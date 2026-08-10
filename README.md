@@ -6,7 +6,6 @@ H3 Motion Context for MiniMax H3, with MultiRef compatibility and arbitrary-posi
 
 ## Fork additions — 2026-08-10
 
-- **MultiRef compatibility** — ordinary MiniMax H3 Ref2VA refs can coexist with Motion Context timeline audio.
 - **H3 Custom Keyframes** — place still-image keyframes at arbitrary frame positions in the generated video.
 - **Lazy runtime patches** — the H3 compatibility patches are installed on first use rather than at ComfyUI startup.
 
