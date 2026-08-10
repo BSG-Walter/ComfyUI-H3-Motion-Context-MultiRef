@@ -33,6 +33,7 @@ anchor_mode
           what this mode is asking.
 """
 
+import json
 import logging
 import os
 
@@ -45,8 +46,12 @@ try:
 except ImportError:  # ComfyUI always ships safetensors; belt and braces
     _st_load = _st_save = None
 
-from .patch_layout import MC_KEY, MC_AUDIO_KEY, is_applied
-from .patch_payload import is_applied as payload_patch_applied
+from .patch_layout import (
+    MC_KEY,
+    MC_AUDIO_KEY,
+    apply_patch as _apply_layout_patch,
+)
+from .patch_payload import apply_patch as _apply_payload_patch
 
 try:
     import torchaudio
@@ -69,6 +74,18 @@ AUDIO_HZ = 40.0
 # delivered clip would continue from the wrong instant. So off-grid requests
 # are snapped DOWN before slicing, keeping content and coverage in agreement.
 VIDEO_RUN_GRID = (39, 22, 5, 1)
+
+
+def _ensure_h3_runtime_patches():
+    """Install both H3 patches on first execution of a node that needs them."""
+    if not _apply_layout_patch():
+        raise RuntimeError(
+            "h3_motion_context: could not enable the MiniMax H3 layout "
+            "extension. Check the ComfyUI console for the self-test error.")
+    if not _apply_payload_patch():
+        raise RuntimeError(
+            "h3_motion_context: could not enable keyframe/ref coexistence. "
+            "Check the ComfyUI console.")
 
 
 def _pixel_frames(latent_t):
@@ -277,11 +294,7 @@ class MiniMaxH3MotionContext:
               encode_mode, anchor_mode, crop, audio_context_length=22,
               audio_mode="timeline", context_latent=None, audio_vae=None,
               context_audio=None):
-        if not is_applied():
-            raise RuntimeError(
-                "h3_motion_context: the layout patch is not active, so interior "
-                "anchors would be rejected by ComfyUI. Check the startup log for "
-                "the self-test failure reason.")
+        _ensure_h3_runtime_patches()
 
         video = _video_from_latent(latent)
         latent_t = int(video.shape[2])
@@ -373,11 +386,6 @@ class MiniMaxH3MotionContext:
         a_frames = 0
         audio_src = "off"
         if context_latent is not None or context_audio is not None:
-            if not payload_patch_applied():
-                raise RuntimeError(
-                    "h3_motion_context: the payload patch is not active. Without it "
-                    "the audio ref would overwrite the pinned video latents and the "
-                    "motion context would be lost. Check the startup log.")
             # the audio window is independent of the video one: audio cond
             # rows cost rows but never cost delivered frames
             a_frames = int(audio_context_length) or span
@@ -768,15 +776,246 @@ class MiniMaxH3MotionContextLoadLatent:
         return ({"samples": [data["video"], data["audio"]]},)
 
 
+class _DynamicKeyframeInputs(dict):
+    """Dynamic backend input map for keyframe_image_N sockets."""
+
+    def __contains__(self, key):
+        return isinstance(key, str) and key.startswith("keyframe_image_")
+
+    def __getitem__(self, key):
+        if isinstance(key, str) and key.startswith("keyframe_image_"):
+            return ("IMAGE",)
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        if isinstance(key, str) and key.startswith("keyframe_image_"):
+            return ("IMAGE",)
+        return default
+
+class MiniMaxH3CustomKeyframes:
+    """Attach still-image H3 keyframes at arbitrary timeline positions."""
+
+    MAX_KEYFRAMES = 32
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "conditioning": (
+                    "CONDITIONING",
+                    {
+                        "tooltip": (
+                            "H3 conditioning. The node replaces its complete "
+                            "minimax_keyframes list with the keyframes below."
+                        )
+                    },
+                ),
+                "vae": (
+                    "VAE",
+                    {
+                        "tooltip": (
+                            "MiniMax H3 video VAE used to encode each still."
+                        )
+                    },
+                ),
+                "latent": (
+                    "LATENT",
+                    {
+                        "tooltip": (
+                            "Target MiniMax H3 AV latent; defines resolution "
+                            "and exact frame count."
+                        )
+                    },
+                ),
+                "keyframe_state": (
+                    "STRING",
+                    {
+                        "default": (
+                            '{"count":3,"positions":[1,22,79]}'
+                        ),
+                        "multiline": False,
+                        "tooltip": (
+                            "Internal UI state. Normally managed by the "
+                            "keyframe position controls."
+                        ),
+                    },
+                ),
+                "indexing": (
+                    ["1-based", "0-based"],
+                    {"default": "1-based"},
+                ),
+                "crop": (
+                    ["disabled", "center"],
+                    {"default": "disabled"},
+                ),
+            },
+            "optional": _DynamicKeyframeInputs(),
+        }
+
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "apply"
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = (
+        "Pin still-image MiniMax H3 keyframes at arbitrary output-frame "
+        "positions. Starts with 3 keyframes; use + Add keyframe to add more."
+    )
+
+    def apply(
+        self,
+        conditioning,
+        vae,
+        latent,
+        keyframe_state,
+        indexing="1-based",
+        crop="disabled",
+        **kwargs,
+    ):
+        _ensure_h3_runtime_patches()
+
+        try:
+            state = json.loads(keyframe_state or "{}")
+        except Exception as exc:
+            raise ValueError(
+                "h3_motion_context: invalid H3 Custom Keyframes UI state"
+            ) from exc
+
+        positions = state.get("positions", [])
+        count = int(state.get("count", len(positions)))
+
+        if count < 1 or count > self.MAX_KEYFRAMES:
+            raise ValueError(
+                "h3_motion_context: Custom Keyframes count must be 1..%d"
+                % self.MAX_KEYFRAMES
+            )
+        if len(positions) < count:
+            raise ValueError(
+                "h3_motion_context: %d keyframe slots but only %d saved "
+                "positions" % (count, len(positions))
+            )
+
+        video = _video_from_latent(latent)
+        width = int(video.shape[4]) * 16
+        height = int(video.shape[3]) * 16
+        frame_count = _pixel_frames(int(video.shape[2]))
+
+        anchors = []
+        for slot in range(1, count + 1):
+            raw_position = int(positions[slot - 1])
+            pixel_index = (
+                raw_position - 1
+                if indexing == "1-based"
+                else raw_position
+            )
+
+            if pixel_index < 0 or pixel_index >= frame_count:
+                low, high = (
+                    (1, frame_count)
+                    if indexing == "1-based"
+                    else (0, frame_count - 1)
+                )
+                raise ValueError(
+                    "h3_motion_context: keyframe %d position %d is "
+                    "outside %d..%d"
+                    % (slot, raw_position, low, high)
+                )
+
+            image = kwargs.get("keyframe_image_%d" % slot)
+            if image is None:
+                raise ValueError(
+                    "h3_motion_context: keyframe %d has no image connected"
+                    % slot
+                )
+            if getattr(image, "ndim", 0) != 4:
+                raise ValueError(
+                    "h3_motion_context: keyframe %d expected IMAGE "
+                    "[B,H,W,C]" % slot
+                )
+            if int(image.shape[0]) != 1:
+                raise ValueError(
+                    "h3_motion_context: keyframe %d must receive exactly "
+                    "one image, not a batch of %d"
+                    % (slot, int(image.shape[0]))
+                )
+
+            anchors.append((pixel_index, slot, image))
+
+        anchors.sort(key=lambda item: item[0])
+
+        for i in range(1, len(anchors)):
+            if anchors[i - 1][0] == anchors[i][0]:
+                displayed = (
+                    anchors[i][0] + 1
+                    if indexing == "1-based"
+                    else anchors[i][0]
+                )
+                raise ValueError(
+                    "h3_motion_context: duplicate keyframe position %d"
+                    % displayed
+                )
+
+        keyframes = []
+        for pixel_index, slot, image in anchors:
+            resized = _resize(image, width, height, crop)
+            encoded = vae.encode(resized)
+
+            if (
+                getattr(encoded, "ndim", 0) != 5
+                or int(encoded.shape[2]) != 1
+            ):
+                raise ValueError(
+                    "h3_motion_context: keyframe %d encoded to %s; "
+                    "expected one H3 still latent [B,C,1,H,W]"
+                    % (
+                        slot,
+                        tuple(getattr(encoded, "shape", ())),
+                    )
+                )
+
+            keyframes.append({
+                # Stock PackedLayout accepts frame 0 here. The real temporal
+                # location is applied lazily through MC_KEY.
+                "resolved_frame_index": 0,
+                MC_KEY: int(pixel_index),
+                "latent": encoded,
+            })
+
+        out = node_helpers.conditioning_set_values(
+            conditioning,
+            {
+                "minimax_keyframes": keyframes,
+                "minimax_frame_count": frame_count,
+            },
+        )
+
+        shown = [
+            p + 1 if indexing == "1-based" else p
+            for p, _, _ in anchors
+        ]
+        _LOG.info(
+            "h3_motion_context: Custom Keyframes pinned %d anchors at %s "
+            "in a %d-frame %dx%d target",
+            len(keyframes),
+            shown,
+            frame_count,
+            width,
+            height,
+        )
+
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3MotionContext": MiniMaxH3MotionContext,
     "MiniMaxH3MotionContextTrim": MiniMaxH3MotionContextTrim,
     "MiniMaxH3MotionContextSaveLatent": MiniMaxH3MotionContextSaveLatent,
     "MiniMaxH3MotionContextLoadLatent": MiniMaxH3MotionContextLoadLatent,
+    "MiniMaxH3CustomKeyframes": MiniMaxH3CustomKeyframes,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3MotionContext": "H3 Motion Context",
     "MiniMaxH3MotionContextTrim": "H3 Motion Context Trim",
     "MiniMaxH3MotionContextSaveLatent": "H3 Motion Context Save Latent",
     "MiniMaxH3MotionContextLoadLatent": "H3 Motion Context Load Latent",
+    "MiniMaxH3CustomKeyframes": "H3 Custom Keyframes",
 }
