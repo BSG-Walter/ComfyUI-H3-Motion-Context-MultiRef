@@ -7,6 +7,7 @@ H3 Motion Context for MiniMax H3, with MultiRef compatibility and arbitrary-posi
 ## Fork additions — 2026-08-10
 
 - **H3 Custom Keyframes** — place still-image keyframes at arbitrary frame positions in the generated video.
+- **H3 Custom Audio** — pin audio clips at arbitrary frame positions of the target clip's audio timeline (beginning, middle or end), the audio counterpart of Custom Keyframes.
 - **Lazy runtime patches** — the H3 compatibility patches are installed on first use rather than at ComfyUI startup.
 
 See [MODIFICATIONS.md](MODIFICATIONS.md) for details on the MultiRef changes.
@@ -41,6 +42,28 @@ The node sorts anchors by frame position, rejects duplicate or out-of-range posi
 When using **H3 Custom Keyframes**, put all visual keyframes on this node, including first/last-frame anchors if you want them.
 
 These are conditioning anchors rather than deterministic morph points; H3 still generates the motion and transitions between them from the prompt.
+
+## H3 Custom Audio
+
+The audio counterpart of H3 Custom Keyframes: pin audio clips at arbitrary positions of the target clip's own audio timeline, so the model hears them as established sound and generates the rest around them.
+
+The node starts with one audio slot and lets you add or remove more with **+ Add audio** and **- Remove audio**. Each slot takes an `AUDIO` clip and a frame position, plus two node-level controls:
+
+```text
+indexing:  1-based / 0-based frame positions
+align:     end    - the clip finishes at the chosen frame; the model continues from it
+           start  - the clip begins at the chosen frame; the model leads into it
+```
+
+Examples (1-based, align = end):
+
+```text
+AUDIO 1 -> 1      opening sound over the first frame
+AUDIO 2 -> 79     sound leading into frame 79 (middle injection)
+AUDIO 3 -> 22     one clip ending where the next begins: contiguous bed
+```
+
+Unused media is windowed at the anchor: an `end`-aligned clip longer than its position is tail-sliced so it always finishes exactly at the chosen frame; a `start`-aligned clip is head-sliced so it never runs past the last frame. Duplicate end frames and out-of-range positions are rejected. Blocks are appended to any existing `minimax_refs`, so they coexist with Ref2VA refs and Motion Context timeline audio.
 
 ## Recommended Motion Context settings
 
@@ -82,6 +105,10 @@ Motion Context timeline-audio ref
 ## Important limitation
 
 The MultiRef compatibility patch is specifically for **Ref2VA refs + Motion Context timeline audio** coexistence. It does not make long recursive generated-audio chains lossless. For fixed-song lip-sync workflows, using the original song slices as the audio reference and Motion Context for video only may be preferable.
+
+## Troubleshooting
+
+**`self-test failed (found 4 rows in marked audio ref slot ...)` on startup or first run** usually means the **upstream `ComfyUI-H3-Motion-Context` package is still installed next to this fork**. Both install the same MiniMax H3 runtime patch, and the second application double-wraps `PackedLayout.__init__`. Disable the other package (ComfyUI-Manager → Custom Nodes Manager → ComfyUI-H3-Motion-Context → Disable) and restart ComfyUI. As a safety net this fork detects another `h3_motion_context` wrapper at install time and takes over from it, but the duplicate install should be removed anyway since this fork replaces the upstream package entirely.
 
 ## License / upstream
 

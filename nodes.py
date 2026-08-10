@@ -109,8 +109,8 @@ def _resize(image, width, height, crop):
     return samples.movedim(1, -1)
 
 
-def _encode_tail_audio(audio_vae, audio, seconds):
-    """Encode the last `seconds` of a clip's audio with the H3 audio VAE.
+def _encode_audio_window(audio_vae, audio, seconds, tail=True):
+    """Encode the last (`tail`) or first (`head`) `seconds` of a clip's audio.
 
     Returns ([1, 32, 2, T] latent, T) where T counts 40 Hz latent steps,
     matching what the layout calls ref_audio_t.
@@ -121,19 +121,30 @@ def _encode_tail_audio(audio_vae, audio, seconds):
     if sr != vae_sr:
         if torchaudio is None:
             raise RuntimeError(
-                "h3_motion_context: context_audio is %d Hz but the VAE wants %d Hz "
+                "h3_motion_context: audio is %d Hz but the VAE wants %d Hz "
                 "and torchaudio is not available to resample." % (sr, vae_sr))
         waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
     want = int(round(seconds * vae_sr))
     have = int(waveform.shape[-1])
     if have < want:
-        _LOG.warning("h3_motion_context: context_audio is %.3fs, shorter than the "
-                     "%.3fs of pinned video. Pinning what there is.",
+        _LOG.warning("h3_motion_context: audio is %.3fs, shorter than the "
+                     "%.3fs window; windowing what there is.",
                      have / vae_sr, seconds)
-    else:
+    elif tail:
         waveform = waveform[..., have - want:]
+    else:
+        waveform = waveform[..., :want]
     z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
     return z, int(z.shape[-1])
+
+
+def _encode_tail_audio(audio_vae, audio, seconds):
+    """Encode the last `seconds` of a clip's audio with the H3 audio VAE.
+
+    Returns ([1, 32, 2, T] latent, T) where T counts 40 Hz latent steps,
+    matching what the layout calls ref_audio_t.
+    """
+    return _encode_audio_window(audio_vae, audio, seconds, tail=True)
 
 
 def _streams_from_latent(latent):
@@ -1005,12 +1016,256 @@ class MiniMaxH3CustomKeyframes:
         return (out,)
 
 
+class _DynamicAudioInputs(dict):
+    """Dynamic backend input map for audio_N sockets."""
+
+    def __contains__(self, key):
+        return isinstance(key, str) and key.startswith("audio_")
+
+    def __getitem__(self, key):
+        if isinstance(key, str) and key.startswith("audio_"):
+            return ("AUDIO",)
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        if isinstance(key, str) and key.startswith("audio_"):
+            return ("AUDIO",)
+        return default
+
+
+class MiniMaxH3CustomAudio:
+    """Pin audio clips at arbitrary positions of the H3 output timeline.
+
+    Stock audio refs sit in a span before the clip and are merely imitated.
+    Every block attached here is instead MOVED onto the target clip's own
+    audio timeline, with its sound (or its start, in start mode) landing at
+    the requested frame, exactly how custom keyframes anchor the video. The
+    injected sound is never denoised, so the model hears it as established
+    fact and must generate the clip's audio around it -- before it, after
+    it, or both.
+
+    align=end:  the audio block ENDS at the chosen frame. Sound before that
+                instant is pinned, the model continues from it.
+    align=start: the audio block STARTS at the chosen frame. Sound from that
+                instant on is pinned, the model leads into it.
+    """
+
+    MAX_AUDIOS = 16
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "conditioning": (
+                    "CONDITIONING",
+                    {
+                        "tooltip": (
+                            "H3 conditioning. Custom audio blocks are appended "
+                            "to any existing minimax_refs (Ref2VA refs, H3 "
+                            "Motion Context audio)."
+                        )
+                    },
+                ),
+                "audio_vae": (
+                    "VAE",
+                    {
+                        "tooltip": (
+                            "MiniMax H3 audio VAE used to encode each audio "
+                            "clip."
+                        )
+                    },
+                ),
+                "latent": (
+                    "LATENT",
+                    {
+                        "tooltip": (
+                            "Target MiniMax H3 AV latent; defines the frame "
+                            "count the audio positions are measured against."
+                        )
+                    },
+                ),
+                "audio_state": (
+                    "STRING",
+                    {
+                        "default": '{"count":1,"positions":[1]}',
+                        "multiline": False,
+                        "tooltip": (
+                            "Internal UI state. Normally managed by the "
+                            "audio position controls."
+                        ),
+                    },
+                ),
+                "indexing": (
+                    ["1-based", "0-based"],
+                    {"default": "1-based"},
+                ),
+                "align": (
+                    ["end", "start"],
+                    {
+                        "default": "end",
+                        "tooltip": (
+                            "end: the audio block finishes at the chosen "
+                            "frame (sound already here, the model continues "
+                            "it). start: the audio block begins at the "
+                            "chosen frame (sound arrives there, the model "
+                            "leads into it)."
+                        ),
+                    },
+                ),
+            },
+            "optional": _DynamicAudioInputs(),
+        }
+
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "apply"
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = (
+        "Pin MiniMax H3 audio clips at arbitrary output-frame positions, "
+        "end- or start-aligned. Starts with 1 audio slot; use + Add audio "
+        "for more."
+    )
+
+    def apply(
+        self,
+        conditioning,
+        audio_vae,
+        latent,
+        audio_state,
+        indexing="1-based",
+        align="end",
+        **kwargs,
+    ):
+        _ensure_h3_runtime_patches()
+
+        try:
+            state = json.loads(audio_state or "{}")
+        except Exception as exc:
+            raise ValueError(
+                "h3_motion_context: invalid H3 Custom Audio UI state"
+            ) from exc
+
+        positions = state.get("positions", [])
+        count = int(state.get("count", len(positions)))
+
+        if count < 1 or count > self.MAX_AUDIOS:
+            raise ValueError(
+                "h3_motion_context: Custom Audio count must be 1..%d"
+                % self.MAX_AUDIOS
+            )
+        if len(positions) < count:
+            raise ValueError(
+                "h3_motion_context: %d audio slots but only %d saved "
+                "positions" % (count, len(positions))
+            )
+
+        frame_count = _pixel_frames(int(_video_from_latent(latent).shape[2]))
+
+        anchors = []
+        for slot in range(1, count + 1):
+            raw_position = int(positions[slot - 1])
+            zero_based = (
+                raw_position - 1 if indexing == "1-based" else raw_position
+            )
+
+            if align == "end":
+                # the block ends at the END of 1-based frame `position`
+                # (sound covers frames 1..position). position is the 1-based
+                # raw value; a 0-based slot maps to the same end instant.
+                if zero_based < 0 or zero_based >= frame_count:
+                    low, high = (
+                        (1, frame_count)
+                        if indexing == "1-based"
+                        else (0, frame_count - 1)
+                    )
+                    raise ValueError(
+                        "h3_motion_context: audio %d end position %d is "
+                        "outside %d..%d" % (slot, raw_position, low, high)
+                    )
+                window_frames = zero_based + 1
+            else:
+                if zero_based < 0 or zero_based >= frame_count:
+                    low, high = (
+                        (1, frame_count)
+                        if indexing == "1-based"
+                        else (0, frame_count - 1)
+                    )
+                    raise ValueError(
+                        "h3_motion_context: audio %d start position %d is "
+                        "outside %d..%d" % (slot, raw_position, low, high)
+                    )
+                window_frames = frame_count - zero_based
+
+            audio = kwargs.get("audio_%d" % slot)
+            if audio is None:
+                raise ValueError(
+                    "h3_motion_context: audio %d has no clip connected" % slot
+                )
+            waveform = audio.get("waveform")
+            if getattr(waveform, "ndim", 0) != 3 or int(waveform.shape[-1]) < 1:
+                raise ValueError(
+                    "h3_motion_context: audio %d expected an AUDIO clip "
+                    "[B,C,L]" % slot
+                )
+
+            z, rt = _encode_audio_window(
+                audio_vae, audio, window_frames / float(FPS),
+                tail=(align == "end"))
+            if rt < 1:
+                raise ValueError(
+                    "h3_motion_context: audio %d encoded to zero latent "
+                    "steps" % slot
+                )
+
+            if align == "end":
+                # sound ends at the end of 1-based frame `position`
+                end_frame = float(zero_based + 1)
+            else:
+                # sound starts at 0-based frame `zero_based` and covers
+                # rt 40 Hz steps = rt * 3/5 frame units of timeline
+                end_frame = float(zero_based) + rt * 3.0 / 5.0
+
+            anchors.append((end_frame, slot, z, rt))
+
+        anchors.sort(key=lambda item: item[0])
+
+        for i in range(len(anchors)):
+            for j in range(i + 1, len(anchors)):
+                if abs(anchors[i][0] - anchors[j][0]) < 1e-6:
+                    raise ValueError(
+                        "h3_motion_context: audio %d and %d would both end at "
+                        "frame %.3f. Pick different positions."
+                        % (anchors[i][1], anchors[j][1], anchors[i][0])
+                    )
+
+        refs = [
+            {
+                "kind": "audio",
+                "ref_audio_t": rt,
+                "audio_latent": z,
+                MC_AUDIO_KEY: end_frame,
+            }
+            for end_frame, _, z, rt in anchors
+        ]
+
+        out = node_helpers.conditioning_set_values(
+            conditioning, {"minimax_refs": refs}, append=True)
+
+        _LOG.info(
+            "h3_motion_context: Custom Audio pinned %d blocks (%s-aligned) "
+            "ending at %.3f..%.3f in a %d-frame clip",
+            len(refs), align, anchors[0][0], anchors[-1][0], frame_count,
+        )
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3MotionContext": MiniMaxH3MotionContext,
     "MiniMaxH3MotionContextTrim": MiniMaxH3MotionContextTrim,
     "MiniMaxH3MotionContextSaveLatent": MiniMaxH3MotionContextSaveLatent,
     "MiniMaxH3MotionContextLoadLatent": MiniMaxH3MotionContextLoadLatent,
     "MiniMaxH3CustomKeyframes": MiniMaxH3CustomKeyframes,
+    "MiniMaxH3CustomAudio": MiniMaxH3CustomAudio,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3MotionContext": "H3 Motion Context",
@@ -1018,4 +1273,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3MotionContextSaveLatent": "H3 Motion Context Save Latent",
     "MiniMaxH3MotionContextLoadLatent": "H3 Motion Context Load Latent",
     "MiniMaxH3CustomKeyframes": "H3 Custom Keyframes",
+    "MiniMaxH3CustomAudio": "H3 Custom Audio",
 }

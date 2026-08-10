@@ -122,63 +122,65 @@ def _fixup(layout, text_len, latent_t, frame_count, keyframes, refs=None):
 
 
 def _fixup_audio(layout, text_len, refs):
-    """Move the marked Motion Context audio ref onto the target timeline.
+    """Move every marked audio ref onto the target timeline.
 
-    Ordinary Ref2VA refs may appear before it. The marked Motion Context
-    audio ref MUST be last.
+    Each ref marked with MC_AUDIO_KEY is shifted so its block ends at
+    target_origin + FRAME_RESCALE * end_frame, which places it anywhere on
+    (or before) the clip's own audio timeline -- beginning, middle or end,
+    exactly how keyframe coordinates anchor the video. Ordinary Ref2VA refs
+    keep their stock slots.
+
+    Marked refs may appear anywhere among the refs. Every slot selection is
+    taken from a pre-shift snapshot of the time coordinates, so moving one
+    block can never corrupt the slot detection of another, even when two
+    blocks end up overlapping on the timeline.
     """
-    marked_idx = [i for i, r in enumerate(refs)
-                  if r.get(MC_AUDIO_KEY) is not None]
-    if len(marked_idx) != 1:
-        raise RuntimeError(
-            "h3_motion_context: audio timeline placement requires exactly one "
-            "ref marked with %s; layout has %d refs, %d marked."
-            % (MC_AUDIO_KEY, len(refs), len(marked_idx)))
-
-    idx = marked_idx[0]
-    if idx != len(refs) - 1:
-        raise RuntimeError(
-            "h3_motion_context: the marked Motion Context audio ref must be "
-            "the LAST ref block. This compatibility patch supports ordinary "
-            "Ref2VA refs followed by the MC audio ref.")
-
-    blk = refs[idx]
-    if blk.get("kind") != "audio":
-        raise RuntimeError(
-            "h3_motion_context: %s set on a %r ref; only audio refs can be "
-            "moved onto the timeline." % (MC_AUDIO_KEY, blk.get("kind")))
-
-    rt = int(blk.get("ref_audio_t", 0))
-    if rt <= 0:
+    marked = [(i, r) for i, r in enumerate(refs)
+              if r.get(MC_AUDIO_KEY) is not None]
+    if not marked:
         return
-
-    prefix = _ref_cursor_advance(refs[:idx])
-    slot_start = float(text_len) + prefix
-    slot_end = slot_start + float(rt)
-
-    target_origin = float(text_len) + _ref_cursor_advance(refs)
-    end_frame = float(blk[MC_AUDIO_KEY])
+    for i, blk in marked:
+        if blk.get("kind") != "audio":
+            raise RuntimeError(
+                "h3_motion_context: %s set on a %r ref; only audio refs can be "
+                "moved onto the timeline." % (MC_AUDIO_KEY, blk.get("kind")))
 
     t = layout.position_ids[:, 0]
+    snapshot = t.clone()
     eps = 1e-4
-    sel = (t >= slot_start - eps) & (t < slot_end - eps)
-
+    cond_rows = set()
     for a, b, kind in layout.segments:
         if kind == "cond":
-            sel[a:b] = False
+            cond_rows.update(range(a, b))
 
-    count = int(sel.sum())
-    if count < rt or count > 8 * rt:
-        raise RuntimeError(
-            "h3_motion_context: found %d rows in the marked audio ref slot "
-            "[%.4f, %.4f) for %d latent steps, expected between %d and %d. "
-            "Upstream layout change or overlapping coordinates; refusing "
-            "to move audio rows."
-            % (count, slot_start, slot_end, rt, rt, 8 * rt))
+    target_origin = float(text_len) + _ref_cursor_advance(refs)
 
-    desired_start = target_origin + mm.FRAME_RESCALE * end_frame - float(rt)
-    shift = desired_start - slot_start
-    layout.position_ids[sel, 0] = t[sel] + shift
+    for i, blk in marked:
+        rt = int(blk.get("ref_audio_t", 0))
+        if rt <= 0:
+            continue
+
+        prefix = _ref_cursor_advance(refs[:i])
+        slot_start = float(text_len) + prefix
+        slot_end = slot_start + float(rt)
+
+        sel = (snapshot >= slot_start - eps) & (snapshot < slot_end - eps)
+        for r in cond_rows:
+            sel[r] = False
+
+        count = int(sel.sum())
+        if count < rt or count > 8 * rt:
+            raise RuntimeError(
+                "h3_motion_context: found %d rows in marked audio ref slot "
+                "[%.4f, %.4f) for %d latent steps, expected between %d and %d. "
+                "Upstream layout change or overlapping coordinates; refusing "
+                "to move audio rows."
+                % (count, slot_start, slot_end, rt, rt, 8 * rt))
+
+        end_frame = float(blk[MC_AUDIO_KEY])
+        desired_start = target_origin + mm.FRAME_RESCALE * end_frame - float(rt)
+        shift = desired_start - slot_start
+        t[sel] = snapshot[sel] + shift
 
     # H3_MC_MULTI_REF_AUDIO_SHAREABLE_LAYOUT
 
@@ -376,6 +378,72 @@ def _self_test():
             "multi-ref audio rows shifted non-uniformly or by the wrong "
             "amount: %s vs %.6f" % (multi_deltas[:4], want_multi_shift))
 
+    # Several marked audio refs at different positions on the same timeline
+    # (beginning / middle injection). Each block must end exactly at
+    # target_origin + FRAME_RESCALE * end_frame, its rows land on the
+    # expected step coordinates, and every other row must stay bit-identical
+    # to a graph whose refs were never marked.
+    ends = [0, 4, 7]
+    rt2 = 6
+    refs_two = [{"kind": "audio", "ref_audio_t": rt2, MC_AUDIO_KEY: e}
+                for e in ends]
+    h = mm.PackedLayout.__new__(mm.PackedLayout)
+    _orig_init(h, text_len, latent_t, lh, lw, audio_t,
+               keyframes=run, refs=refs_two, frame_count=frame_count)
+    _fixup(h, text_len, latent_t, frame_count, run, refs=refs_two)
+    _fixup_audio(h, text_len, refs_two)
+
+    i_plain = mm.PackedLayout.__new__(mm.PackedLayout)
+    _orig_init(i_plain, text_len, latent_t, lh, lw, audio_t,
+               keyframes=run, refs=refs_two, frame_count=frame_count)
+    _fixup(i_plain, text_len, latent_t, frame_count, run, refs=refs_two)
+
+    origin2 = float(text_len) + _ref_cursor_advance(refs_two)
+    expected = {}
+    for e, r in zip(ends, refs_two):
+        rt_i = int(r["ref_audio_t"])
+        start = origin2 + mm.FRAME_RESCALE * float(e) - float(rt_i)
+        steps = [start + k for k in range(rt_i)]
+        expected[e] = steps + steps  # stereo: each step contributes two rows
+    th = h.position_ids[:, 0]
+    ref_audio_segs = [(a, b) for a, b, kind in h.segments
+                      if kind == "ref_audio"]
+    if len(ref_audio_segs) != len(refs_two):
+        raise RuntimeError(
+            "multi-mark audio: expected %d ref_audio segments, layout has %d"
+            % (len(refs_two), len(ref_audio_segs)))
+    for (e, r), (a, b) in zip(zip(ends, refs_two), ref_audio_segs):
+        # each block's rows are a contiguous packed range; the video/audio
+        # target rows legitimately share time coordinates with injected
+        # blocks, so match only inside this block's own row range
+        rt_i = int(r["ref_audio_t"])
+        start = origin2 + mm.FRAME_RESCALE * float(e) - float(rt_i)
+        steps = [start + k for k in range(rt_i)]
+        for value in steps:
+            # float64 additions differing in the last ulp are fine: match
+            # within 1e-7. Each step contributes exactly two rows, one per
+            # stereo channel, at the same coordinate.
+            hit = sum(1 for i in range(a, b)
+                      if abs(float(th[i]) - value) < 1e-7)
+            if hit != 2:
+                raise RuntimeError(
+                    "multi-mark audio: coordinate %.9f of block ending at "
+                    "frame %d found on %d of its own rows, expected 2 "
+                    "(stereo)" % (value, e, hit))
+    if not torch.equal(h.position_ids[:, 1:], i_plain.position_ids[:, 1:]):
+        raise RuntimeError("multi-mark audio move touched a non-time coordinate")
+    th_plain = i_plain.position_ids[:, 0]
+    moved = [i for i in range(len(th)) if float(th[i]) != float(th_plain[i])]
+    allowed = {v for vals in expected.values() for v in vals}
+    for i in moved:
+        hits = [v for v in allowed if abs(float(th[i]) - v) < 1e-7]
+        if not hits:
+            raise RuntimeError(
+                "multi-mark audio: row %d moved to unexpected time %.9f"
+                % (i, float(th[i])))
+    if not moved:
+        raise RuntimeError("multi-mark audio moved no rows")
+
 
 def apply_patch():
     global _orig_init, _applied
@@ -385,14 +453,46 @@ def apply_patch():
         _LOG.warning("h3_motion_context: MiniMax H3 model module missing expected "
                      "attributes, patch not applied")
         return False
-    _orig_init = mm.PackedLayout.__init__
+    current = mm.PackedLayout.__init__
+    if current is not _patched_init and getattr(current, "_h3mc_layout_patcher", False):
+        # OUR wrapper is already installed (the same package imported twice,
+        # or a node reload re-ran us). Adopt it instead of wrapping the
+        # wrapper: nesting fixups would move rows twice and the self-test
+        # would see a corrupted layout.
+        _orig_init = current._h3mc_orig_init
+        _applied = True
+        _LOG.info("h3_motion_context: adopting the already-installed layout patch")
+        return True
+    if current is not _patched_init:
+        # The upstream ComfyUI-H3-Motion-Context package (or a second copy of
+        # this code) may have installed its own wrapper first. Its module
+        # captured the stock init in a module global of the same name; recover
+        # it and take over, so the two wrappers never nest their fixups.
+        foreign_orig = getattr(
+            getattr(current, "__globals__", None) or {}, "get", lambda k, d=None: d)("_orig_init", None)
+        if foreign_orig is not None and foreign_orig is not current:
+            _orig_init = foreign_orig
+            _patched_init._h3mc_orig_init = _orig_init
+            _patched_init._h3mc_layout_patcher = True
+            mm.PackedLayout.__init__ = _patched_init
+            _applied = True
+            _LOG.warning("h3_motion_context: took over the layout patch installed "
+                         "by another h3_motion_context copy; disabling the other "
+                         "package (upstream ComfyUI-H3-Motion-Context) is cleaner")
+            return True
+    _orig_init = current
     try:
         _self_test()
     except Exception as exc:
         _orig_init = None
         _LOG.warning("h3_motion_context: self-test failed (%s), patch not applied. "
-                     "Interior keyframe anchors unavailable.", exc)
+                     "Interior keyframe anchors unavailable. If you have both "
+                     "the upstream ComfyUI-H3-Motion-Context package and this "
+                     "fork installed, disable one of them and restart ComfyUI.",
+                     exc)
         return False
+    _patched_init._h3mc_orig_init = _orig_init
+    _patched_init._h3mc_layout_patcher = True
     mm.PackedLayout.__init__ = _patched_init
     _applied = True
     _LOG.info("h3_motion_context: interior keyframe anchors enabled")

@@ -70,7 +70,28 @@ def apply_patch():
         _LOG.warning("h3_motion_context: MiniMaxH3.extra_conds not found, "
                      "keyframes and refs cannot be combined")
         return False
-    _orig_extra_conds = cls.extra_conds
+    current = cls.extra_conds
+    if current is not _patched_extra_conds and getattr(current, "_h3mc_payload_patcher", False):
+        # Our own wrapper is already installed; adopt it instead of wrapping
+        # the wrapper (double merges are benign but pointless).
+        _orig_extra_conds = current._h3mc_payload_orig
+        _applied = True
+        return True
+    if current is not _patched_extra_conds:
+        foreign_orig = getattr(
+            getattr(current, "__globals__", None) or {}, "get", lambda k, d=None: d)("_orig_extra_conds", None)
+        if foreign_orig is not None and foreign_orig is not current:
+            _orig_extra_conds = foreign_orig
+            _patched_extra_conds._h3mc_payload_orig = _orig_extra_conds
+            _patched_extra_conds._h3mc_payload_patcher = True
+            cls.extra_conds = _patched_extra_conds
+            _applied = True
+            _LOG.warning("h3_motion_context: took over the extra_conds patch "
+                         "installed by another h3_motion_context copy")
+            return True
+    _orig_extra_conds = current
+    _patched_extra_conds._h3mc_payload_orig = _orig_extra_conds
+    _patched_extra_conds._h3mc_payload_patcher = True
     cls.extra_conds = _patched_extra_conds
     _applied = True
     _LOG.info("h3_motion_context: keyframe/ref coexistence enabled")
