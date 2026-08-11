@@ -17,8 +17,8 @@ def main():
     compile(LAYOUT, "patch_layout.py", "exec")
     compile(PAYLOAD, "patch_payload.py", "exec")
 
-    assert 'motion_context_audio_ref = ref' in NODES
     assert 'append=True' in NODES
+    assert '{"minimax_refs": [ref]}, append=True)' in NODES
     assert 'values["minimax_refs"] = [ref]' not in NODES
 
     # Multi-ref timeline audio: marked blocks may appear anywhere among the

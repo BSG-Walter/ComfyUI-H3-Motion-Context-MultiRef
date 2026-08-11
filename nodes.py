@@ -115,13 +115,6 @@ def _step_offsets(latent_t):
     return out
 
 
-def _resize(image, width, height, crop):
-    # image [B, H, W, C] -> [B, height, width, 3]; matches the stock helper
-    samples = image[..., :3].movedim(-1, 1)
-    samples = comfy.utils.common_upscale(samples, width, height, "lanczos", crop)
-    return samples.movedim(1, -1)
-
-
 def _encode_audio_window(audio_vae, audio, seconds, tail=True):
     """Encode the last (`tail`) or first (`head`) `seconds` of a clip's audio.
 
@@ -149,15 +142,6 @@ def _encode_audio_window(audio_vae, audio, seconds, tail=True):
         waveform = waveform[..., :want]
     z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
     return z, int(z.shape[-1])
-
-
-def _encode_tail_audio(audio_vae, audio, seconds):
-    """Encode the last `seconds` of a clip's audio with the H3 audio VAE.
-
-    Returns ([1, 32, 2, T] latent, T) where T counts 40 Hz latent steps,
-    matching what the layout calls ref_audio_t.
-    """
-    return _encode_audio_window(audio_vae, audio, seconds, tail=True)
 
 
 def _streams_from_latent(latent):
@@ -427,8 +411,8 @@ class MiniMaxH3MotionContext:
                         "h3_motion_context: context_audio supplied without "
                         "audio_vae. Wire the H3 audio VAE, or wire "
                         "context_latent instead.")
-                audio_latent, ref_audio_t = _encode_tail_audio(
-                    audio_vae, context_audio, a_frames / float(FPS))
+                audio_latent, ref_audio_t = _encode_audio_window(
+                    audio_vae, context_audio, a_frames / float(FPS), tail=True)
                 overhang = 0.0  # decoded audio was match_tail-cut at the frame
                 audio_src = "vae"
             ref = {
@@ -448,15 +432,12 @@ class MiniMaxH3MotionContext:
                 end_frame = float(span if anchor_mode == "head" else 0)
                 end_frame += overhang / FRAME_RESCALE
                 ref[MC_AUDIO_KEY] = end_frame
-            # Preserve existing Ref2VA refs; append MC audio after normal conditioning.
-            motion_context_audio_ref = ref  # H3_MC_MULTI_REF_AUDIO_SHAREABLE_APPEND
-
         out = node_helpers.conditioning_set_values(conditioning, values)
         if ref_audio_t:
             # append=True preserves existing Ref2VA refs and places the
             # Motion Context timeline-audio ref last.
             out = node_helpers.conditioning_set_values(
-                out, {"minimax_refs": [motion_context_audio_ref]}, append=True)
+                out, {"minimax_refs": [ref]}, append=True)
 
         trim = span if anchor_mode == "head" else 0
         _LOG.info("h3_motion_context: %s/%s, %d frames -> %d cond blocks at "
@@ -695,9 +676,6 @@ class MiniMaxH3MotionContextSaveLatent:
                    "Load node.")
 
     def save(self, latent, filename_prefix, clip_index=0):
-        if _st_save is None:
-            raise RuntimeError("h3_motion_context: safetensors is not "
-                               "available; cannot save latents.")
         parts = _streams_from_latent(latent)
         if len(parts) < 2:
             raise ValueError(
@@ -783,9 +761,6 @@ class MiniMaxH3MotionContextLoadLatent:
             return float("NaN")  # unresolvable: never cache
 
     def load(self, latent_path, clip_index=0):
-        if _st_load is None:
-            raise RuntimeError("h3_motion_context: safetensors is not "
-                               "available; cannot load latents.")
         path = _resolve_latent_path(latent_path, clip_index)
         data = _st_load(path)
         if "video" not in data or "audio" not in data:
@@ -800,20 +775,24 @@ class MiniMaxH3MotionContextLoadLatent:
         return ({"samples": [data["video"], data["audio"]]},)
 
 
-class _DynamicKeyframeInputs(dict):
-    """Dynamic backend input map for keyframe_image_N sockets."""
+class _DynamicInputs(dict):
+    """Dynamic backend input map: accepts any key under `prefix`."""
+
+    def __init__(self, prefix, types):
+        self._prefix = prefix
+        self._types = types
 
     def __contains__(self, key):
-        return isinstance(key, str) and key.startswith("keyframe_image_")
+        return isinstance(key, str) and key.startswith(self._prefix)
 
     def __getitem__(self, key):
-        if isinstance(key, str) and key.startswith("keyframe_image_"):
-            return ("IMAGE",)
+        if isinstance(key, str) and key.startswith(self._prefix):
+            return self._types
         raise KeyError(key)
 
     def get(self, key, default=None):
-        if isinstance(key, str) and key.startswith("keyframe_image_"):
-            return ("IMAGE",)
+        if isinstance(key, str) and key.startswith(self._prefix):
+            return self._types
         return default
 
 class MiniMaxH3CustomKeyframes:
@@ -873,7 +852,7 @@ class MiniMaxH3CustomKeyframes:
                     {"default": "disabled"},
                 ),
             },
-            "optional": _DynamicKeyframeInputs(),
+            "optional": _DynamicInputs("keyframe_image_", ("IMAGE",)),
         }
 
     RETURN_TYPES = ("CONDITIONING",)
@@ -1029,23 +1008,6 @@ class MiniMaxH3CustomKeyframes:
         return (out,)
 
 
-class _DynamicAudioInputs(dict):
-    """Dynamic backend input map for audio_N sockets."""
-
-    def __contains__(self, key):
-        return isinstance(key, str) and key.startswith("audio_")
-
-    def __getitem__(self, key):
-        if isinstance(key, str) and key.startswith("audio_"):
-            return ("AUDIO",)
-        raise KeyError(key)
-
-    def get(self, key, default=None):
-        if isinstance(key, str) and key.startswith("audio_"):
-            return ("AUDIO",)
-        return default
-
-
 class MiniMaxH3CustomAudio:
     """Pin audio clips at arbitrary positions of the H3 output timeline.
 
@@ -1133,7 +1095,7 @@ class MiniMaxH3CustomAudio:
                     },
                 ),
             },
-            "optional": _DynamicAudioInputs(),
+            "optional": _DynamicInputs("audio_", ("AUDIO",)),
         }
 
     RETURN_TYPES = ("CONDITIONING",)
@@ -1181,10 +1143,10 @@ class MiniMaxH3CustomAudio:
                 "positions" % (count, len(positions))
             )
         if len(strengths) < count:
-            strengths = ([1.0] * count)[:count]
+            strengths = [1.0] * count
         strengths = [
             min(1.0, max(0.05, float(s)))
-            for s in (strengths[:count] + [1.0] * count)[:count]
+            for s in strengths[:count]
         ]
 
         frame_count = _pixel_frames(int(_video_from_latent(latent).shape[2]))

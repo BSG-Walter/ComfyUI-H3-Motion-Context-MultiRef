@@ -31,12 +31,7 @@ from .patch_layout import MC_AUDIO_STRENGTH
 
 _LOG = logging.getLogger("h3_motion_context")
 
-_orig_extra_conds = None
-_applied = False
-_orig_cond_audio_rows = None
-_cond_applied = False
-_orig_forward = None
-_forward_applied = False
+_ORIG = {}
 _warned_no_blend = False
 
 _FOREIGN_ORIG_NAMES = (
@@ -73,8 +68,41 @@ def _recover_foreign(attr, names):
     return None
 
 
+def _install(cls, attr, patched, foreign_names, gone_msg, done_msg):
+    """Adopt or install `patched` over `cls.attr`; returns success.
+
+    Idempotent: if our own wrapper (possibly from a previous import of this
+    module) already owns the attribute, it is adopted instead of re-wrapped.
+    If a wrapper installed by another h3_motion_context copy owns it, the
+    stock function it captured is recovered and taken over.
+    """
+    if cls is None or not hasattr(cls, attr):
+        _LOG.warning("h3_motion_context: %s not found, %s", attr, gone_msg)
+        return False
+    current = getattr(cls, attr)
+    if getattr(current, "_h3mc_patcher", False):
+        _ORIG[attr] = getattr(current, "_h3mc_orig", current)
+        return True
+    if current is not patched:
+        foreign = _recover_foreign(current, foreign_names)
+        if foreign is not None:
+            _ORIG[attr] = foreign
+            setattr(patched, "_h3mc_patcher", True)
+            setattr(patched, "_h3mc_orig", foreign)
+            setattr(cls, attr, patched)
+            _LOG.warning("h3_motion_context: took over the %s patch installed "
+                         "by another h3_motion_context copy", attr)
+            return True
+    _ORIG[attr] = current
+    setattr(patched, "_h3mc_patcher", True)
+    setattr(patched, "_h3mc_orig", current)
+    setattr(cls, attr, patched)
+    _LOG.info("h3_motion_context: %s", done_msg)
+    return True
+
+
 def _patched_extra_conds(self, **kwargs):
-    out = _orig_extra_conds(self, **kwargs)
+    out = _ORIG["extra_conds"](self, **kwargs)
     keyframes = kwargs.get("minimax_keyframes", None)
     refs = kwargs.get("minimax_refs", None)
     if not keyframes or not refs:
@@ -100,38 +128,13 @@ def _patched_extra_conds(self, **kwargs):
 
 
 def apply_patch():
-    global _orig_extra_conds, _applied
-    if _applied:
-        return True
-    cls = getattr(model_base, "MiniMaxH3", None)
-    if cls is None or not hasattr(cls, "extra_conds"):
-        _LOG.warning("h3_motion_context: MiniMaxH3.extra_conds not found, "
-                     "keyframes and refs cannot be combined")
-        return False
-    current = cls.extra_conds
-    if current is not _patched_extra_conds and \
-            getattr(current, "_h3mc_payload_patcher", False):
-        _orig_extra_conds = current._h3mc_payload_orig
-        _applied = True
-        return True
-    if current is not _patched_extra_conds:
-        foreign_orig = _recover_foreign(current, _FOREIGN_ORIG_NAMES)
-        if foreign_orig is not None:
-            _orig_extra_conds = foreign_orig
-            _patched_extra_conds._h3mc_payload_orig = _orig_extra_conds
-            _patched_extra_conds._h3mc_payload_patcher = True
-            cls.extra_conds = _patched_extra_conds
-            _applied = True
-            _LOG.warning("h3_motion_context: took over the extra_conds patch "
-                         "installed by another h3_motion_context copy")
-            return True
-    _orig_extra_conds = current
-    _patched_extra_conds._h3mc_payload_orig = _orig_extra_conds
-    _patched_extra_conds._h3mc_payload_patcher = True
-    cls.extra_conds = _patched_extra_conds
-    _applied = True
-    _LOG.info("h3_motion_context: keyframe/ref coexistence enabled")
-    return True
+    return _install(
+        getattr(model_base, "MiniMaxH3", None), "extra_conds",
+        _patched_extra_conds, _FOREIGN_ORIG_NAMES,
+        "keyframes and refs cannot be combined",
+        "keyframe/ref coexistence enabled")
+
+
 def _target_audio_segment(layout):
     """(start_row, steps) of the target audio stream segment in the layout.
 
@@ -217,7 +220,7 @@ def _patched_cond_audio_rows(self, payload, device):
             _LOG.warning("h3_motion_context: cond_audio_latents/refs mismatch "
                          "(%d vs %d), per-block strength disabled this run",
                          len(latents), len(audio_refs))
-        return _orig_cond_audio_rows(self, payload, device)
+        return _ORIG["_cond_audio_rows"](self, payload, device)
 
     stash = payload.get(_BLEND_ROWS_KEY) or {}
     rows = []
@@ -248,38 +251,11 @@ def _patched_cond_audio_rows(self, payload, device):
 
 
 def apply_cond_audio_patch():
-    global _orig_cond_audio_rows, _cond_applied
-    if _cond_applied:
-        return True
-    cls = getattr(mm_model, "MiniMaxH3Model", None)
-    if cls is None or not hasattr(cls, "_cond_audio_rows"):
-        _LOG.warning("h3_motion_context: MiniMaxH3Model._cond_audio_rows not "
-                     "found, per-block audio strength unavailable")
-        return False
-    current = cls._cond_audio_rows
-    if current is not _patched_cond_audio_rows and \
-            getattr(current, "_h3mc_cond_audio_patcher", False):
-        _orig_cond_audio_rows = current._h3mc_cond_audio_orig
-        _cond_applied = True
-        return True
-    if current is not _patched_cond_audio_rows:
-        foreign_orig = _recover_foreign(current, _FOREIGN_ORIG_NAMES)
-        if foreign_orig is not None:
-            _orig_cond_audio_rows = foreign_orig
-            _patched_cond_audio_rows._h3mc_cond_audio_orig = _orig_cond_audio_rows
-            _patched_cond_audio_rows._h3mc_cond_audio_patcher = True
-            cls._cond_audio_rows = _patched_cond_audio_rows
-            _cond_applied = True
-            _LOG.warning("h3_motion_context: took over the cond-audio patch "
-                         "installed by another h3_motion_context copy")
-            return True
-    _orig_cond_audio_rows = current
-    _patched_cond_audio_rows._h3mc_cond_audio_orig = _orig_cond_audio_rows
-    _patched_cond_audio_rows._h3mc_cond_audio_patcher = True
-    cls._cond_audio_rows = _patched_cond_audio_rows
-    _cond_applied = True
-    _LOG.info("h3_motion_context: per-block audio strength enabled")
-    return True
+    return _install(
+        getattr(mm_model, "MiniMaxH3Model", None), "_cond_audio_rows",
+        _patched_cond_audio_rows, _FOREIGN_ORIG_NAMES,
+        "per-block audio strength unavailable",
+        "per-block audio strength enabled")
 
 
 def _patched_forward(self, x, timestep, context, transformer_options={},
@@ -298,7 +274,7 @@ def _patched_forward(self, x, timestep, context, transformer_options={},
     global _warned_no_blend
     payload = minimax_payload or {}
     blend = None
-    if payload.get(_BLEND_MAP_KEY) is None and _orig_forward is not None:
+    if payload.get(_BLEND_MAP_KEY) is None:
         if isinstance(x, (list, tuple)) and len(x) > 1 and x[1] is not None \
                 and getattr(x[1], "ndim", 0) == 4:
             blend = _audio_blend_map(payload.get("layout"),
@@ -334,53 +310,14 @@ def _patched_forward(self, x, timestep, context, transformer_options={},
                 sel = audio_rows.index_select(0, pair.to(audio_rows.device))
                 stash[i] = sel.reshape(rt * 2, audio_rows.shape[1])
         payload[_BLEND_ROWS_KEY] = stash
-    return _orig_forward(self, x, timestep, context,
-                         transformer_options=transformer_options,
-                         minimax_payload=minimax_payload, **kwargs)
+    return _ORIG["forward"](self, x, timestep, context,
+                            transformer_options=transformer_options,
+                            minimax_payload=minimax_payload, **kwargs)
 
 
 def apply_forward_patch():
-    global _orig_forward, _forward_applied
-    if _forward_applied:
-        return True
-    cls = getattr(mm_model, "MiniMaxH3Model", None)
-    if cls is None or not hasattr(cls, "forward"):
-        _LOG.warning("h3_motion_context: MiniMaxH3Model.forward not found, "
-                     "per-block audio strength blending unavailable")
-        return False
-    current = cls.forward
-    if current is not _patched_forward and \
-            getattr(current, "_h3mc_forward_patcher", False):
-        _orig_forward = current._h3mc_forward_orig
-        _forward_applied = True
-        return True
-    if current is not _patched_forward:
-        foreign_orig = _recover_foreign(current, _FOREIGN_ORIG_NAMES)
-        if foreign_orig is not None:
-            _orig_forward = foreign_orig
-            _patched_forward._h3mc_forward_orig = _orig_forward
-            _patched_forward._h3mc_forward_patcher = True
-            cls.forward = _patched_forward
-            _forward_applied = True
-            _LOG.warning("h3_motion_context: took over the forward patch "
-                         "installed by another h3_motion_context copy")
-            return True
-    _orig_forward = current
-    _patched_forward._h3mc_forward_orig = _orig_forward
-    _patched_forward._h3mc_forward_patcher = True
-    cls.forward = _patched_forward
-    _forward_applied = True
-    _LOG.info("h3_motion_context: continuous audio strength blending enabled")
-    return True
-
-
-def is_cond_audio_applied():
-    return _cond_applied
-
-
-def is_forward_applied():
-    return _forward_applied
-
-
-def is_applied():
-    return _applied
+    return _install(
+        getattr(mm_model, "MiniMaxH3Model", None), "forward",
+        _patched_forward, _FOREIGN_ORIG_NAMES,
+        "continuous audio strength blending unavailable",
+        "continuous audio strength blending enabled")

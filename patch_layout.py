@@ -68,12 +68,10 @@ _orig_init = None
 _applied = False
 
 
-def _find_dup_installs(root=None):
+def _find_dup_installs():
     """Folder names of other H3-Motion-Context copies in custom_nodes."""
     here = os.path.dirname(os.path.abspath(__file__))
     base = os.path.dirname(here)
-    if root is not None:
-        base = root
     if not os.path.isdir(base):
         return []
     try:
@@ -505,15 +503,11 @@ def apply_patch():
         # over, so the wrappers never nest their fixups.
         globs = getattr(current, "__globals__", None) or {}
         foreign_orig = None
-        if isinstance(globs, dict):
-            get = globs.get
-            for name in _FOREIGN_ORIG_NAMES:
-                cand = get(name)
-                if callable(cand) and cand is not current:
-                    foreign_orig = cand
-                    break
-        elif getattr(current, "_h3mc_orig_init", None):
-            foreign_orig = current._h3mc_orig_init
+        for name in _FOREIGN_ORIG_NAMES:
+            cand = globs.get(name)
+            if callable(cand) and cand is not current:
+                foreign_orig = cand
+                break
         if foreign_orig is not None:
             _orig_init = foreign_orig
             _patched_init._h3mc_orig_init = _orig_init
@@ -556,7 +550,3 @@ def apply_patch():
     _applied = True
     _LOG.info("h3_motion_context: interior keyframe anchors enabled")
     return True
-
-
-def is_applied():
-    return _applied
