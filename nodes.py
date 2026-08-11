@@ -37,10 +37,15 @@ import json
 import logging
 import os
 
+import av
+import numpy as np
+import torch
 import comfy.utils
 import folder_paths
 import node_helpers
+from comfy_extras.nodes_audio import f32_pcm
 from comfy_extras.nodes_minimax_h3 import _resize
+from PIL import Image, ImageOps
 from safetensors.torch import load_file as _st_load, save_file as _st_save
 
 from .patch_layout import (
@@ -148,6 +153,76 @@ def _encode_audio_window(audio_vae, audio, seconds, tail=True):
         waveform = waveform[..., :want]
     z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
     return z, int(z.shape[-1])
+
+
+def _media_ref_path(media):
+    """Resolve an uploaded media ref {name, subfolder, type} to a file path."""
+    name = media.get("name") if isinstance(media, dict) else None
+    if not name:
+        raise ValueError("h3_motion_context: clip media ref has no name")
+    sub = media.get("subfolder") or ""
+    ref = "%s/%s" % (sub, name) if sub else name
+    path = folder_paths.get_annotated_filepath(
+        "%s [%s]" % (ref, media.get("type") or "input"))
+    if not os.path.isfile(path):
+        raise ValueError(
+            "h3_motion_context: media file not found: %s" % ref)
+    return path
+
+
+def _load_image_file(media):
+    """Load an uploaded still image as [1,H,W,C] float IMAGE frames."""
+    img = node_helpers.pillow(
+        ImageOps.exif_transpose,
+        node_helpers.pillow(Image.open, _media_ref_path(media)))
+    img = img.convert("RGB")
+    return torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0)[None]
+
+
+def _load_media_file(media):
+    """Decode an uploaded audio/video file with PyAV.
+
+    Returns {"frames": [B,H,W,C]|None, "audio": AUDIO dict|None}, decoding
+    whatever streams the file actually has.
+    """
+    frames, audio = None, None
+    with av.open(_media_ref_path(media)) as af:
+        video = af.streams.video
+        if video:
+            collected = []
+            for frame in af.decode(video[0]):
+                arr = frame.to_ndarray(format="rgb24")
+                collected.append(torch.from_numpy(
+                    np.asarray(arr, dtype=np.float32) / 255.0))
+            if collected:
+                frames = torch.stack(collected)
+        sounds = af.streams.audio
+        if sounds:
+            stream = sounds[0]
+            sr = stream.codec_context.sample_rate
+            n_channels = stream.channels
+            chunks = []
+            for frame in af.decode(stream):
+                buf = torch.from_numpy(frame.to_ndarray())
+                if buf.shape[0] != n_channels:
+                    buf = buf.view(-1, n_channels).t()
+                chunks.append(buf)
+            if chunks:
+                audio = {
+                    "waveform": f32_pcm(torch.cat(chunks, dim=1)).unsqueeze(0),
+                    "sample_rate": int(sr),
+                }
+    return {"frames": frames, "audio": audio}
+
+
+def _slice_audio(audio, seconds):
+    """Drop `seconds` of sound from the FRONT of an AUDIO dict."""
+    sr = int(audio["sample_rate"])
+    n = int(round(seconds * sr))
+    w = audio["waveform"]
+    if n > 0 and n < int(w.shape[-1]):
+        return {"waveform": w[..., n:], "sample_rate": sr}
+    return audio
 
 
 def _streams_from_latent(latent):
@@ -1638,6 +1713,22 @@ class MiniMaxH3Timeline:
 
             if kind == "video":
                 frames = kwargs.get("video_%d" % idx)
+                audio = kwargs.get("video_audio_%d" % idx)
+                src_start = max(0, int(clip.get("src_start") or 0))
+                fmedia = clip.get("file")
+                if fmedia:
+                    data = _load_media_file(fmedia)
+                    frames = data["frames"]
+                    if frames is None:
+                        raise ValueError(
+                            "h3_motion_context: video clip %d file %r has no "
+                            "video stream"
+                            % (idx, fmedia.get("name")))
+                    frames = frames[src_start:]
+                    if audio is None and clip.get("audio_link", True) \
+                            and data["audio"] is not None:
+                        audio = _slice_audio(
+                            data["audio"], src_start / float(FPS))
                 if frames is None:
                     raise ValueError(
                         "h3_motion_context: video clip %d has no frames "
@@ -1705,6 +1796,9 @@ class MiniMaxH3Timeline:
                         "h3_motion_context: image clip %d at frame %d is "
                         "outside 1..%d" % (idx, start, frame_count))
                 image = kwargs.get("image_%d" % idx)
+                fmedia = clip.get("file")
+                if fmedia:
+                    image = _load_image_file(fmedia)
                 if image is None:
                     raise ValueError(
                         "h3_motion_context: image clip %d has no image "
@@ -1737,6 +1831,18 @@ class MiniMaxH3Timeline:
                 a_start, a_len = self._fit_audio(
                     start, clip.get("len") or 22, frame_count, idx)
                 audio = kwargs.get("audio_%d" % idx)
+                fmedia = clip.get("file")
+                if fmedia:
+                    data = _load_media_file(fmedia)
+                    audio = data["audio"]
+                    if audio is None:
+                        raise ValueError(
+                            "h3_motion_context: audio clip %d file %r has no "
+                            "audio stream"
+                            % (idx, fmedia.get("name")))
+                    audio = _slice_audio(
+                        audio,
+                        max(0, int(clip.get("src_start") or 0)) / float(FPS))
                 if audio is None:
                     raise ValueError(
                         "h3_motion_context: audio clip %d has no clip "

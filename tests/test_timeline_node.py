@@ -195,4 +195,103 @@ except ValueError:
 print("audio_vae requirement OK")
 
 
+# --- uploaded media files: clips reference {name, subfolder, type} ---
+from PIL import Image as _PILImage
+import io as _io
+import imageio_ffmpeg
+import json
+import numpy as np
+import os
+import wave
+
+folder_paths = pkg.nodes.folder_paths
+inp_dir = folder_paths.get_input_directory()
+os.makedirs(inp_dir, exist_ok=True)
+
+_tmp = []
+def _tmpfile(name, write):
+    path = os.path.join(inp_dir, name)
+    write(path)
+    _tmp.append(path)
+    return {"name": name, "subfolder": "", "type": "input"}
+
+# still image
+_tmpfile("h3tl_tmp.png", lambda p: _PILImage.fromarray(
+    np.full((12, 12, 3), 255, dtype=np.uint8)).save(p))
+# 16-frame mp4 (no audio track)
+def _mk_video(p):
+    w = imageio_ffmpeg.write_frames(p, (12, 12), fps=24)
+    w.send(None)
+    for _ in range(16):
+        w.send(np.full((12, 12, 3), 200, dtype=np.uint8))
+    w.close()
+_tmpfile("h3tl_tmp.mp4", _mk_video)
+# 2 s mono wav at 16 kHz
+def _mk_wav(p):
+    n = 32000
+    data = (np.linspace(-1, 1, n) * 32767).astype(np.int16)
+    with wave.open(p, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(16000)
+        f.writeframes(data.tobytes())
+_tmpfile("h3tl_tmp.wav", _mk_wav)
+
+img_media = _tmp[0] and {"name": "h3tl_tmp.png", "subfolder": "", "type": "input"}
+vid_media = {"name": "h3tl_tmp.mp4", "subfolder": "", "type": "input"}
+wav_media = {"name": "h3tl_tmp.wav", "subfolder": "", "type": "input"}
+
+# image file clip: no input required
+state = json.dumps({"clips": [{"id": 1, "kind": "image", "start": 4,
+                               "strength": 1, "file": img_media}]})
+cond = run(state, AudioVAE(), vae=FakeVideoVAE())
+assert len(cond["minimax_keyframes"]) == 1
+assert cond["minimax_keyframes"][0][pl.MC_KEY] == 3
+print("uploaded image clip OK")
+
+# video file clip with src_start: 16 frames, start at frame 10, 5 frames
+# from source frame 10 -> window [10..15), run 5 -> 2 latent steps
+avv = AudioVAE()
+state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 10,
+                               "len": 5, "src_start": 10,
+                               "file": vid_media}]})
+cond = run(state, avv, vae=FakeVideoVAE())
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 2, len(kfs)
+assert kfs[0][pl.MC_KEY] == 9 and kfs[1][pl.MC_KEY] == 10
+assert (cond.get("minimax_refs") or []) == []  # mp4 has no audio -> silent
+print("uploaded video file clip OK: src_start window, silent track")
+
+# audio file clip with src_start: 2 s wav, drop 1 s, window the rest
+ava = AudioVAE()
+state = json.dumps({"clips": [{"id": 1, "kind": "audio", "start": 30,
+                               "len": 22, "src_start": 24,
+                               "file": wav_media}]})
+cond = run(state, ava, vae=FakeVideoVAE())
+refs = cond["minimax_refs"]
+assert len(refs) == 1
+assert refs[0][pl.MC_AUDIO_KEY] == 51.0, refs[0][pl.MC_AUDIO_KEY]  # 30-1+22
+w = ava.windows[0]
+want = int(round(22 / 24.0 * 16000))
+assert int(w.shape[1]) == min(want, 16000), w.shape  # 1 s left after slice
+print("uploaded audio file clip OK: src_start slice + window")
+
+# missing file raises
+try:
+    run(json.dumps({"clips": [{"id": 1, "kind": "image", "start": 4,
+                               "file": {"name": "missing.png",
+                                        "type": "input"}}]}),
+        AudioVAE(), vae=FakeVideoVAE())
+    raise AssertionError("missing media file must raise")
+except ValueError:
+    pass
+print("missing media file validation OK")
+
+for p in _tmp:
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+
+
 print("PASS: timeline super node")
