@@ -47,11 +47,13 @@ from .patch_layout import (
     MC_KEY,
     MC_AUDIO_KEY,
     MC_AUDIO_STRENGTH,
+    MC_VIDEO_STRENGTH,
     apply_patch as _apply_layout_patch,
 )
 from .patch_payload import (
     apply_patch as _apply_payload_patch,
     apply_cond_audio_patch as _apply_cond_audio_patch,
+    apply_cond_video_patch as _apply_cond_video_patch,
     apply_forward_patch as _apply_forward_patch,
 )
 
@@ -95,10 +97,14 @@ def _ensure_h3_runtime_patches():
         raise RuntimeError(
             "h3_motion_context: could not enable per-block audio strength. "
             "Check the ComfyUI console.")
+    if not _apply_cond_video_patch():
+        raise RuntimeError(
+            "h3_motion_context: could not enable per-block video strength. "
+            "Check the ComfyUI console.")
     if not _apply_forward_patch():
         raise RuntimeError(
-            "h3_motion_context: could not enable continuous audio strength "
-            "blending. Check the ComfyUI console.")
+            "h3_motion_context: could not enable the per-keyframe pin/flip "
+            "schedule. Check the ComfyUI console.")
 
 
 def _pixel_frames(latent_t):
@@ -776,24 +782,41 @@ class MiniMaxH3MotionContextLoadLatent:
 
 
 class _DynamicInputs(dict):
-    """Dynamic backend input map: accepts any key under `prefix`."""
+    """Dynamic backend input map: accepts any key under any declared prefix.
+    Fixed entries (keyword arguments) are stored as real dict items so they
+    survive API serialization and enumerate normally.
 
-    def __init__(self, prefix, types):
-        self._prefix = prefix
-        self._types = types
+    Legacy two-argument form (one prefix, one type) still works.
+    """
+
+    def __init__(self, *pairs, **fixed):
+        self._prefixes = {}
+        if len(pairs) == 2 and isinstance(pairs[0], str) \
+                and isinstance(pairs[1], (tuple, list)):
+            pairs = [pairs]
+        # longest prefix wins, so "video_audio_" beats "video_"
+        for prefix, types in sorted(pairs, key=lambda p: -len(p[0])):
+            self._prefixes[prefix] = types
+        for name, spec in fixed.items():
+            dict.__setitem__(self, name, spec)
 
     def __contains__(self, key):
-        return isinstance(key, str) and key.startswith(self._prefix)
+        return (isinstance(key, str)
+                and any(key.startswith(p) for p in self._prefixes)) \
+                or dict.__contains__(self, key)
 
     def __getitem__(self, key):
-        if isinstance(key, str) and key.startswith(self._prefix):
-            return self._types
-        raise KeyError(key)
+        if isinstance(key, str):
+            for prefix, types in self._prefixes.items():
+                if key.startswith(prefix):
+                    return types
+        return dict.__getitem__(self, key)
 
     def get(self, key, default=None):
-        if isinstance(key, str) and key.startswith(self._prefix):
-            return self._types
-        return default
+        try:
+            return self[key]
+        except KeyError:
+            return default
 
 class MiniMaxH3CustomKeyframes:
     """Attach still-image H3 keyframes at arbitrary timeline positions."""
@@ -1025,11 +1048,12 @@ class MiniMaxH3CustomAudio:
                 instant on is pinned, the model leads into it.
 
     Each slot has a strength ("audio N strength") between 0.05 and 1.0 that
-    sets the clip's INFLUENCE on that zone: 1.0 pins the clip exactly, and
-    every step of denoising mixes the clip with the model's own evolving
-    generation at a strength ratio, so 0.5 gives the clip half influence
-    (the model may reshape half the sound), 0.1 a light touch (the model
-    creates most of the sound), and the transition is continuous.
+    sets how much of the clip stays pinned: the rows are pinned EXACT (clean,
+    no noise) while the audio schedule's progress stays below the strength,
+    then the block's tokens are dropped from the layout and the model's own
+    stream covers the region with no reference at all. So 1.0 pins exactly,
+    0.9 almost the clip, 0.5 pinned half then free re-render, 0.1 a light
+    early-structure hint. Nothing noisy is ever shown to the model.
     """
 
     MAX_AUDIOS = 16
@@ -1250,6 +1274,195 @@ class MiniMaxH3CustomAudio:
         return (out,)
 
 
+class MiniMaxH3CustomVideo:
+    """Pin full video clips onto the H3 output timeline.
+
+    Each clip is encoded in one VAE call; every latent step becomes a cond
+    block anchored at its own pixel frame, so the motion lives inside the
+    latents like a run of keyframes. An optional audio track per clip is
+    windowed to that clip's duration (a longer track is cut from its start)
+    and end-aligned with the clip's last frame.
+
+    Each slot has a strength ("video N strength") between 0.05 and 1.0 that
+    sets how much of the clip stays pinned: the clip is pinned EXACT (clean
+    rows under the canonical 0.999 claim) for the first `strength`-fraction
+    of the run, then its tokens are dropped from the layout and the model's
+    own stream covers the region with no reference at all. So 1.0 pins
+    exactly, 0.9 almost the clip, 0.5 pinned half then free re-render,
+    0.1 a light early-structure hint. Nothing noisy is ever shown to the
+    model. The clip's audio track follows the same strength on the same
+    schedule (audio timeline, shifted via time_shift_sigma).
+    """
+
+    MAX_VIDEOS = 8
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "conditioning": ("CONDITIONING", {
+                    "tooltip": "H3 conditioning. The node replaces its "
+                               "minimax_keyframes list with the videos' cond "
+                               "blocks and appends any audio refs to existing "
+                               "refs."}),
+                "vae": ("VAE", {
+                    "tooltip": "MiniMax H3 video VAE used to encode the "
+                               "clips."}),
+                "latent": ("LATENT", {
+                    "tooltip": "Target MiniMax H3 AV latent; defines "
+                               "resolution and exact frame count."}),
+                "video_state": ("STRING", {
+                    "default": '{"count":1,"positions":[1],"strengths":[1]}',
+                    "multiline": False,
+                    "tooltip": "Internal UI state. Normally managed by the "
+                               "video position and strength controls."}),
+                "indexing": (["1-based", "0-based"], {"default": "1-based"}),
+                "crop": (["disabled", "center"], {"default": "disabled"}),
+            },
+            "optional": _DynamicInputs(
+                ("video_", ("IMAGE",)),
+                ("video_audio_", ("AUDIO",)),
+                audio_vae=("VAE", {
+                    "tooltip": "H3 audio VAE. Required when any clip has an "
+                               "audio track wired."}),
+            ),
+        }
+
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "apply"
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = ("Pin full video clips, each with its own position, "
+                   "strength and optional audio track, onto the H3 timeline. "
+                   "Starts with 1 video slot; use + Add video for more. "
+                   "Strength 1.0 pins the clip exactly (default); lower "
+                   "values let the model vary the content more.")
+
+    def apply(self, conditioning, vae, latent, video_state,
+              indexing="1-based", crop="disabled", audio_vae=None, **kwargs):
+        _ensure_h3_runtime_patches()
+
+        try:
+            state = json.loads(video_state or "{}")
+        except Exception as exc:
+            raise ValueError(
+                "h3_motion_context: invalid H3 Custom Video UI state"
+            ) from exc
+
+        positions = state.get("positions", [])
+        count = int(state.get("count", len(positions)))
+        strengths = state.get("strengths", [])
+
+        if count < 1 or count > self.MAX_VIDEOS:
+            raise ValueError(
+                "h3_motion_context: Custom Video count must be 1..%d"
+                % self.MAX_VIDEOS)
+        if len(positions) < count:
+            raise ValueError(
+                "h3_motion_context: %d video slots but only %d saved "
+                "positions" % (count, len(positions)))
+        if len(strengths) < count:
+            strengths = [1.0] * count
+        strengths = [min(1.0, max(0.05, float(s)))
+                     for s in strengths[:count]]
+
+        target = _video_from_latent(latent)
+        width = int(target.shape[4]) * 16
+        height = int(target.shape[3]) * 16
+        frame_count = _pixel_frames(int(target.shape[2]))
+
+        keyframes = []
+        audio_refs = []
+        infos = []
+        for slot in range(1, count + 1):
+            raw_position = int(positions[slot - 1])
+            zero_based = (raw_position - 1 if indexing == "1-based"
+                          else raw_position)
+
+            video = kwargs.get("video_%d" % slot)
+            if video is None:
+                raise ValueError(
+                    "h3_motion_context: video %d has no clip connected" % slot)
+            if getattr(video, "ndim", 0) != 4 or int(video.shape[0]) < 1:
+                raise ValueError(
+                    "h3_motion_context: video %d expected IMAGE frames "
+                    "[B,H,W,C]" % slot)
+
+            n = int(video.shape[0])
+            run = next(g for g in VIDEO_RUN_GRID if g <= n)
+            if run != n:
+                _LOG.warning(
+                    "h3_motion_context: video %d has %d frames, off the VAE "
+                    "grid; pinning the first %d (usable runs: 1, 5, 22, 39)",
+                    slot, n, run)
+
+            if zero_based < 0 or zero_based + run > frame_count:
+                raise ValueError(
+                    "h3_motion_context: video %d does not fit: %d frames "
+                    "starting at position %d in a %d frame clip"
+                    % (slot, run, raw_position, frame_count))
+
+            enc = vae.encode(_resize(video[:run], width, height, crop))
+            steps = int(enc.shape[2])
+            if _pixel_frames(steps) != run:
+                raise RuntimeError(
+                    "h3_motion_context: video %d encoded %d frames to %d "
+                    "latent steps; the VAE grid no longer matches "
+                    "VIDEO_RUN_GRID. Upstream VAE change, refusing to run."
+                    % (slot, run, steps))
+
+            strength = strengths[slot - 1]
+            offsets = _step_offsets(steps)
+            for k, off in enumerate(offsets):
+                keyframes.append({
+                    "resolved_frame_index": 0,
+                    MC_KEY: zero_based + off,
+                    MC_VIDEO_STRENGTH: strength,
+                    "latent": enc[:, :, k:k + 1],
+                })
+
+            audio_info = "off"
+            audio = kwargs.get("video_audio_%d" % slot)
+            if audio is not None:
+                if audio_vae is None:
+                    raise ValueError(
+                        "h3_motion_context: video %d has an audio track but "
+                        "no audio_vae. Wire the H3 audio VAE." % slot)
+                audio_latent, ref_audio_t = _encode_audio_window(
+                    audio_vae, audio, run / float(FPS), tail=False)
+                # end-aligned with this video's last frame: the block ends
+                # at 1-based frame zero_based + run
+                audio_refs.append({
+                    "kind": "audio",
+                    "ref_audio_t": ref_audio_t,
+                    "audio_latent": audio_latent,
+                    MC_AUDIO_KEY: float(zero_based + run),
+                    MC_AUDIO_STRENGTH: strength,
+                })
+                audio_info = "%d latent steps" % ref_audio_t
+
+            infos.append((slot, zero_based, zero_based + run - 1, run,
+                          audio_info))
+
+        out = node_helpers.conditioning_set_values(conditioning, {
+            "minimax_keyframes": keyframes,
+            "minimax_frame_count": frame_count,
+        })
+        if audio_refs:
+            out = node_helpers.conditioning_set_values(
+                out, {"minimax_refs": audio_refs}, append=True)
+
+        _LOG.info(
+            "h3_motion_context: Custom Video pinned %d clips (%d cond blocks "
+            "total) in a %d-frame clip: %s",
+            count, len(keyframes), frame_count,
+            ", ".join("video %d = %d frames at %d..%d, audio %s"
+                      % (slot, run, start, end, ai)
+                      for slot, start, end, run, ai in infos),
+        )
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3MotionContext": MiniMaxH3MotionContext,
     "MiniMaxH3MotionContextTrim": MiniMaxH3MotionContextTrim,
@@ -1257,6 +1470,7 @@ NODE_CLASS_MAPPINGS = {
     "MiniMaxH3MotionContextLoadLatent": MiniMaxH3MotionContextLoadLatent,
     "MiniMaxH3CustomKeyframes": MiniMaxH3CustomKeyframes,
     "MiniMaxH3CustomAudio": MiniMaxH3CustomAudio,
+    "MiniMaxH3CustomVideo": MiniMaxH3CustomVideo,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3MotionContext": "H3 Motion Context",
@@ -1265,4 +1479,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3MotionContextLoadLatent": "H3 Motion Context Load Latent",
     "MiniMaxH3CustomKeyframes": "H3 Custom Keyframes",
     "MiniMaxH3CustomAudio": "H3 Custom Audio",
+    "MiniMaxH3CustomVideo": "H3 Custom Video",
 }

@@ -16,9 +16,16 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
         positionRegex,
         extName,
         hasStrength = false,
+        strengthLabel = (i) => `audio ${i} strength`,
+        strengthTooltip =
+            "How much of the clip the model may re-render: 1.0 pins it " +
+            "exactly; 0.9 almost the clip, minor reshaping; 0.5 half clip " +
+            "half model; 0.1 a light hint. The zone stays clean at any " +
+            "strength.",
+        extraInputs = [],
     } = cfg;
 
-    const strengthWidgetName = (i) => `audio ${i} strength`;
+    const strengthWidgetName = (i) => strengthLabel(i);
 
     function stateWidget(node) {
         return node.widgets?.find((w) => w.name === stateWidgetName);
@@ -75,6 +82,10 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
         return `${slotPrefix}${i}`;
     }
 
+    function extraInputName(extra, i) {
+        return `${extra.prefix}${i}`;
+    }
+
     function positionWidgetName(i) {
         return positionLabel(i);
     }
@@ -87,16 +98,25 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
         if (findInput(node, inputName(i)) >= 0) return;
 
         node.addInput(inputName(i), slotType, { label: slotLabel(i) });
+        for (const extra of extraInputs) {
+            if (findInput(node, extraInputName(extra, i)) < 0) {
+                node.addInput(extraInputName(extra, i), extra.type, {
+                    label: extra.label(i),
+                });
+            }
+        }
     }
 
     function removeInput(node, i) {
-        const slot = findInput(node, inputName(i));
-        if (slot < 0) return;
+        for (const name of [inputName(i), ...extraInputs.map((e) => extraInputName(e, i))]) {
+            const slot = findInput(node, name);
+            if (slot < 0) continue;
 
-        if (node.inputs?.[slot]?.link != null) {
-            node.disconnectInput(slot);
+            if (node.inputs?.[slot]?.link != null) {
+                node.disconnectInput(slot);
+            }
+            node.removeInput(slot);
         }
-        node.removeInput(slot);
     }
 
     function findPositionWidget(node, i) {
@@ -165,11 +185,7 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
                 max: 1,
                 step: 0.01,
                 precision: 2,
-                tooltip:
-                    "Clip influence on that zone: 1.0 pins it exactly; 0.5 is " +
-                    "half clip / half model generation; 0.1 is a light hint " +
-                    "(the model creates most of the sound). Continuous, no " +
-                    "cutoffs.",
+                tooltip: strengthTooltip,
             },
         );
 

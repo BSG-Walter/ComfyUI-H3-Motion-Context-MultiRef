@@ -67,17 +67,20 @@ Unused media is windowed at the anchor: an `end`-aligned clip longer than its po
 
 ### Per-clip strength
 
-Each audio slot gets a **strength** widget (`audio N strength`) that sets the clip's **influence** on its zone continuously:
+Each audio slot gets a **strength** widget (`audio N strength`) that sets how much of the clip the model may re-render:
 
 ```text
 1.0      the clip is pinned exactly (default) - the model reproduces it faithfully
 0.9      almost the clip - the model may only reshape minor details
-0.5      half clip, half the model's own generation
+0.5      half clip, half the model's own re-render
 0.1      a light hint - the model creates most of the sound
-  ~0     transparent - the zone is essentially free
 ```
 
-Every denoising step blends the clip with what the model itself is generating at that zone (`strength * clip + (1 - strength) * generation`), so intermediate values behave like true fractions of influence with no cutoffs and no noise floor. The strength lives per audio slot inside `audio_state` (the `"strengths"` array), so it travels with the widget state and survives copies.
+Weak audio blocks use the same **pin-then-flip schedule** as video: the clip is pinned **exact** (clean rows, canonical 0.999 claim) while the audio schedule's progress stays below the strength, then its tokens are dropped from the layout, letting the model's own stream cover the region with no reference at all - `1.0` exact, `0.5` pinned half then free, `0.0` a pure prompt block. Nothing noisy is ever shown to the model, so there is no noise floor.
+
+The Custom Video node's per-slot strength governs each clip's audio track the same way. Its **video** strength is the same schedule: the clip is pinned **exact** (clean rows, canonical 0.999 claim) for the first `strength`-fraction of the run and its tokens are then dropped from the layout, letting the model's own stream cover the region with no reference at all - `1.0` exact, `0.5` pinned half then free, `0.0` a pure prompt block.
+
+The strength lives per audio slot inside `audio_state` (the `"strengths"` array), so it travels with the widget state and survives copies.
 
 ## Recommended Motion Context settings
 

@@ -49,6 +49,7 @@ import comfy.ldm.minimax.model as mm
 MC_KEY = "motion_context_index"
 MC_AUDIO_KEY = "motion_context_audio_end_frame"
 MC_AUDIO_STRENGTH = "motion_context_audio_strength"
+MC_VIDEO_STRENGTH = "motion_context_video_strength"
 _LOG = logging.getLogger("h3_motion_context")
 
 # Module-global names older copies of this code (or of the upstream package)
