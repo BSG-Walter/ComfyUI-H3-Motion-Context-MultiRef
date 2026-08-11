@@ -819,7 +819,17 @@ class _DynamicInputs(dict):
             return default
 
 class MiniMaxH3CustomKeyframes:
-    """Attach still-image H3 keyframes at arbitrary timeline positions."""
+    """Attach still-image H3 keyframes at arbitrary timeline positions.
+
+    Each slot has a strength ("keyframe N strength") between 0.05 and 1.0
+    that sets how much of the run the image stays pinned: the rows are
+    pinned EXACT (clean, under the canonical 0.999 claim) while the video
+    schedule's progress stays below the strength, then the block's tokens
+    are dropped from the layout and the model's own stream covers the
+    region with no reference at all. So 1.0 pins exactly, 0.9 almost the
+    image, 0.5 pinned half then free re-render, 0.1 a light early-structure
+    hint. Nothing noisy is ever shown to the model.
+    """
 
     MAX_KEYFRAMES = 32
 
@@ -857,12 +867,13 @@ class MiniMaxH3CustomKeyframes:
                     "STRING",
                     {
                         "default": (
-                            '{"count":3,"positions":[1,22,79]}'
+                            '{"count":3,"positions":[1,22,79],'
+                            '"strengths":[1,1,1]}'
                         ),
                         "multiline": False,
                         "tooltip": (
                             "Internal UI state. Normally managed by the "
-                            "keyframe position controls."
+                            "keyframe position and strength controls."
                         ),
                     },
                 ),
@@ -884,7 +895,9 @@ class MiniMaxH3CustomKeyframes:
     CATEGORY = "conditioning/minimax"
     DESCRIPTION = (
         "Pin still-image MiniMax H3 keyframes at arbitrary output-frame "
-        "positions. Starts with 3 keyframes; use + Add keyframe to add more."
+        "positions. Starts with 3 keyframes; use + Add keyframe to add more. "
+        "Strength 1.0 pins the image exactly (default); lower values let "
+        "the model vary the content more."
     )
 
     def apply(
@@ -908,6 +921,7 @@ class MiniMaxH3CustomKeyframes:
 
         positions = state.get("positions", [])
         count = int(state.get("count", len(positions)))
+        strengths = state.get("strengths", [])
 
         if count < 1 or count > self.MAX_KEYFRAMES:
             raise ValueError(
@@ -919,6 +933,10 @@ class MiniMaxH3CustomKeyframes:
                 "h3_motion_context: %d keyframe slots but only %d saved "
                 "positions" % (count, len(positions))
             )
+        if len(strengths) < count:
+            strengths = [1.0] * count
+        strengths = [min(1.0, max(0.05, float(s)))
+                     for s in strengths[:count]]
 
         video = _video_from_latent(latent)
         width = int(video.shape[4]) * 16
@@ -1003,6 +1021,7 @@ class MiniMaxH3CustomKeyframes:
                 # location is applied lazily through MC_KEY.
                 "resolved_frame_index": 0,
                 MC_KEY: int(pixel_index),
+                MC_VIDEO_STRENGTH: strengths[slot - 1],
                 "latent": encoded,
             })
 

@@ -86,6 +86,35 @@ assert refs[0][pl.MC_AUDIO_STRENGTH] == 0.5
 print("video node apply OK: 2 clips, per-clip strength, per-clip audio")
 
 
+# --- Custom Keyframes node: per-keyframe strength rides on MC_VIDEO_STRENGTH;
+# legacy states without strengths pin every keyframe at 1.0 ---
+class FakeStillVAE:
+    def encode(self, pix):
+        return torch.zeros(pix.shape[0], 4, 1, 2, 2)  # one H3 still latent
+
+
+kfnode = n.MiniMaxH3CustomKeyframes()
+state = '{"count":3,"positions":[1,11,22],"strengths":[0.5,1.0,0.25]}'
+out = kfnode.apply([[torch.zeros(1, 7, 4), {}]], FakeStillVAE(),
+                   {"samples": FakeAV()}, state, "1-based", "disabled",
+                   keyframe_image_1=torch.rand(1, 12, 12, 3),
+                   keyframe_image_2=torch.rand(1, 12, 12, 3),
+                   keyframe_image_3=torch.rand(1, 12, 12, 3))
+kfs = out[0][0][1]["minimax_keyframes"]
+assert len(kfs) == 3
+assert kfs[0][pl.MC_KEY] == 0 and kfs[0][pl.MC_VIDEO_STRENGTH] == 0.5
+assert kfs[1][pl.MC_KEY] == 10 and kfs[1][pl.MC_VIDEO_STRENGTH] == 1.0
+assert kfs[2][pl.MC_KEY] == 21 and kfs[2][pl.MC_VIDEO_STRENGTH] == 0.25
+out = kfnode.apply([[torch.zeros(1, 7, 4), {}]], FakeStillVAE(),
+                   {"samples": FakeAV()}, '{"count":2,"positions":[1,10]}',
+                   "1-based", "disabled",
+                   keyframe_image_1=torch.rand(1, 12, 12, 3),
+                   keyframe_image_2=torch.rand(1, 12, 12, 3))
+kfs = out[0][0][1]["minimax_keyframes"]
+assert [kf[pl.MC_VIDEO_STRENGTH] for kf in kfs] == [1.0, 1.0]
+print("keyframe node apply OK: per-keyframe strength, legacy state -> 1.0")
+
+
 # --- video pin/flip: marked rows are pinned CLEAN (never noised); the
 # forward wrapper claims them clean (0.999), records the active set, and
 # flips weak blocks out of the layout once t_v crosses their strength. The

@@ -35,6 +35,8 @@ def main():
     # and flips weak blocks out of the layout once their timeline crosses
     # their strength, and the patched packers pin marked rows exact.
     assert 'MC_VIDEO_STRENGTH: strength' in NODES
+    assert 'MC_VIDEO_STRENGTH: strengths[slot - 1]' in NODES
+    assert '"strengths":[1,1,1]' in NODES
     assert '_patched_cond_video_rows' in PAYLOAD
     assert '_patched_forward' in PAYLOAD
     assert 'apply_forward_patch' in PAYLOAD
