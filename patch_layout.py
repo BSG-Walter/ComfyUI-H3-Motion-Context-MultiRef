@@ -233,7 +233,28 @@ def _fixup_audio(layout, text_len, refs):
         shift = desired_start - slot_start
         t[sel] = snapshot[sel] + shift
 
-    # H3_MC_MULTI_REF_AUDIO_SHAREABLE_LAYOUT
+def _assert_moved(td, te, slots, cond_rows, want_shift=None):
+    """Self-test helper: exactly the rows whose pre-shift coordinate falls in
+    one of `slots` moved, each by the same shift."""
+    moved = set(i for i in range(len(td)) if float(td[i]) != float(te[i]))
+    expect = set()
+    for start, end in slots:
+        expect.update(i for i in range(len(td))
+                      if start - 1e-4 <= float(td[i]) < end - 1e-4
+                      and i not in cond_rows)
+    if moved != expect:
+        raise RuntimeError(
+            "audio move touched the wrong rows: %d moved, %d expected, "
+            "e.g. %s" % (len(moved), len(expect),
+                         sorted(moved ^ expect)[:8]))
+    if not moved:
+        raise RuntimeError("audio move moved no rows")
+    if want_shift is not None:
+        deltas = [float(te[i]) - float(td[i]) for i in sorted(moved)]
+        if any(abs(dd - want_shift) > 1e-5 for dd in deltas):
+            raise RuntimeError(
+                "audio rows shifted non-uniformly or by the wrong amount: "
+                "%s vs %.6f" % (deltas[:4], want_shift))
 
 def _patched_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
                   keyframes=None, refs=None, frame_count=None):
@@ -352,24 +373,10 @@ def _self_test():
     for a, b, kind in d.segments:
         if kind == "cond":
             cond_rows.update(range(a, b))
-    expect_moved = set(i for i in range(len(td))
-                       if text_len - 1e-4 <= float(td[i]) < text_len + rt - 1e-4
-                       and i not in cond_rows)
-    moved = set(i for i in range(len(td)) if float(td[i]) != float(te[i]))
-    if moved != expect_moved:
-        raise RuntimeError(
-            "audio move touched the wrong rows: %d moved, %d expected, "
-            "e.g. %s" % (len(moved), len(expect_moved),
-                         sorted(moved ^ expect_moved)[:8]))
-    if not moved:
-        raise RuntimeError("audio move moved no rows")
-    want_shift = mm.FRAME_RESCALE * end_frame  # advance == rt cancels here
-    deltas = [float(te[i]) - float(td[i]) for i in sorted(moved)]
-    if any(abs(dd - want_shift) > 1e-5 for dd in deltas):
-        raise RuntimeError("audio rows shifted non-uniformly or by the wrong "
-                           "amount: %s vs %.6f" % (deltas[:4], want_shift))
+    # advance == rt cancels here, so the shift is just the frame offset
+    _assert_moved(td, te, [(text_len, text_len + rt)], cond_rows,
+                  want_shift=mm.FRAME_RESCALE * end_frame)
 
-    # H3_MC_MULTI_REF_AUDIO_SHAREABLE_SELFTEST
     # Two ordinary image refs followed by the marked MC timeline-audio ref.
     img1 = {"kind": "image", "latent_h": lh, "latent_w": lw}
     img2 = {"kind": "image", "latent_h": lh, "latent_w": lw}
@@ -398,36 +405,17 @@ def _self_test():
     tf, tg = f.position_ids[:, 0], g.position_ids[:, 0]
     prefix = _ref_cursor_advance(refs_plain[:2])
     slot_start = float(text_len) + prefix
-    slot_end = slot_start + float(rt)
 
     cond_rows = set()
     for a, b, kind in f.segments:
         if kind == "cond":
             cond_rows.update(range(a, b))
 
-    expect_moved = set(
-        i for i in range(len(tf))
-        if slot_start - 1e-4 <= float(tf[i]) < slot_end - 1e-4
-        and i not in cond_rows
-    )
-    moved = set(i for i in range(len(tf)) if float(tf[i]) != float(tg[i]))
-
-    if moved != expect_moved:
-        raise RuntimeError(
-            "multi-ref audio move touched the wrong rows: %d moved, %d expected, "
-            "e.g. %s" % (len(moved), len(expect_moved),
-                         sorted(moved ^ expect_moved)[:8]))
-    if not moved:
-        raise RuntimeError("multi-ref audio move moved no rows")
-
     target_origin = float(text_len) + _ref_cursor_advance(refs_marked)
-    desired_start = target_origin + mm.FRAME_RESCALE * end_frame - float(rt)
-    want_multi_shift = desired_start - slot_start
-    multi_deltas = [float(tg[i]) - float(tf[i]) for i in sorted(moved)]
-    if any(abs(dd - want_multi_shift) > 1e-5 for dd in multi_deltas):
-        raise RuntimeError(
-            "multi-ref audio rows shifted non-uniformly or by the wrong "
-            "amount: %s vs %.6f" % (multi_deltas[:4], want_multi_shift))
+    want_multi_shift = (target_origin + mm.FRAME_RESCALE * end_frame
+                        - float(rt) - slot_start)
+    _assert_moved(tf, tg, [(slot_start, slot_start + float(rt))], cond_rows,
+                  want_shift=want_multi_shift)
 
     # Several marked audio refs at different positions on the same timeline
     # (beginning / middle injection). Each block must end exactly at
@@ -450,12 +438,6 @@ def _self_test():
     _fixup(i_plain, text_len, latent_t, frame_count, run, refs=refs_two)
 
     origin2 = float(text_len) + _ref_cursor_advance(refs_two)
-    expected = {}
-    for e, r in zip(ends, refs_two):
-        rt_i = int(r["ref_audio_t"])
-        start = origin2 + mm.FRAME_RESCALE * float(e) - float(rt_i)
-        steps = [start + k for k in range(rt_i)]
-        expected[e] = steps + steps  # stereo: each step contributes two rows
     th = h.position_ids[:, 0]
     ref_audio_segs = [(a, b) for a, b, kind in h.segments
                       if kind == "ref_audio"]
@@ -483,17 +465,15 @@ def _self_test():
                     "(stereo)" % (value, e, hit))
     if not torch.equal(h.position_ids[:, 1:], i_plain.position_ids[:, 1:]):
         raise RuntimeError("multi-mark audio move touched a non-time coordinate")
-    th_plain = i_plain.position_ids[:, 0]
-    moved = [i for i in range(len(th)) if float(th[i]) != float(th_plain[i])]
-    allowed = {v for vals in expected.values() for v in vals}
-    for i in moved:
-        hits = [v for v in allowed if abs(float(th[i]) - v) < 1e-7]
-        if not hits:
-            raise RuntimeError(
-                "multi-mark audio: row %d moved to unexpected time %.9f"
-                % (i, float(th[i])))
-    if not moved:
-        raise RuntimeError("multi-mark audio moved no rows")
+    cond_rows = set()
+    for a, b, kind in h.segments:
+        if kind == "cond":
+            cond_rows.update(range(a, b))
+    # each marked block's rows moved off its stock slot; nothing else did.
+    # The shifts are per-block (non-uniform), so no want_shift here.
+    _assert_moved(i_plain.position_ids[:, 0], th,
+                  [(float(text_len) + j * rt2, float(text_len) + (j + 1) * rt2)
+                   for j in range(len(refs_two))], cond_rows)
 
 
 def apply_patch():
@@ -514,22 +494,15 @@ def apply_patch():
         _applied = True
         _LOG.info("h3_motion_context: adopting the already-installed layout patch")
         return True
-    if current is not _patched_init:
-        # The upstream ComfyUI-H3-Motion-Context package (or another copy of
-        # this code) may have installed its own wrapper first. Its module
-        # captured the stock init in a module global; recover it and take
-        # over, so the wrappers never nest their fixups.
-        foreign_orig = _recover_foreign(current, _FOREIGN_ORIG_NAMES)
-        if foreign_orig is not None:
-            _orig_init = foreign_orig
-            _patched_init._h3mc_orig_init = _orig_init
-            _patched_init._h3mc_layout_patcher = True
-            mm.PackedLayout.__init__ = _patched_init
-            _applied = True
-            _LOG.warning("h3_motion_context: took over the layout patch installed "
-                         "by another h3_motion_context copy; disabling the other "
-                         "package (upstream ComfyUI-H3-Motion-Context) is cleaner")
-            return True
+    if current is not _patched_init and _recover_foreign(
+            current, _FOREIGN_ORIG_NAMES) is not None:
+        # Another copy of this code (or the upstream package) wrapped the
+        # stock init first. Wrapping the wrapper would run the fixups twice,
+        # so refuse: the docs say to delete the other copy.
+        _LOG.warning("h3_motion_context: another H3-Motion-Context copy has "
+                     "already patched PackedLayout.__init__; DELETE every "
+                     "other copy and restart ComfyUI.")
+        return False
     _orig_init = current
     try:
         _self_test()

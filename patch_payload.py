@@ -36,6 +36,7 @@ import comfy.model_base as model_base
 from .patch_layout import (
     MC_AUDIO_STRENGTH,
     MC_VIDEO_STRENGTH,
+    _FOREIGN_ORIG_NAMES,
     _recover_foreign,
 )
 
@@ -43,7 +44,9 @@ _LOG = logging.getLogger("h3_motion_context")
 
 _ORIG = {}
 
-_FOREIGN_ORIG_NAMES = (
+# module-global names a foreign wrapper of the payload attributes may have
+# captured the stock functions under, on top of the layout ones
+_FOREIGN_ORIG_NAMES = _FOREIGN_ORIG_NAMES + (
     "_orig_extra_conds",
     "_orig_cond_audio_rows",
     "_orig_cond_video_rows",
@@ -56,13 +59,22 @@ _FOREIGN_ORIG_NAMES = (
 )
 
 
+def _mix(r, aug, seed):
+    """Stock global-aug row mixing for unmarked blocks."""
+    if aug < 1.0:
+        gen = torch.Generator("cpu").manual_seed(seed)
+        noise = torch.randn(r.shape, generator=gen, dtype=torch.float32)
+        r = aug * r + (1.0 - aug) * noise.to(r.device)
+    return r
+
+
 def _install(cls, attr, patched, foreign_names, gone_msg, done_msg):
     """Adopt or install `patched` over `cls.attr`; returns success.
 
     Idempotent: if our own wrapper (possibly from a previous import of this
     module) already owns the attribute, it is adopted instead of re-wrapped.
     If a wrapper installed by another h3_motion_context copy owns it, the
-    stock function it captured is recovered and taken over.
+    patch is refused: the docs say to delete the other copy.
     """
     if cls is None or not hasattr(cls, attr):
         _LOG.warning("h3_motion_context: %s not found, %s", attr, gone_msg)
@@ -71,16 +83,12 @@ def _install(cls, attr, patched, foreign_names, gone_msg, done_msg):
     if getattr(current, "_h3mc_patcher", False):
         _ORIG[attr] = getattr(current, "_h3mc_orig", current)
         return True
-    if current is not patched:
-        foreign = _recover_foreign(current, foreign_names)
-        if foreign is not None:
-            _ORIG[attr] = foreign
-            setattr(patched, "_h3mc_patcher", True)
-            setattr(patched, "_h3mc_orig", foreign)
-            setattr(cls, attr, patched)
-            _LOG.warning("h3_motion_context: took over the %s patch installed "
-                         "by another h3_motion_context copy", attr)
-            return True
+    if current is not patched and _recover_foreign(
+            current, foreign_names) is not None:
+        _LOG.warning("h3_motion_context: another h3_motion_context copy has "
+                     "already patched %s; DELETE every other copy and "
+                     "restart ComfyUI.", attr)
+        return False
     _ORIG[attr] = current
     setattr(patched, "_h3mc_patcher", True)
     setattr(patched, "_h3mc_orig", current)
@@ -145,10 +153,8 @@ def _patched_cond_audio_rows(self, payload, device):
             continue
         z = r["audio_latent"]
         rr = mm_model.pack_audio(z.to(torch.float32))
-        if r.get(MC_AUDIO_STRENGTH) is None and aug < 1.0:
-            gen = torch.Generator("cpu").manual_seed(seed)
-            noise = torch.randn(rr.shape, generator=gen, dtype=torch.float32)
-            rr = aug * rr + (1.0 - aug) * noise.to(rr.device)
+        if r.get(MC_AUDIO_STRENGTH) is None:
+            rr = _mix(rr, aug, seed)
         rows.append(rr.to(device))
     return torch.cat(rows, dim=0) if rows else None
 
@@ -271,10 +277,8 @@ def _patched_cond_video_rows(self, payload, device):
             continue
         r = mm_model.patchify_video(kf["latent"].to(torch.float32),
                                     self.patch_size)
-        if kf.get(MC_VIDEO_STRENGTH) is None and aug < 1.0:
-            gen = torch.Generator("cpu").manual_seed(seed)
-            noise = torch.randn(r.shape, generator=gen, dtype=torch.float32)
-            r = aug * r + (1.0 - aug) * noise.to(r.device)
+        if kf.get(MC_VIDEO_STRENGTH) is None:
+            r = _mix(r, aug, seed)
         rows.append(r.to(device))
     for r in payload.get("refs") or []:
         if "latent" not in r or r.get("kind") == "audio":
@@ -283,10 +287,8 @@ def _patched_cond_video_rows(self, payload, device):
             continue
         r2 = mm_model.patchify_video(r["latent"].to(torch.float32),
                                      self.patch_size)
-        if r.get(MC_VIDEO_STRENGTH) is None and aug < 1.0:
-            gen = torch.Generator("cpu").manual_seed(seed)
-            noise = torch.randn(r2.shape, generator=gen, dtype=torch.float32)
-            r2 = aug * r2 + (1.0 - aug) * noise.to(r2.device)
+        if r.get(MC_VIDEO_STRENGTH) is None:
+            r2 = _mix(r2, aug, seed)
         rows.append(r2.to(device))
     return torch.cat(rows, dim=0) if rows else None
 

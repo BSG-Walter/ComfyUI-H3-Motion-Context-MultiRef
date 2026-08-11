@@ -602,8 +602,7 @@ def _resolve_latent_path(path, clip_index=0):
                 # underscore (*_00002_.safetensors) and are deliberately
                 # NOT matched: their numbers count runs, not clips, so a
                 # reject could be sitting in any of them.
-                endings = ("_%05d.safetensors" % idx,
-                           "_clip%03d.safetensors" % idx)  # older versions
+                endings = ("_%05d.safetensors" % idx,)
                 files = [os.path.join(c, f) for f in os.listdir(c)
                          if f.endswith(endings)]
                 if not files:
