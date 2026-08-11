@@ -14,6 +14,7 @@ function readState(node) {
     let state = {
         count: 1,
         positions: [...DEFAULT_POSITIONS],
+        strengths: [1],
     };
 
     try {
@@ -29,14 +30,25 @@ function readState(node) {
                 (v) => Math.trunc(Number(v)),
             );
         }
+        if (Array.isArray(parsed?.strengths)) {
+            state.strengths = parsed.strengths.map((v) => {
+                const s = Number(v);
+                if (!Number.isFinite(s)) return 1;
+                return Math.min(1, Math.max(0.05, s));
+            });
+        }
     } catch (_) {}
 
     while (state.positions.length < state.count) {
         const previous = state.positions.at(-1) ?? 1;
         state.positions.push(previous + 17);
     }
+    while (state.strengths.length < state.count) {
+        state.strengths.push(1);
+    }
 
     state.positions = state.positions.slice(0, state.count);
+    state.strengths = state.strengths.slice(0, state.count);
     return state;
 }
 
@@ -54,6 +66,10 @@ function audioInputName(i) {
 
 function positionWidgetName(i) {
     return `audio ${i} position`;
+}
+
+function strengthWidgetName(i) {
+    return `audio ${i} strength`;
 }
 
 function findInput(node, name) {
@@ -129,11 +145,66 @@ function removePositionWidget(node, i) {
     }
 }
 
+function findStrengthWidget(node, i) {
+    return node.widgets?.find(
+        (w) => w.name === strengthWidgetName(i),
+    );
+}
+
+function ensureStrengthWidget(node, i, initialValue) {
+    let widget = findStrengthWidget(node, i);
+
+    if (widget) {
+        widget.value = initialValue;
+        return widget;
+    }
+
+    widget = node.addWidget(
+        "number",
+        strengthWidgetName(i),
+        initialValue,
+        (value) => {
+            widget.value = Math.min(
+                1,
+                Math.max(0.05, Number(value)),
+            );
+            writeState(node);
+        },
+        {
+            min: 0.05,
+            max: 1,
+            step: 0.01,
+            precision: 2,
+            tooltip:
+                "Clip influence on that zone: 1.0 pins it exactly; 0.5 is " +
+                "half clip / half model generation; 0.1 is a light hint " +
+                "(the model creates most of the sound). Continuous, no " +
+                "cutoffs.",
+        },
+    );
+
+    widget.serialize = false;
+    widget.options ??= {};
+    widget.options.serialize = false;
+    return widget;
+}
+
+function removeStrengthWidget(node, i) {
+    const widget = findStrengthWidget(node, i);
+    if (!widget || !node.widgets) return;
+
+    const index = node.widgets.indexOf(widget);
+    if (index >= 0) {
+        node.widgets.splice(index, 1);
+    }
+}
+
 function writeState(node) {
     const raw = stateWidget(node);
     if (!raw) return;
 
     const positions = [];
+    const strengths = [];
     for (
         let i = 1;
         i <= node._h3CustomAudioCount;
@@ -144,11 +215,23 @@ function writeState(node) {
                 Number(findPositionWidget(node, i)?.value ?? 1),
             ),
         );
+        strengths.push(
+            Math.min(
+                1,
+                Math.max(
+                    0.05,
+                    Number(
+                        findStrengthWidget(node, i)?.value ?? 1,
+                    ),
+                ),
+            ),
+        );
     }
 
     raw.value = JSON.stringify({
         count: node._h3CustomAudioCount,
         positions,
+        strengths,
     });
 }
 
@@ -184,6 +267,7 @@ function ensureButtons(node) {
                 i,
                 previous + 17,
             );
+            ensureStrengthWidget(node, i, 1);
             writeState(node);
             refreshNode(node);
         },
@@ -204,6 +288,7 @@ function ensureButtons(node) {
             const i = node._h3CustomAudioCount;
             removeAudioInput(node, i);
             removePositionWidget(node, i);
+            removeStrengthWidget(node, i);
             node._h3CustomAudioCount -= 1;
             writeState(node);
             refreshNode(node);
@@ -217,14 +302,14 @@ function reorderWidgets(node) {
 
     const raw = stateWidget(node);
     const normal = [];
-    const positions = [];
+    const slots = [];
     const buttons = [];
 
     for (const widget of node.widgets) {
         if (widget === raw) continue;
 
-        if (/^audio \d+ position$/.test(widget.name)) {
-            positions.push(widget);
+        if (/^audio \d+ (position|strength)$/.test(widget.name)) {
+            slots.push(widget);
         } else if (
             widget.name === "+ Add audio" ||
             widget.name === "- Remove audio"
@@ -235,7 +320,7 @@ function reorderWidgets(node) {
         }
     }
 
-    positions.sort((a, b) => {
+    slots.sort((a, b) => {
         const ai = Number(
             a.name.match(/\d+/)?.[0] ?? 0,
         );
@@ -248,7 +333,7 @@ function reorderWidgets(node) {
     node.widgets = [
         ...(raw ? [raw] : []),
         ...normal,
-        ...positions,
+        ...slots,
         ...buttons,
     ];
 }
@@ -278,6 +363,7 @@ function buildUI(node) {
     ) {
         removeAudioInput(node, i);
         removePositionWidget(node, i);
+        removeStrengthWidget(node, i);
     }
 
     for (let i = 1; i <= state.count; i++) {
@@ -286,6 +372,11 @@ function buildUI(node) {
             node,
             i,
             state.positions[i - 1],
+        );
+        ensureStrengthWidget(
+            node,
+            i,
+            state.strengths[i - 1],
         );
     }
 

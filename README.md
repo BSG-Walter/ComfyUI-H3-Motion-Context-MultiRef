@@ -65,6 +65,20 @@ AUDIO 3 -> 22     one clip ending where the next begins: contiguous bed
 
 Unused media is windowed at the anchor: an `end`-aligned clip longer than its position is tail-sliced so it always finishes exactly at the chosen frame; a `start`-aligned clip is head-sliced so it never runs past the last frame. Duplicate end frames and out-of-range positions are rejected. Blocks are appended to any existing `minimax_refs`, so they coexist with Ref2VA refs and Motion Context timeline audio.
 
+### Per-clip strength
+
+Each audio slot gets a **strength** widget (`audio N strength`) that sets the clip's **influence** on its zone continuously:
+
+```text
+1.0      the clip is pinned exactly (default) - the model reproduces it faithfully
+0.9      almost the clip - the model may only reshape minor details
+0.5      half clip, half the model's own generation
+0.1      a light hint - the model creates most of the sound
+  ~0     transparent - the zone is essentially free
+```
+
+Every denoising step blends the clip with what the model itself is generating at that zone (`strength * clip + (1 - strength) * generation`), so intermediate values behave like true fractions of influence with no cutoffs and no noise floor. The strength lives per audio slot inside `audio_state` (the `"strengths"` array), so it travels with the widget state and survives copies.
+
 ## Recommended Motion Context settings
 
 For the tested continuation setup:
@@ -108,7 +122,7 @@ The MultiRef compatibility patch is specifically for **Ref2VA refs + Motion Cont
 
 ## Troubleshooting
 
-**`self-test failed (found 4 rows in marked audio ref slot ...)` on startup or first run** usually means the **upstream `ComfyUI-H3-Motion-Context` package is still installed next to this fork**. Both install the same MiniMax H3 runtime patch, and the second application double-wraps `PackedLayout.__init__`. Disable the other package (ComfyUI-Manager → Custom Nodes Manager → ComfyUI-H3-Motion-Context → Disable) and restart ComfyUI. As a safety net this fork detects another `h3_motion_context` wrapper at install time and takes over from it, but the duplicate install should be removed anyway since this fork replaces the upstream package entirely.
+**`self-test failed (found 4 rows in marked audio ref slot ...)` on startup or first run** means a **second copy of the H3-Motion-Context custom node is installed** (the upstream `ComfyUI-H3-Motion-Context` package or an older version of this fork). Both install the same MiniMax H3 runtime patch, and the second application double-wraps `PackedLayout.__init__`, so the self-test finds half the expected rows. **Delete every other H3-Motion-Context folder** from `custom_nodes` (keep only `ComfyUI-H3-Motion-Context-MultiRef`), clear `__pycache__` if one lingers, and restart ComfyUI. When this happens the console now prints a message listing the detected duplicate folders (or a search hint if none is found). As a safety net this fork also takes over from another `h3_motion_context` wrapper it can recognize at install time, but the duplicate install should be removed anyway since this fork replaces the upstream package entirely.
 
 ## License / upstream
 

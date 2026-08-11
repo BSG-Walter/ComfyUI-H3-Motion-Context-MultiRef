@@ -49,9 +49,14 @@ except ImportError:  # ComfyUI always ships safetensors; belt and braces
 from .patch_layout import (
     MC_KEY,
     MC_AUDIO_KEY,
+    MC_AUDIO_STRENGTH,
     apply_patch as _apply_layout_patch,
 )
-from .patch_payload import apply_patch as _apply_payload_patch
+from .patch_payload import (
+    apply_patch as _apply_payload_patch,
+    apply_cond_audio_patch as _apply_cond_audio_patch,
+    apply_forward_patch as _apply_forward_patch,
+)
 
 try:
     import torchaudio
@@ -77,15 +82,26 @@ VIDEO_RUN_GRID = (39, 22, 5, 1)
 
 
 def _ensure_h3_runtime_patches():
-    """Install both H3 patches on first execution of a node that needs them."""
+    """Install the H3 patches on first execution of a node that needs them."""
     if not _apply_layout_patch():
         raise RuntimeError(
             "h3_motion_context: could not enable the MiniMax H3 layout "
-            "extension. Check the ComfyUI console for the self-test error.")
+            "extension. Check the ComfyUI console for the self-test error; "
+            "if a second H3-Motion-Context custom node (upstream package or "
+            "an older version of this fork) is installed, DELETE every other "
+            "copy and restart ComfyUI.")
     if not _apply_payload_patch():
         raise RuntimeError(
             "h3_motion_context: could not enable keyframe/ref coexistence. "
             "Check the ComfyUI console.")
+    if not _apply_cond_audio_patch():
+        raise RuntimeError(
+            "h3_motion_context: could not enable per-block audio strength. "
+            "Check the ComfyUI console.")
+    if not _apply_forward_patch():
+        raise RuntimeError(
+            "h3_motion_context: could not enable continuous audio strength "
+            "blending. Check the ComfyUI console.")
 
 
 def _pixel_frames(latent_t):
@@ -1048,6 +1064,13 @@ class MiniMaxH3CustomAudio:
                 instant is pinned, the model continues from it.
     align=start: the audio block STARTS at the chosen frame. Sound from that
                 instant on is pinned, the model leads into it.
+
+    Each slot has a strength ("audio N strength") between 0.05 and 1.0 that
+    sets the clip's INFLUENCE on that zone: 1.0 pins the clip exactly, and
+    every step of denoising mixes the clip with the model's own evolving
+    generation at a strength ratio, so 0.5 gives the clip half influence
+    (the model may reshape half the sound), 0.1 a light touch (the model
+    creates most of the sound), and the transition is continuous.
     """
 
     MAX_AUDIOS = 16
@@ -1087,11 +1110,11 @@ class MiniMaxH3CustomAudio:
                 "audio_state": (
                     "STRING",
                     {
-                        "default": '{"count":1,"positions":[1]}',
+                        "default": '{"count":1,"positions":[1],"strengths":[1]}',
                         "multiline": False,
                         "tooltip": (
                             "Internal UI state. Normally managed by the "
-                            "audio position controls."
+                            "audio position and strength controls."
                         ),
                     },
                 ),
@@ -1123,7 +1146,8 @@ class MiniMaxH3CustomAudio:
     DESCRIPTION = (
         "Pin MiniMax H3 audio clips at arbitrary output-frame positions, "
         "end- or start-aligned. Starts with 1 audio slot; use + Add audio "
-        "for more."
+        "for more. Each clip has its own strength: 1.0 pins it exactly "
+        "(default), lower values let the model vary the sound more."
     )
 
     def apply(
@@ -1147,6 +1171,7 @@ class MiniMaxH3CustomAudio:
 
         positions = state.get("positions", [])
         count = int(state.get("count", len(positions)))
+        strengths = state.get("strengths", [])
 
         if count < 1 or count > self.MAX_AUDIOS:
             raise ValueError(
@@ -1158,6 +1183,12 @@ class MiniMaxH3CustomAudio:
                 "h3_motion_context: %d audio slots but only %d saved "
                 "positions" % (count, len(positions))
             )
+        if len(strengths) < count:
+            strengths = ([1.0] * count)[:count]
+        strengths = [
+            min(1.0, max(0.05, float(s)))
+            for s in (strengths[:count] + [1.0] * count)[:count]
+        ]
 
         frame_count = _pixel_frames(int(_video_from_latent(latent).shape[2]))
 
@@ -1225,7 +1256,7 @@ class MiniMaxH3CustomAudio:
                 # rt 40 Hz steps = rt * 3/5 frame units of timeline
                 end_frame = float(zero_based) + rt * 3.0 / 5.0
 
-            anchors.append((end_frame, slot, z, rt))
+            anchors.append((end_frame, slot, z, rt, strengths[slot - 1]))
 
         anchors.sort(key=lambda item: item[0])
 
@@ -1244,8 +1275,9 @@ class MiniMaxH3CustomAudio:
                 "ref_audio_t": rt,
                 "audio_latent": z,
                 MC_AUDIO_KEY: end_frame,
+                MC_AUDIO_STRENGTH: strength,
             }
-            for end_frame, _, z, rt in anchors
+            for end_frame, _, z, rt, strength in anchors
         ]
 
         out = node_helpers.conditioning_set_values(

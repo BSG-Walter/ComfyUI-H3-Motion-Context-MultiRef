@@ -40,6 +40,7 @@ copy of a 90-line constructor that would rot on the next ComfyUI change.
 """
 
 import logging
+import os
 
 import torch
 
@@ -47,10 +48,44 @@ import comfy.ldm.minimax.model as mm
 
 MC_KEY = "motion_context_index"
 MC_AUDIO_KEY = "motion_context_audio_end_frame"
+MC_AUDIO_STRENGTH = "motion_context_audio_strength"
 _LOG = logging.getLogger("h3_motion_context")
+
+# Module-global names older copies of this code (or of the upstream package)
+# capture the stock init under when they install their own wrapper. A wrapper
+# we do not recognize as ours may still expose the stock constructor under
+# one of these names in its module globals.
+_FOREIGN_ORIG_NAMES = (
+    "_orig_init",
+    "_original_init",
+    "_stock_init",
+    "_unpatched_init",
+    "_orig_initializer",
+    "_base_init",
+)
 
 _orig_init = None
 _applied = False
+
+
+def _find_dup_installs(root=None):
+    """Folder names of other H3-Motion-Context copies in custom_nodes."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    base = os.path.dirname(here)
+    if root is not None:
+        base = root
+    if not os.path.isdir(base):
+        return []
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return []
+    own = os.path.basename(here).lower()
+    found = []
+    for name in names:
+        if "h3-motion-context" in name.lower() and name.lower() != own:
+            found.append(name)
+    return sorted(found)
 
 
 def _ref_cursor_advance(refs):
@@ -464,13 +499,22 @@ def apply_patch():
         _LOG.info("h3_motion_context: adopting the already-installed layout patch")
         return True
     if current is not _patched_init:
-        # The upstream ComfyUI-H3-Motion-Context package (or a second copy of
+        # The upstream ComfyUI-H3-Motion-Context package (or another copy of
         # this code) may have installed its own wrapper first. Its module
-        # captured the stock init in a module global of the same name; recover
-        # it and take over, so the two wrappers never nest their fixups.
-        foreign_orig = getattr(
-            getattr(current, "__globals__", None) or {}, "get", lambda k, d=None: d)("_orig_init", None)
-        if foreign_orig is not None and foreign_orig is not current:
+        # captured the stock init in a module global; recover it and take
+        # over, so the wrappers never nest their fixups.
+        globs = getattr(current, "__globals__", None) or {}
+        foreign_orig = None
+        if isinstance(globs, dict):
+            get = globs.get
+            for name in _FOREIGN_ORIG_NAMES:
+                cand = get(name)
+                if callable(cand) and cand is not current:
+                    foreign_orig = cand
+                    break
+        elif getattr(current, "_h3mc_orig_init", None):
+            foreign_orig = current._h3mc_orig_init
+        if foreign_orig is not None:
             _orig_init = foreign_orig
             _patched_init._h3mc_orig_init = _orig_init
             _patched_init._h3mc_layout_patcher = True
@@ -485,11 +529,26 @@ def apply_patch():
         _self_test()
     except Exception as exc:
         _orig_init = None
-        _LOG.warning("h3_motion_context: self-test failed (%s), patch not applied. "
-                     "Interior keyframe anchors unavailable. If you have both "
-                     "the upstream ComfyUI-H3-Motion-Context package and this "
-                     "fork installed, disable one of them and restart ComfyUI.",
-                     exc)
+        dups = _find_dup_installs()
+        where = ""
+        if dups:
+            where = ("\n  Found other H3-Motion-Context copies in custom_nodes "
+                     "(delete ALL of them and restart ComfyUI):\n    %s"
+                     % "\n    ".join(dups))
+        else:
+            where = ("\n  No other H3-Motion-Context folder found in custom_nodes; "
+                     "another copy may be loaded from elsewhere (a zip, a venv, "
+                     "or a stale __pycache__). Search your whole ComfyUI "
+                     "directory for folders named *H3-Motion-Context* and delete "
+                     "every copy EXCEPT this fork (ComfyUI-H3-Motion-Context-"
+                     "MultiRef), then restart ComfyUI.")
+        _LOG.warning("h3_motion_context: self-test failed (%s), patch not "
+                     "applied. Interior keyframe anchors unavailable. This is "
+                     "almost always caused by a SECOND copy of the H3-Motion-"
+                     "Context custom node (the upstream package or an older "
+                     "version of this fork) being installed at the same time, "
+                     "so both patches fight over PackedLayout.__init__ and "
+                     "double-wrap it.%s", exc, where)
         return False
     _patched_init._h3mc_orig_init = _orig_init
     _patched_init._h3mc_layout_patcher = True
