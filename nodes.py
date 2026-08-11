@@ -40,11 +40,8 @@ import os
 import comfy.utils
 import folder_paths
 import node_helpers
-
-try:
-    from safetensors.torch import load_file as _st_load, save_file as _st_save
-except ImportError:  # ComfyUI always ships safetensors; belt and braces
-    _st_load = _st_save = None
+from comfy_extras.nodes_minimax_h3 import _resize
+from safetensors.torch import load_file as _st_load, save_file as _st_save
 
 from .patch_layout import (
     MC_KEY,
