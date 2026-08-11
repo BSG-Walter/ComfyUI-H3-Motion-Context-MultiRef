@@ -68,6 +68,23 @@ _orig_init = None
 _applied = False
 
 
+def _recover_foreign(attr, names):
+    """Recover a stock function a foreign wrapper captured under any of the
+    candidate module-global names."""
+    globs = getattr(attr, "__globals__", None)
+    if isinstance(globs, dict):
+        get = globs.get
+        for name in names:
+            cand = get(name)
+            if callable(cand) and cand is not attr:
+                return cand
+    for name in names:
+        cand = getattr(attr, name, None)
+        if callable(cand) and cand is not attr:
+            return cand
+    return None
+
+
 def _find_dup_installs():
     """Folder names of other H3-Motion-Context copies in custom_nodes."""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -501,13 +518,7 @@ def apply_patch():
         # this code) may have installed its own wrapper first. Its module
         # captured the stock init in a module global; recover it and take
         # over, so the wrappers never nest their fixups.
-        globs = getattr(current, "__globals__", None) or {}
-        foreign_orig = None
-        for name in _FOREIGN_ORIG_NAMES:
-            cand = globs.get(name)
-            if callable(cand) and cand is not current:
-                foreign_orig = cand
-                break
+        foreign_orig = _recover_foreign(current, _FOREIGN_ORIG_NAMES)
         if foreign_orig is not None:
             _orig_init = foreign_orig
             _patched_init._h3mc_orig_init = _orig_init

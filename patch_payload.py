@@ -27,7 +27,7 @@ import torch
 import comfy.ldm.minimax.model as mm_model
 import comfy.model_base as model_base
 
-from .patch_layout import MC_AUDIO_STRENGTH
+from .patch_layout import MC_AUDIO_STRENGTH, _recover_foreign
 
 _LOG = logging.getLogger("h3_motion_context")
 
@@ -49,23 +49,6 @@ _FOREIGN_ORIG_NAMES = (
 # payload keys this fork owns; extra_conds leaves them untouched
 _BLEND_MAP_KEY = "_h3mc_audio_blend_map"
 _BLEND_ROWS_KEY = "_h3mc_audio_blend_rows"
-
-
-def _recover_foreign(attr, names):
-    """Recover a stock function a foreign wrapper captured under any of the
-    candidate module-global names."""
-    globs = getattr(attr, "__globals__", None)
-    if isinstance(globs, dict):
-        get = globs.get
-        for name in names:
-            cand = get(name)
-            if callable(cand) and cand is not attr:
-                return cand
-    for name in names:
-        cand = getattr(attr, name, None)
-        if callable(cand) and cand is not attr:
-            return cand
-    return None
 
 
 def _install(cls, attr, patched, foreign_names, gone_msg, done_msg):
