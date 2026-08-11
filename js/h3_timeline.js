@@ -441,7 +441,10 @@ function splitAt(node) {
 }
 
 function hitTest(node, p, s) {
-    if (p[1] < RULER_H) return btnZone(p) || { zone: "ruler" };
+    if (p[1] < RULER_H) {
+        const b = btnZone(p);
+        return b ? { zone: b } : { zone: "ruler" };
+    }
     for (let i = node._h3Clips.length - 1; i >= 0; i--) {
         const c = node._h3Clips[i];
         if (c.kind === "video") {
@@ -590,19 +593,39 @@ async function addClipWithMedia(node, kind) {
     addClip(node, detected || kind, info);
 }
 
+function placeAndPushClip(node, newClip) {
+    const lane = laneOf(newClip.kind);
+    const start = playHeadBoundary(node);
+    newClip.start = start;
+    const newLen = Number(newClip.len) || (newClip.kind === "image" ? 3 : 22);
+
+    const sameLane = node._h3Clips.filter((c) => c !== newClip && laneOf(c.kind) === lane);
+    sameLane.sort((a, b) => Number(a.start) - Number(b.start));
+
+    let pushCursor = start + newLen;
+    for (const c of sameLane) {
+        const cStart = Number(c.start);
+        const cLen = Number(c.len) || 1;
+        if (cStart >= start && cStart < pushCursor) {
+            c.start = pushCursor;
+            pushCursor = c.start + cLen;
+        } else if (cStart < start && cStart + cLen > start) {
+            c.start = pushCursor;
+            pushCursor = c.start + cLen;
+        }
+    }
+}
+
 function addClip(node, kind, info) {
     if (!node._h3Clips || node._h3Clips.length >= MAX_CLIPS) return;
     const c = defaults[kind]();
     c.id = (node._h3Clips.at(-1)?.id ?? 0) + 1;
-    const lastEnd = node._h3Clips.length
-        ? Number(node._h3Clips.at(-1).start) + (Number(node._h3Clips.at(-1).len) || 1) - 1
-        : 0;
-    c.start = Math.max(1, lastEnd + 1);
     if (info) {
         c.file = info;
         c.src_start = 0;
     }
     node._h3Clips.push(c);
+    placeAndPushClip(node, c);
     ensureInputs(node);
     writeState(node);
     fixNodeSize(node);
@@ -814,7 +837,7 @@ function setup(node) {
             _drag: null,
             _hover: null,
             _dragPlay: false,
-            _play: null,
+            _play: 0,
             _playing: false,
             _ctxs: new Set(),
             computeSize: () => [WIDTH, HEIGHT],
@@ -1054,7 +1077,7 @@ function setup(node) {
                         removeClip(nd, hit.i);
                     } else if (hit.zone === "media") {
                         replaceClipMedia(nd, hit.c);
-                    } else {
+                    } else if (hit.c) {
                         this._drag = {
                             ...hit,
                             grab: p[0],
@@ -1069,6 +1092,8 @@ function setup(node) {
                                     : hit.c.len ?? 22,
                             ),
                         };
+                    } else {
+                        return true;
                     }
                     return true;
                 }
