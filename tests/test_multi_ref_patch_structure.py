@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 NODES = (ROOT / "nodes.py").read_text(encoding="utf-8")
 LAYOUT = (ROOT / "patch_layout.py").read_text(encoding="utf-8")
 PAYLOAD = (ROOT / "patch_payload.py").read_text(encoding="utf-8")
+TIMELINE_DRAW_JS = (ROOT / "js" / "timeline_draw.js").read_text(encoding="utf-8")
 
 
 def main():
@@ -53,6 +54,11 @@ def main():
     assert '("video_", ("IMAGE",))' in NODES
     assert '("video_audio_", ("AUDIO",))' in NODES
     assert 'video_state' in NODES
+
+    # Timeline UI/backend wiring fixes: linked video audio ignores stale
+    # audio_len, and dynamic inputs follow stable clip ids.
+    assert ': clip.audio_link' in TIMELINE_DRAW_JS
+    assert 'slot = int(clip.get("id") or idx)' in NODES
 
     # Duplicate-install hardening lives in the layout patcher.
     assert '_FOREIGN_ORIG_NAMES' in LAYOUT

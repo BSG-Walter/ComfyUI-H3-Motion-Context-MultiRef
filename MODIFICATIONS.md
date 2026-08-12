@@ -76,6 +76,67 @@ to the model.
 - All runtime patches support adoption/takeover, with `MODIFICATIONS.md`
   docs and Troubleshooting keeping the deletion guidance current.
 
+## Timeline super node (2026-08-11)
+
+One node, one ordered timeline of stills, video clips and audio clips, each
+pinned at a 1-based start frame (frame 1 = the first latent step). The
+timeline replaces the stock `minimax_keyframes` list and appends its audio
+blocks to `minimax_refs`.
+
+- **`nodes.py`** `MiniMaxH3Timeline`: mixed-kind clips with per-clip
+  strength; a video's audio rides the audio timeline (`video_audio_N`,
+  linked to the video by default). Linked audio follows the clip; set
+  `audio_link` false in the state to move/trim the audio independently
+  (`audio_start` / `audio_len` / `audio_align` head|tail). Video and image
+  placements are structural and raise when they do not fit the target
+  clip; audio windows are contextual and are parked at the last frame with
+  a warning instead of raising. Optional `video_` / `video_audio_` /
+  `image_` / `audio_` inputs are added and removed dynamically
+  (`_DynamicInputs`).
+- **`js/h3_timeline.js`** draws the timeline widget on a custom widget
+  (ruler + video lane + audio lane, `🔗` link toggle, `✕` remove,
+  `trim` edges), driven by `timeline_state`, a hidden non-serialized
+  STRING widget so the graph stays server-restorable and diff-friendly.
+  Drag handling works both with the classic canvas widget events and with
+  the new frontend, which also routes widget-local pointer events into the
+  same `mouse()` handler and redraws via `triggerDraw`. The new frontend
+  sizes nodes from slots only and ignores widget widths, so `fixNodeSize()`
+  forces the node to the full ruler width (840px) on setup and after every
+  clip add/remove; `setSize`/`resize` stick because the graph never
+  recomputes node width on its own.
+- **`tests/test_timeline_node.py`** covers mixed timelines, linked vs
+  unlinked video audio, head/tail window slicing, out-of-range clamping
+  and structural raises. Runs on the ComfyUI venv python, no GPU.
+
+## Timeline video editor (2026-08-11)
+
+`MiniMaxH3Timeline` becomes a self-contained editor: clips are uploaded
+straight into the node instead of wired over sockets (sockets stay for
+older workflows; a clip with a `file` ref ignores them).
+
+- **`nodes.py`** clips may carry `"file": {name, subfolder, type}` resolved
+  against ComfyUI's input folder, plus `"src_start"` (0-based source frame
+  window). `_load_image_file` (PIL) and `_load_media_file` (PyAV: video
+  frames `[B,H,W,C]` + optional audio track) decode uploads at apply time;
+  `_slice_audio` drops `src_start/FPS` seconds from the front of a track.
+  A file-backed video's own audio rides the audio timeline when
+  `audio_link` is true; a video file with no audio track is silent.
+- **`js/h3_timeline.js`** the `+ image/video/audio` buttons upload the
+  picked file through `/upload/image` (raw bytes, works for any type) and
+  classify it by extension; every clip has a media-preview: stills and
+  video frames drawn into the block (`<video>` seeked via `/view` Range
+  requests), audio clips draw a 128-bucket min/max waveform decoded in
+  the browser. A playhead on the ruler (drag to scrub, `▶`/`⏹` to play,
+  `Space` toggles) previews the frame under it and plays audio tracks via
+  WebAudio; `✂` or `S` splits the clip under the playhead into two
+  file-backed clips with adjusted `src_start`/`len`; dragging clips and the
+  playhead magnet-snap to clip edges, the playhead and lane boundaries
+  (`resolveMove` / `splitSnap`).
+- **`tests/test_timeline_node.py`** adds file-based clips (real PNG, MP4
+  via imageio_ffmpeg and WAV files written into ComfyUI's input dir):
+  image/video/audio windows, `src_start` slicing, silent video, and
+  missing-file validation.
+
 ## Example workflow set
 
 The upstream example workflows are not included in this fork bundle. The examples folder uses a custom workflow family instead, beginning with `Simple Motion Context - No Reference Images.json` as the stock-compatible baseline. Its layout is intentionally retained as the visual template for later variants.

@@ -25,10 +25,7 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
         extraInputs = [],
     } = cfg;
 
-    const strengthWidgetName = (i) => strengthLabel(i);
-
-    function stateWidget(node) {
-        return node.widgets?.find((w) => w.name === stateWidgetName);
+        function stateWidget(node) {        return node.widgets?.find((w) => w.name === stateWidgetName);
     }
 
     function readState(node) {
@@ -86,10 +83,6 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
         return `${extra.prefix}${i}`;
     }
 
-    function positionWidgetName(i) {
-        return positionLabel(i);
-    }
-
     function findInput(node, name) {
         return node.inputs?.findIndex((input) => input.name === name) ?? -1;
     }
@@ -120,7 +113,7 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
     }
 
     function findPositionWidget(node, i) {
-        return node.widgets?.find((w) => w.name === positionWidgetName(i));
+        return node.widgets?.find((w) => w.name === positionLabel(i));
     }
 
     function ensurePositionWidget(node, i, initialValue) {
@@ -135,7 +128,7 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
         // truth for the position list; these are rebuilt from it.
         widget = node.addWidget(
             "number",
-            positionWidgetName(i),
+            positionLabel(i),
             initialValue,
             (value) => {
                 widget.value = Math.trunc(Number(value));
@@ -150,8 +143,8 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
         return widget;
     }
 
-    function removePositionWidget(node, i) {
-        const widget = findPositionWidget(node, i);
+    function removeWidget(node, name) {
+        const widget = node.widgets?.find((w) => w.name === name);
         if (!widget || !node.widgets) return;
 
         const index = node.widgets.indexOf(widget);
@@ -161,7 +154,7 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
     }
 
     function findStrengthWidget(node, i) {
-        return node.widgets?.find((w) => w.name === strengthWidgetName(i));
+        return node.widgets?.find((w) => w.name === strengthLabel(i));
     }
 
     function ensureStrengthWidget(node, i, initialValue) {
@@ -174,7 +167,7 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
 
         widget = node.addWidget(
             "number",
-            strengthWidgetName(i),
+            strengthLabel(i),
             initialValue,
             (value) => {
                 widget.value = Math.min(1, Math.max(0.05, Number(value)));
@@ -193,16 +186,6 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
         widget.options ??= {};
         widget.options.serialize = false;
         return widget;
-    }
-
-    function removeStrengthWidget(node, i) {
-        const widget = findStrengthWidget(node, i);
-        if (!widget || !node.widgets) return;
-
-        const index = node.widgets.indexOf(widget);
-        if (index >= 0) {
-            node.widgets.splice(index, 1);
-        }
     }
 
     function writeState(node) {
@@ -258,8 +241,8 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
 
             const i = node[countProp];
             removeInput(node, i);
-            removePositionWidget(node, i);
-            if (hasStrength) removeStrengthWidget(node, i);
+            removeWidget(node, positionLabel(i));
+            if (hasStrength) removeWidget(node, strengthLabel(i));
             node[countProp] -= 1;
             writeState(node);
             refreshNode(node);
@@ -316,8 +299,8 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
         // Remove only stale dynamic slots beyond the serialized count.
         for (let i = maxSlots; i > state.count; i--) {
             removeInput(node, i);
-            removePositionWidget(node, i);
-            if (hasStrength) removeStrengthWidget(node, i);
+            removeWidget(node, positionLabel(i));
+            if (hasStrength) removeWidget(node, strengthLabel(i));
         }
 
         for (let i = 1; i <= state.count; i++) {
