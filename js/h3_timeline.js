@@ -16,6 +16,8 @@ import {
     WIDTH,
     HEIGHT,
     TOOL_X,
+    SLIDER_X,
+    SLIDER_W,
     COLORS,
     PLAY_COLOR,
     mediaKey,
@@ -278,6 +280,11 @@ function setup(node) {
                     ctx.fillText(txt, x + 2, 2);
                 }
 
+                // opaque backdrop over the toolbar so ruler labels don't
+                // bleed through the buttons and zoom slider
+                ctx.fillStyle = "#1a1a2a";
+                ctx.fillRect(TOOL_X - 4, 0, WIDTH - TOOL_X + 4, RULER_H);
+
                 ctx.strokeStyle = "#888";
                 const snapOn = this._snapEnabled ?? true;
                 const btnChars = ["✂", "🧲", this._playing ? "⏹" : "▶", "F", "−", "+"];
@@ -299,6 +306,24 @@ function setup(node) {
                 ctx.textBaseline = "middle";
                 for (const [i, ch] of btnChars.entries()) {
                     ctx.fillText(ch, TOOL_X + i * 20 + BTN_W / 2, 3 + BTN_H / 2 + 0.5);
+                }
+
+                // zoom slider: log-scale track from minS to ZOOM_MAX
+                {
+                    const minS = Math.max(0.5, Math.min(ZOOM_MIN, WIDTH / span));
+                    const trackY = 3 + BTN_H / 2 + 0.5;
+                    const t0 = SLIDER_X;
+                    const t1 = SLIDER_X + SLIDER_W;
+                    ctx.fillStyle = "#222";
+                    ctx.beginPath();
+                    ctx.roundRect(t0, trackY - 2, SLIDER_W, 4, 2);
+                    ctx.fill();
+                    const tn = Math.log(this._scale / minS) / Math.log(ZOOM_MAX / minS);
+                    const kx = t0 + clamp(tn, 0, 1) * SLIDER_W;
+                    ctx.fillStyle = "#3a5a80";
+                    ctx.beginPath();
+                    ctx.arc(clamp(kx, t0, t1), trackY, 4, 0, Math.PI * 2);
+                    ctx.fill();
                 }
 
                 ctx.fillText("video", 2, RULER_H + 14);
@@ -416,6 +441,14 @@ function setup(node) {
                     const hit = hitTest(nd, p, this._scale);
                     if (!hit) return false;
                     e.preventDefault();
+                    if (hit.zone === "slider") {
+                        this._dragSlider = true;
+                        const minS = Math.max(0.5, Math.min(ZOOM_MIN, WIDTH / (nd._h3Span ?? SPAN)));
+                        const tn = clamp((p[0] - SLIDER_X) / SLIDER_W, 0, 1);
+                        this._scale = Math.exp(tn * Math.log(ZOOM_MAX / minS)) * minS;
+                        this.redraw(nd);
+                        return true;
+                    }
                     if (hit.zone === "in" || hit.zone === "out") {
                         const f = hit.zone === "in" ? 1 / ZOOM_STEP : ZOOM_STEP;
                         const minS = Math.max(
@@ -492,6 +525,13 @@ function setup(node) {
                 if (type.includes("move")) {
                     nd._h3Hovered = true;
                     this._hover = hitTest(nd, p, this._scale);
+                    if (this._dragSlider) {
+                        const minS = Math.max(0.5, Math.min(ZOOM_MIN, WIDTH / (nd._h3Span ?? SPAN)));
+                        const tn = clamp((p[0] - SLIDER_X) / SLIDER_W, 0, 1);
+                        this._scale = Math.exp(tn * Math.log(ZOOM_MAX / minS)) * minS;
+                        this.redraw(nd);
+                        return true;
+                    }
                     const d = this._drag;
                     if (this._dragPlay) {
                         const s = this._scale;
@@ -628,6 +668,7 @@ function setup(node) {
                     this._drag = null;
                     this._hover = null;
                     this._dragPlay = false;
+                    this._dragSlider = false;
                     this._frame = null;
                     this.redraw(nd);
                     return true;

@@ -7,7 +7,7 @@ export const MAX_CLIPS = 32;
 
 export const SPAN = 240; // ruler length in frames
 export const PX = 3.5; // pixels per frame (base zoom)
-export const ZOOM_MIN = 2; // px/frame limits for zoom buttons
+export const ZOOM_MIN = 1; // px/frame limits for zoom buttons
 export const ZOOM_MAX = 24;
 export const ZOOM_STEP = 1.25;
 export const SNAP_PX = 12; // magnet radius for clip snapping
@@ -20,7 +20,9 @@ export const LANE_H = 68;
 export const PAD = 4;
 export const WIDTH = 840;
 export const HEIGHT = RULER_H + 2 * LANE_H + PAD;
-export const TOOL_X = WIDTH - 124; // first toolbar column
+export const TOOL_X = WIDTH - 230; // first toolbar column
+export const SLIDER_X = TOOL_X + 6 * 20 + 6; // zoom slider start (6px gap after last button)
+export const SLIDER_W = 74; // zoom slider track width
 
 export const COLORS = {
     image: "#7aa2f7",
@@ -259,6 +261,7 @@ export function edgeZone(p, r) {
 
 export function btnZone(p) {
     if (p[1] > RULER_H || p[0] < TOOL_X) return null;
+    if (p[0] >= SLIDER_X && p[0] <= SLIDER_X + SLIDER_W) return "slider";
     const col = Math.floor((p[0] - TOOL_X) / 20);
     return ["split", "snap", "play", "unit", "in", "out"][col] || null;
 }
