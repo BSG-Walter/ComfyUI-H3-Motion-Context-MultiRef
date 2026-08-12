@@ -114,6 +114,22 @@ export function ensureInputs(node) {
 
 export function removeClip(node, i) {
     const [clip] = node._h3Clips.splice(i, 1);
+    // a separated (unlinked) audio band outlives its video: promote the band
+    // to its own audio clip before deleting the video block, so deleting the
+    // video never kills the detached audio.
+    if (clip.kind === "video" && !clip.audio_link && !clip.audio_off) {
+        const a = defaults.audio();
+        a.id = (node._h3Clips.at(-1)?.id ?? 0) + 1;
+        a.start = Number(clip.audio_start ?? clip.start);
+        a.len = Number(clip.audio_len ?? clip.len) || 22;
+        a.strength = Number(clip.strength) || 1;
+        a.align = clip.audio_align ?? "head";
+        if (clip.file) {
+            a.file = clip.file;
+            a.src_start = Number(clip.src_start) || 0;
+        }
+        node._h3Clips.push(a);
+    }
     node._h3Thumbs?.delete(clip.id);
     for (const [name] of clipInputs(clip)) {
         const slot = node.inputs?.findIndex((inp) => inp.name === name);
@@ -123,6 +139,15 @@ export function removeClip(node, i) {
         }
     }
     ensureInputs(node);
+    writeState(node);
+    fixNodeSize(node);
+}
+
+// delete only the separated audio band of a video clip: the band goes
+// silent and stops being drawn/colliding, the video block stays.
+export function removeClipAudio(node, c) {
+    if (c?.kind !== "video") return;
+    c.audio_off = true;
     writeState(node);
     fixNodeSize(node);
 }

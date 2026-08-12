@@ -177,6 +177,20 @@ assert cond["minimax_refs"][0][pl.MC_AUDIO_KEY] == 85.0  # parked at last frame
 print("out-of-range audio clamp OK")
 
 
+# --- audio_off: the deleted audio band must stay silent ---
+avoff = AudioVAE()
+state = '{"clips":[' \
+        '{"id":1,"kind":"video","start":10,"len":22,' \
+        '"audio_link":false,"audio_start":30,"audio_len":10,' \
+        '"audio_off":true}]}'
+cond = run(state, avoff, vae=FakeVideoVAE(),
+           video_1=torch.rand(5, 12, 12, 3), video_audio_1=audio())
+assert len(cond["minimax_keyframes"]) == 2
+assert (cond.get("minimax_refs") or []) == [], cond.get("minimax_refs")
+assert len(avoff.windows) == 0  # the VAE never saw the wired audio
+print("audio_off video clip OK: band deleted, video stays, silent")
+
+
 # --- structural violations still raise ---
 try:
     run('{"clips":[{"id":1,"kind":"video","start":200,"len":22}]}',
@@ -276,6 +290,16 @@ assert len(kfs) == 2, len(kfs)
 assert kfs[0][pl.MC_KEY] == 9 and kfs[1][pl.MC_KEY] == 10
 assert (cond.get("minimax_refs") or []) == []  # mp4 has no audio -> silent
 print("uploaded video file clip OK: src_start window, silent track")
+
+# audio_off also suppresses the file's own sound
+avo2 = AudioVAE()
+state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 4,
+                               "len": 5, "audio_off": True,
+                               "file": vid_media}]})
+cond = run(state, avo2, vae=FakeVideoVAE())
+assert len(cond["minimax_keyframes"]) == 2
+assert (cond.get("minimax_refs") or []) == []
+print("audio_off file video OK: file sound suppressed")
 
 # audio file clip with src_start: 2 s wav, drop 1 s, window the rest
 ava = AudioVAE()

@@ -110,6 +110,7 @@ export function laneRange(c, lane) {
         const len = c.kind === "image" ? 3 : Number(c.len) || 22;
         return { s: Number(c.start), e: Number(c.start) + len };
     }
+    if (c.audio_off) return { s: 0, e: 0 };
     const s =
         c.kind === "audio"
             ? Number(c.start)
@@ -127,7 +128,9 @@ export function laneRange(c, lane) {
 
 // the time range the clip's sound actually plays in (the audio-lane range:
 // follows the video while linked, the ghost's own position when unlinked).
+// audio_off clips have no sound at all.
 export function soundRange(c) {
+    if (c.audio_off) return { s: -1, e: -1 };
     const start = c.audio_link ? c.start : c.audio_start ?? c.start;
     const len = c.audio_link ? c.len : c.audio_len ?? c.len ?? 22;
     return { s: Number(start), e: Number(start) + (Number(len) || 22) };
@@ -249,7 +252,7 @@ export function hitTest(node, p, s) {
     }
     for (let i = node._h3Clips.length - 1; i >= 0; i--) {
         const c = node._h3Clips[i];
-        if (c.kind === "video") {
+        if (c.kind === "video" && !c.audio_off) {
             const g = ghostRect(c, s);
             if (inRect(p, g, 4)) {
                 // edge trims win over the link toggle so the ghost's

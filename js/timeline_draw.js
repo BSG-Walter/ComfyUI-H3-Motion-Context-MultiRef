@@ -93,6 +93,7 @@ export function drawBlock(ctx, color, label, r, ghost, media, node, clip) {
 }
 
 export function drawGhost(ctx, c, s, node) {
+    if (c.audio_off) return; // the separated audio band was deleted
     const g = ghostRect(c, s);
     drawBlock(ctx, COLORS.audio, `♪ ${c.id}`, g, true, null, node);
     const m = c.file ? ensureMedia(node, c) : null;

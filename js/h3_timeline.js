@@ -37,6 +37,7 @@ import {
     ensureInputs,
     fixNodeSize,
     removeClip,
+    removeClipAudio,
     replaceClipMedia,
     addClipWithMedia,
     splitAt,
@@ -58,12 +59,24 @@ function closeClipMenu() {
     _menuOverlay = null;
 }
 
-function openClipMenu(node, widget, clip, idx, x, y) {
+function openClipMenu(node, widget, clip, idx, x, y, zone) {
     closeClipMenu();
     widget._menuAt = Date.now();
-    const items = [
-        ["Delete clip", () => removeClip(node, idx)],
-        ["Replace clip\u2026", () => replaceClipMedia(node, clip)],
+    // right-clicking the separated audio band of a video clip targets the
+    // band only: the only destructive option is deleting that band. Deleting
+    // the clip is reached from the video block itself.
+    const onGhost =
+        clip.kind === "video" &&
+        !clip.audio_off &&
+        ["audio", "trimAL", "trimAR", "link"].includes(zone);
+    const items = [];
+    if (onGhost) {
+        items.push(["Delete audio track", () => removeClipAudio(node, clip)]);
+    } else {
+        items.push(["Delete clip", () => removeClip(node, idx)]);
+        items.push(["Replace clip\u2026", () => replaceClipMedia(node, clip)]);
+    }
+    items.push(
         ["Copy clip", null],
         ["Cut clip", null],
         ["Duplicate", null],
@@ -71,7 +84,7 @@ function openClipMenu(node, widget, clip, idx, x, y) {
         ["Move down", null],
         ["Move to playhead", null],
         ["Change strength", null],
-    ];
+    );
     const overlay = document.createElement("div");
     overlay.style.cssText = "position:fixed;inset:0;z-index:3000";
     overlay.addEventListener("pointerdown", closeClipMenu);
@@ -184,11 +197,11 @@ function setup(node) {
                         px = e.offsetX;
                         py = e.offsetY - this._yOff;
                     }
-                    const hit = hitTest(nd, [px, py], this._scale);
-                    const idx = hit?.c ? (nd._h3Clips?.indexOf(hit.c) ?? -1) : -1;
-                    if (idx >= 0) {
-                        openClipMenu(nd, this, hit.c, idx, e.clientX, e.clientY);
-                    }
+                        const hit = hitTest(nd, [px, py], this._scale);
+                        const idx = hit?.c ? (nd._h3Clips?.indexOf(hit.c) ?? -1) : -1;
+                        if (idx >= 0) {
+                            openClipMenu(nd, this, hit.c, idx, e.clientX, e.clientY, hit.zone);
+                        }
                 }, true);
             },
             _clear(ctx) {
@@ -377,7 +390,7 @@ function setup(node) {
                     e.preventDefault();
                     const idx = nd._h3Clips?.indexOf(hit.c) ?? -1;
                     if (idx >= 0) {
-                        openClipMenu(nd, this, hit.c, idx, e.clientX ?? pos[0], e.clientY ?? pos[1]);
+                        openClipMenu(nd, this, hit.c, idx, e.clientX ?? pos[0], e.clientY ?? pos[1], hit.zone);
                     }
                     return true;
                 }

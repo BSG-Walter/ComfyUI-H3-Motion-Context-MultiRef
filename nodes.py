@@ -1726,6 +1726,7 @@ class MiniMaxH3Timeline:
                             % (idx, fmedia.get("name")))
                     frames = frames[src_start:]
                     if audio is None and clip.get("audio_link", True) \
+                            and not clip.get("audio_off") \
                             and data["audio"] is not None:
                         audio = _slice_audio(
                             data["audio"], src_start / float(FPS))
@@ -1767,7 +1768,7 @@ class MiniMaxH3Timeline:
                     })
 
                 audio = kwargs.get("video_audio_%d" % slot)
-                if audio is not None:
+                if audio is not None and not clip.get("audio_off"):
                     if clip.get("audio_link", True):
                         a_start, a_len, align = start, run, "head"
                     else:
