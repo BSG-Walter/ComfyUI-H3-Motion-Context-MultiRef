@@ -154,6 +154,21 @@ assert cond["minimax_refs"][0][pl.MC_AUDIO_KEY] == 9.0  # 5-1+5, not 91
 print("linked audio ignores stale state OK")
 
 
+# --- UI clip IDs are stable even after deletes/splits leave gaps ---
+avgap = AudioVAE()
+state = '{"clips":[' \
+        '{"id":7,"kind":"video","start":1,"strength":0.5,"len":5,' \
+        '"audio_link":true},' \
+        '{"id":9,"kind":"audio","start":20,"strength":1,"len":5}]}'
+cond = run(state, avgap, vae=FakeVideoVAE(),
+           video_7=torch.rand(5, 12, 12, 3),
+           video_audio_7=audio(),
+           audio_9=audio())
+assert len(cond["minimax_keyframes"]) == 2
+assert len(cond["minimax_refs"]) == 2
+print("timeline stable clip ids OK")
+
+
 # --- out-of-range audio clamps with a warning, never raises ---
 av4 = AudioVAE()
 state = '{"clips":[{"id":1,"kind":"audio","start":200,"len":22}]}'

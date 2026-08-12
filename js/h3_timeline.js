@@ -102,6 +102,14 @@ async function replaceClipMedia(node, c) {
     if (kind) c.kind = kind;
     c.file = info;
     c.src_start = 0;
+    delete c.source_len;
+    if (c.kind === "video") {
+        const frames = await probeVideoFrames(node, info);
+        if (frames && Number.isFinite(frames) && frames > 0) {
+            c.source_len = frames;
+            c.len = Math.min(Number(c.len) || frames, frames);
+        }
+    }
     ensureInputs(node);
     writeState(node);
     fixNodeSize(node);
@@ -183,35 +191,34 @@ function loadMedia(node, _c, m) {
             })
             .catch(() => {});
     }
-    return Promise.resolve(); // video: seeked frames drawn on demand
-}
-
-// one shared <video> per node serves thumbnails and the playhead preview
-function videoSeek(node, url, t) {
-    const st = (node._h3Seek ??= { url: null, t: -1 });
-    if (st.url === url && Math.abs(st.t - t) < 1 / 24) return;
-    st.url = url;
-    st.t = t;
-    const v = (node._h3Player ??= Object.assign(document.createElement("video"), {
-        muted: true,
-        playsInline: true,
-        preload: "auto",
-    }));
-    v.onloadeddata = () => {
-        try {
-            v.currentTime = t;
-        } catch (_) {}
-    };
-    v.onseeked = () => redrawNode(node);
-    if (v.src !== url) v.src = url;
-    else {
-        try {
-            v.currentTime = t;
-        } catch (_) {}
+    if (m.kind === "video") {
+        // thumbnails come from the per-clip <video> elements (seeked on
+        // demand in paint). The audio track is decoded into a WebAudio
+        // buffer so it can be played back via startSound, the same path
+        // used by audio clips — this sidesteps the browser autoplay-with-
+        // sound restriction that blocks .play() on a detached <video> once
+        // the user gesture has expired.
+        fetch(m.url)
+            .then((r) => r.arrayBuffer())
+            .then((buf) => {
+                const actx =
+                    node._h3AudioCtx ??
+                    (node._h3AudioCtx =
+                        new (window.AudioContext || window.webkitAudioContext)());
+                return actx.decodeAudioData(buf);
+            })
+            .then((decoded) => {
+                m.buffer = decoded;
+                m.peaks = computePeaks(decoded); // drives the ghost waveform
+                redrawNode(node);
+            })
+            .catch(() => {});
+        return Promise.resolve();
     }
+    return Promise.resolve();
 }
 
-// per-clip <video> elements render each clip's own thumbnail frame
+// per-clip <video> elements render each clip's own thumbnail frame and,
 function thumbEl(node, c, m) {
     let t = node._h3Thumbs.get(c.id);
     if (!t) {
@@ -227,12 +234,34 @@ function thumbEl(node, c, m) {
         node._h3Thumbs.set(c.id, t);
         t.el.onseeked = () => redrawNode(node);
         t.el.onloadeddata = () => {
+            m.duration = t.el.duration;
             try {
                 t.el.currentTime = t.t;
             } catch (_) {}
+            redrawNode(node);
+        };
+        t.el.onloadedmetadata = () => {
+            m.duration = t.el.duration;
+        };
+        t.el.onended = () => {
+            t.el.currentTime = 0;
         };
     }
     return t;
+}
+
+// source length in frames for any file-backed clip (video metadata or the
+// decoded audio buffer), Infinity while unknown so loading is non-blocking.
+function sourceFrames(node, c) {
+    const saved = Number(c?.source_len);
+    if (saved > 0 && isFinite(saved)) return saved;
+    const m = ensureMedia(node, c);
+    if (!m) return Infinity;
+    const dur =
+        (typeof m.duration === "number" && isFinite(m.duration) ? m.duration : m.buffer?.duration) ||
+        0;
+    if (dur <= 0) return Infinity;
+    return Math.max(1, Math.floor(dur * (node._h3TimelineWidget?._fps || 24)));
 }
 
 function thumbSeek(node, c, m, target) {
@@ -259,18 +288,39 @@ function paintCover(ctx, el, r) {
     ctx.drawImage(el, r.x + (r.w - dw) / 2, r.y + (r.h - dh) / 2, dw, dh);
 }
 
-function paintWaveform(ctx, m, r, ghost) {
+// draws the peaks of the SOURCE window [src_start, src_start+len) across
+// the block, so trimming crops the waveform instead of stretching it. The
+// frame->peak mapping uses the decoded buffer duration (the same data the
+// peaks were computed from), so it is exact the moment peaks exist; when
+// they don't, nothing is drawn rather than a stretched full-source guess.
+function paintWaveform(ctx, m, r, ghost, node, clip) {
     if (!m?.peaks) return;
     const n = m.peaks.length / 2;
     if (n < 2) return;
     ctx.fillStyle = "rgba(0,0,0," + (ghost ? 0.25 : 0.35) + ")";
     ctx.fillRect(r.x, r.y, r.w, r.h);
     ctx.fillStyle = ghost ? "rgba(255,255,255,0.5)" : "#fff";
-    const cw = (r.w - 4) / (n - 1);
-    for (let i = 0; i < n; i++) {
-        const amp = Math.max(0.02, m.peaks[i * 2 + 1]);
+    const len = clip
+        ? clip.kind === "audio"
+            ? Number(clip.len) || 22
+            : clip.audio_link
+              ? Number(clip.len) || 22
+              : Number(clip.audio_len ?? clip.len ?? 22)
+        : Infinity;
+    const srcStart = Number(clip?.src_start) || 0;
+    const fps = node?._h3TimelineWidget?._fps || 24;
+    const bufDur = m.buffer?.duration;
+    const k = bufDur > 0 && isFinite(len) ? n / Math.max(1e-3, bufDur * fps) : 0;
+    if (!(k > 0)) return;
+    let i0 = clamp(Math.floor(srcStart * k), 0, n - 1);
+    let i1 = clamp(Math.ceil((srcStart + len) * k), 1, n);
+    const count = i1 - i0;
+    if (count < 2) return;
+    const cw = (r.w - 4) / (count - 1);
+    for (let i = i0; i < i1; i++) {
+        const amp = Math.min(1, Math.max(0.02, m.peaks[i * 2 + 1]));
         const bh = Math.max(1.5, amp * (r.h - 6));
-        const x = r.x + 2 + i * cw;
+        const x = r.x + 2 + (i - i0) * cw;
         ctx.fillRect(x, r.y + (r.h - bh) / 2, Math.max(1, cw * 0.7), bh);
     }
 }
@@ -324,9 +374,27 @@ function laneRange(c, lane) {
         const len = c.kind === "image" ? 3 : Number(c.len) || 22;
         return { s: Number(c.start), e: Number(c.start) + len };
     }
-    const s = c.kind === "audio" ? Number(c.start) : Number(c.audio_start ?? c.start);
-    const len = c.kind === "audio" ? Number(c.len) || 22 : Number(c.audio_len ?? c.len ?? 22);
+    const s =
+        c.kind === "audio"
+            ? Number(c.start)
+            : c.audio_link
+              ? Number(c.start)
+              : Number(c.audio_start ?? c.start);
+    const len =
+        c.kind === "audio"
+            ? Number(c.len) || 22
+            : c.audio_link
+              ? Number(c.len) || 22
+              : Number(c.audio_len ?? c.len ?? 22);
     return { s, e: s + len };
+}
+
+// the time range the clip's sound actually plays in (the audio-lane range:
+// follows the video while linked, the ghost's own position when unlinked).
+function soundRange(c) {
+    const start = c.audio_link ? c.start : c.audio_start ?? c.start;
+    const len = c.audio_link ? c.len : c.audio_len ?? c.len ?? 22;
+    return { s: Number(start), e: Number(start) + (Number(len) || 22) };
 }
 
 // magnet-snap a value to the playhead boundary (or the span ends). Used by
@@ -363,7 +431,8 @@ function probeSnap(node, value, scale) {
 // feel like it was fighting the user at every position.
 function resolveMove(node, c, lane, s, len, grab, px) {
     const clips = node._h3Clips;
-    const hi = (node._h3Span ?? SPAN) - len + 1;
+    const span = node._h3Span ?? SPAN;
+    const hi = Math.max(1, span - len + 1);
     // collision: push the clip flush against the neighbour it would overlap.
     // this doubles as the clip-to-clip snap: once resolved the clip sits
     // edge-to-edge with the neighbour, regardless of how fast you dragged.
@@ -473,14 +542,19 @@ function hitTest(node, p, s) {
         if (c.kind === "video") {
             const g = ghostRect(c, s);
             if (inRect(p, g, 4)) {
+                // edge trims win over the link toggle so the ghost's
+                // borders stay grabbable; the toggle keeps the middle.
+                if (!c.audio_link) {
+                    const ez = edgeZone(p, g);
+                    if (ez === "trimL") return { i, c, zone: "trimAL" };
+                    if (ez === "trimR") return { i, c, zone: "trimAR" };
+                }
                 const bx = g.x + 8;
                 const by = g.y + g.h / 2;
                 if (Math.hypot(p[0] - bx, p[1] - by) < 9) {
                     return { i, c, zone: "link" };
                 }
-                if (!c.audio_link) {
-                    return { i, c, zone: edgeZone(p, g) || "audio" };
-                }
+                if (!c.audio_link) return { i, c, zone: "audio" };
                 return null; // linked: the sound moves with the video
             }
         }
@@ -613,7 +687,39 @@ async function addClipWithMedia(node, kind) {
         return;
     }
     const detected = kindOfFile(info);
-    addClip(node, detected || kind, info);
+    const useKind = detected || kind;
+    let len = null;
+    if (useKind === "video") {
+        len = await probeVideoFrames(node, info, file);
+    }
+    addClip(node, useKind, info, len);
+}
+
+// read the duration of an uploaded video so new clips default to the full
+// source length. Resolves to null if the duration can't be probed quickly.
+function probeVideoFrames(node, info) {
+    return new Promise((resolve) => {
+        const url = mediaURL(info);
+        const v = document.createElement("video");
+        v.preload = "metadata";
+        v.muted = true;
+        let done = false;
+        const finish = (val) => {
+            if (done) return;
+            done = true;
+            v.removeAttribute("src");
+            v.load();
+            resolve(val);
+        };
+        v.onloadedmetadata = () => {
+            const fps = node._h3TimelineWidget?._fps || 24;
+            const frames = Math.max(1, Math.floor(v.duration * fps));
+            finish(frames);
+        };
+        v.onerror = () => finish(null);
+        setTimeout(() => finish(null), 4000);
+        v.src = url;
+    });
 }
 
 function placeAndPushClip(node, newClip) {
@@ -639,13 +745,17 @@ function placeAndPushClip(node, newClip) {
     }
 }
 
-function addClip(node, kind, info) {
+function addClip(node, kind, info, lenOverride) {
     if (!node._h3Clips || node._h3Clips.length >= MAX_CLIPS) return;
     const c = defaults[kind]();
     c.id = (node._h3Clips.at(-1)?.id ?? 0) + 1;
     if (info) {
         c.file = info;
         c.src_start = 0;
+    }
+    if (lenOverride && Number.isFinite(lenOverride) && lenOverride > 0) {
+        c.source_len = lenOverride;
+        c.len = lenOverride;
     }
     node._h3Clips.push(c);
     placeAndPushClip(node, c);
@@ -672,7 +782,7 @@ function drawBlock(ctx, color, label, r, ghost, media, node, clip) {
     ctx.fill();
     ctx.globalAlpha = 1;
     if (media?.kind === "audio") {
-        paintWaveform(ctx, media, r, ghost);
+        paintWaveform(ctx, media, r, ghost, node, clip);
     } else if (!ghost && media?.kind === "image" && media.img) {
         ctx.save();
         roundRect(ctx, r.x, r.y, r.w, r.h, 3);
@@ -699,6 +809,8 @@ function drawBlock(ctx, color, label, r, ghost, media, node, clip) {
 function drawGhost(ctx, c, s, node) {
     const g = ghostRect(c, s);
     drawBlock(ctx, COLORS.audio, `♪ ${c.id}`, g, true, null, node);
+    const m = c.file ? ensureMedia(node, c) : null;
+    if (m?.peaks) paintWaveform(ctx, m, g, true, node, c);
     const bx = g.x + 8;
     const by = g.y + g.h / 2;
     ctx.fillStyle = "#222";
@@ -765,16 +877,26 @@ function togglePlay(node) {
             syncPreview(node);
             if (pos > (node._h3Span ?? SPAN)) {
                 w._playing = false;
-                stopSound(node);
+                stopPlay(node);
             }
             redrawNode(node);
             requestAnimationFrame(tick);
         };
         requestAnimationFrame(tick);
     } else {
-        stopSound(node);
+        stopPlay(node);
     }
     redrawNode(node);
+}
+
+function stopPlay(node) {
+    stopSound(node);
+    for (const [, t] of (node._h3Thumbs ?? []).entries()) {
+        try {
+            t.el.pause();
+            t.el.muted = true;
+        } catch (_) {}
+    }
 }
 
 function stopSound(node) {
@@ -801,20 +923,63 @@ function previewClip(node) {
     );
 }
 
+// clip whose SOUND is under the playhead (audio-lane position: a video's
+// ghost when unlinked, its own block otherwise)
+function soundClip(node) {
+    const w = node._h3TimelineWidget;
+    const f = w?._play;
+    if (f == null) return null;
+    return (
+        node._h3Clips?.find((c) => {
+            if (c.kind === "image" || !c.file) return false;
+            const r = soundRange(c);
+            return f >= r.s - 1 && f < r.e - 1;
+        }) || null
+    );
+}
+
 function syncPreview(node) {
     const w = node._h3TimelineWidget;
-    const c = previewClip(node);
+    const vc = previewClip(node);
+    const sc = soundClip(node);
     const play = w?._play ?? 0;
-    if (c?.file) {
-        const m = ensureMedia(node, c);
-        if (m?.kind === "video" && c.kind === "video") {
-            const fps = w?._fps || 24;
-            const t = (play - (Number(c.start) - 1)) / fps +
-                (Number(c.src_start) || 0) / fps;
-            videoSeek(node, m.url, t);
-        }
+    const playing = !!w?._playing;
+    const fps = w?._fps || 24;
+
+    for (const [id, t] of (node._h3Thumbs ?? []).entries()) {
+        const active =
+            playing &&
+            vc?.kind === "video" &&
+            vc.id === id &&
+            vc.file;
+        try {
+            if (!active) {
+                t.el.pause();
+                t.el.muted = true;
+                continue;
+            }
+            // the active clip's element PLAYS muted (visuals) while the
+            // decoded WebAudio buffer provides the sound (startSound), so
+            // the picture advances smoothly instead of seeking every tick
+            // (which flickered). Drift is corrected by snapping back when
+            // the element falls more than a quarter second behind.
+            const m = ensureMedia(node, vc);
+            if (m?.kind !== "video") continue;
+            const off = (play - (Number(vc.start) - 1) + (Number(vc.src_start) || 0)) / fps;
+            if (t.el.paused) {
+                t.el.muted = true;
+                t.el.currentTime = Math.max(0, off);
+                t.el.play().catch(() => {});
+            } else if (Math.abs(t.el.currentTime - off) > 0.25) {
+                t.el.currentTime = Math.max(0, off);
+            }
+        } catch (_) {}
     }
-    if (c?.kind === "audio" && w?._playing) startSound(node, c);
+
+    // Audio is played via WebAudio using the decoded buffer, which unlike
+    // .play() on a detached <video> with sound is not blocked by autoplay
+    // policy once the AudioContext was resumed by the click.
+    if (playing && sc) startSound(node, sc);
     else stopSound(node);
 }
 
@@ -825,8 +990,9 @@ function startSound(node, c) {
     const m = ensureMedia(node, c);
     if (!m?.buffer || !node._h3AudioCtx) return;
     const play = node._h3TimelineWidget?._play ?? 0;
-    const off = (play - (Number(c.start) - 1)) / (node._h3TimelineWidget?._fps || 24) +
-        (Number(c.src_start) || 0) / (node._h3TimelineWidget?._fps || 24);
+    const fps = node._h3TimelineWidget?._fps || 24;
+    const r = soundRange(c);
+    const off = (play - (r.s - 1)) / fps + (Number(c.src_start) || 0) / fps;
     try {
         const src = node._h3AudioCtx.createBufferSource();
         src.buffer = m.buffer;
@@ -842,7 +1008,7 @@ function setup(node) {
     node._h3Media ??= new Map();
     node._h3Thumbs ??= new Map();
     node._h3Clips = readState(node);
-    if (!node._h3Clips.length) node._h3Clips = [defaults.image()];
+    if (!node._h3Clips) node._h3Clips = [];
     ensureInputs(node);
 
     if (!node._h3TimelineWidget) {
@@ -881,11 +1047,12 @@ function setup(node) {
                 ctx.restore();
             },
             _clear(ctx) {
-                // WidgetLegacy canvases are owned entirely by the widget, so
-                // clear them or translucent redraws smear. The litegraph
-                // graph canvas holds the whole graph and redraws itself each
-                // frame, so never touch it.
-                if (!ctx.canvas?.className?.includes("cursor-crosshair")) return;
+                // The litegraph graph canvas repaints the whole graph each
+                // frame, so stale pixels are impossible there. Any other
+                // canvas (graph body, properties panel, widget canvases) is
+                // NOT guaranteed to repaint itself — clear it or translucent
+                // redraws smear dragged geometry into stretched trails.
+                if (ctx.canvas === app?.canvas?.canvas) return;
                 const t = ctx.getTransform();
                 ctx.clearRect(0, 0, ctx.canvas.width / t.a, ctx.canvas.height / t.d);
             },
@@ -988,20 +1155,28 @@ function setup(node) {
                     }
                 }
 
-                // video thumbnails: seek each clip's own element to its
-                // source start, redraw on loadeddata/seeked
+                // video thumbnails: the playing clip's element runs on its
+                // own (see syncPreview); every other clip seeks to the frame
+                // the playhead currently sits on when over the clip,
+                // otherwise to the clip's source start.
+                const playFrame = this._play ?? 0;
+                const playClip = previewClip(nd);
+                const playing = !!this._playing;
                 for (const c of clips) {
                     if (c.kind !== "video" || !c.file) continue;
                     const key = mediaKey(c.file);
                     const m = nd._h3Media?.get(key);
-                    if (m?.kind === "video") {
-                        thumbSeek(
-                            nd,
-                            c,
-                            m,
-                            (Number(c.start) - 1 + (Number(c.src_start) || 0)) / fps,
-                        );
+                    if (m?.kind !== "video") continue;
+                    if (c === playClip && playing) continue;
+                    let target;
+                    if (c === playClip) {
+                        target =
+                            (playFrame - (Number(c.start) - 1) + (Number(c.src_start) || 0)) /
+                            fps;
+                    } else {
+                        target = (Number(c.start) - 1 + (Number(c.src_start) || 0)) / fps;
                     }
+                    thumbSeek(nd, c, m, Math.max(0, target));
                 }
 
                 const hov = this._hover;
@@ -1067,7 +1242,7 @@ function setup(node) {
                     if (!hit) return false;
                     e.preventDefault();
                     if (hit.zone === "in" || hit.zone === "out") {
-                        const f = hit.zone === "in" ? ZOOM_STEP : 1 / ZOOM_STEP;
+                        const f = hit.zone === "in" ? 1 / ZOOM_STEP : ZOOM_STEP;
                         const minS = Math.max(
                             0.5,
                             Math.min(ZOOM_MIN, WIDTH / (nd._h3Span ?? SPAN)),
@@ -1107,6 +1282,16 @@ function setup(node) {
                         return true;
                     }
                     if (hit.zone === "link") {
+                        // unlinking freezes the ghost at its current spot so
+                        // later edits to the video no longer move it; linking
+                        // drops the frozen position and follows the video again.
+                        if (hit.c.audio_link) {
+                            hit.c.audio_start = hit.c.start;
+                            hit.c.audio_len = hit.c.len;
+                        } else {
+                            delete hit.c.audio_start;
+                            delete hit.c.audio_len;
+                        }
                         hit.c.audio_link = !hit.c.audio_link;
                         writeState(nd);
                     } else if (hit.zone === "remove") {
@@ -1116,18 +1301,18 @@ function setup(node) {
                     } else if (hit.zone === "media") {
                         replaceClipMedia(nd, hit.c);
                     } else if (hit.c) {
+                        const audioEdit =
+                            hit.c.kind === "video" &&
+                            !hit.c.audio_link &&
+                            (hit.zone === "audio" || hit.zone === "trimAL" || hit.zone === "trimAR");
                         this._drag = {
                             ...hit,
                             grab: p[0],
                             startAt: Number(
-                                hit.c.kind === "video" && !hit.c.audio_link
-                                    ? hit.c.audio_start ?? hit.c.start
-                                    : hit.c.start,
+                                audioEdit ? hit.c.audio_start ?? hit.c.start : hit.c.start,
                             ),
                             lenAt: Number(
-                                hit.c.kind === "video" && !hit.c.audio_link
-                                    ? hit.c.audio_len ?? hit.c.len ?? 22
-                                    : hit.c.len ?? 22,
+                                audioEdit ? hit.c.audio_len ?? hit.c.len ?? 22 : hit.c.len ?? 22,
                             ),
                         };
                     } else {
@@ -1151,13 +1336,14 @@ function setup(node) {
                     if (d) {
                         const s = this._scale;
                         const step = Math.round((p[0] - d.grab) / s);
-                        const unb = d.c.kind === "video" && !d.c.audio_link;
-                        const lane = d.zone === "audio" ? 1 : laneOf(d.c.kind);
+                        const audioEdit =
+                            d.zone === "audio" || d.zone === "trimAL" || d.zone === "trimAR";
+                        const lane = audioEdit ? 1 : laneOf(d.c.kind);
                         if (d.zone === "move" || d.zone === "audio") {
                             const img = d.c.kind === "image";
                             const len = img
                                 ? 3
-                                : d.zone === "audio"
+                                : audioEdit
                                   ? (d.c.audio_len ?? d.c.len ?? 22)
                                   : (d.c.len ?? 22);
                             const s2 = resolveMove(
@@ -1172,11 +1358,17 @@ function setup(node) {
                             if (d.zone === "audio") d.c.audio_start = s2;
                             else d.c.start = s2;
                             this._frame = s2;
-                        } else if (d.zone === "trimR") {
+                        } else if (d.zone === "trimR" || d.zone === "trimAR") {
                             let len = clamp(d.lenAt + step, 1, span - d.startAt + 1);
                             if (nd._h3TimelineWidget?._snapEnabled !== false) {
                                 const end = probeSnap(nd, d.startAt + len, s);
                                 len = clamp(end - d.startAt, 1, span - d.startAt + 1);
+                            }
+                            // no clip can ever grow past the end of its source.
+                            if (d.c.file) {
+                                const srcMax = sourceFrames(nd, d.c) -
+                                    (Number(d.c.src_start) || 0);
+                                if (isFinite(srcMax) && srcMax > 0) len = Math.min(len, srcMax);
                             }
                             for (const o of nd._h3Clips) {
                                 if (o === d.c || laneOf(o.kind) !== lane) continue;
@@ -1184,13 +1376,22 @@ function setup(node) {
                                 if (r.s >= d.startAt) len = Math.min(len, r.s - d.startAt);
                             }
                             len = Math.max(1, len);
-                            if (unb) d.c.audio_len = len;
+                            if (d.zone === "trimAR") d.c.audio_len = len;
                             else d.c.len = len;
                             this._frame = d.startAt + len - 1;
-                        } else if (d.zone === "trimL") {
+                        } else if (d.zone === "trimL" || d.zone === "trimAL") {
                             let s2 = clamp(d.startAt + step, 1, d.startAt + d.lenAt - 1);
                             if (nd._h3TimelineWidget?._snapEnabled !== false) {
                                 s2 = probeSnap(nd, s2, s);
+                            }
+                            // dragging the left edge shifts the source window:
+                            // the same source frame stays under the grab point
+                            // unless src_start would go negative. The ghost
+                            // keeps its shared source window fixed instead.
+                            const origSrc = Number(d.c.src_start) || 0;
+                            if (d.zone !== "trimAL" && d.c.file) {
+                                const minStart = d.startAt - origSrc;
+                                s2 = Math.max(s2, minStart);
                             }
                             let right = d.startAt + d.lenAt;
                             for (let guard = 0; guard < nd._h3Clips.length; guard++) {
@@ -1211,13 +1412,16 @@ function setup(node) {
                             }
                             s2 = clamp(s2, 1, d.startAt + d.lenAt - 1);
                             if (s2 >= right) right = s2 + 1;
-                            const len = Math.max(1, right - s2);
-                            if (unb) {
+                            let len = Math.max(1, right - s2);
+                            if (d.zone === "trimAL") {
                                 d.c.audio_start = s2;
                                 d.c.audio_len = len;
                             } else {
                                 d.c.start = s2;
                                 d.c.len = len;
+                                if (d.c.file) {
+                                    d.c.src_start = Math.max(0, origSrc + (s2 - d.startAt));
+                                }
                             }
                             this._frame = s2;
                         }

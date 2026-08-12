@@ -1698,6 +1698,7 @@ class MiniMaxH3Timeline:
         keyframes, refs = [], []
         infos = []
         for idx, clip in enumerate(clips, 1):
+            slot = int(clip.get("id") or idx)
             kind = clip.get("kind")
             if kind not in ("image", "video", "audio"):
                 raise ValueError(
@@ -1712,8 +1713,8 @@ class MiniMaxH3Timeline:
             zero = start - 1
 
             if kind == "video":
-                frames = kwargs.get("video_%d" % idx)
-                audio = kwargs.get("video_audio_%d" % idx)
+                frames = kwargs.get("video_%d" % slot)
+                audio = kwargs.get("video_audio_%d" % slot)
                 src_start = max(0, int(clip.get("src_start") or 0))
                 fmedia = clip.get("file")
                 if fmedia:
@@ -1766,7 +1767,7 @@ class MiniMaxH3Timeline:
                         "latent": enc[:, :, k:k + 1],
                     })
 
-                audio = kwargs.get("video_audio_%d" % idx)
+                audio = kwargs.get("video_audio_%d" % slot)
                 if audio is not None:
                     if clip.get("audio_link", True):
                         a_start, a_len, align = start, run, "head"
@@ -1795,7 +1796,7 @@ class MiniMaxH3Timeline:
                     raise ValueError(
                         "h3_motion_context: image clip %d at frame %d is "
                         "outside 1..%d" % (idx, start, frame_count))
-                image = kwargs.get("image_%d" % idx)
+                image = kwargs.get("image_%d" % slot)
                 fmedia = clip.get("file")
                 if fmedia:
                     image = _load_image_file(fmedia)
@@ -1830,7 +1831,7 @@ class MiniMaxH3Timeline:
                         "Wire the H3 audio VAE." % idx)
                 a_start, a_len = self._fit_audio(
                     start, clip.get("len") or 22, frame_count, idx)
-                audio = kwargs.get("audio_%d" % idx)
+                audio = kwargs.get("audio_%d" % slot)
                 fmedia = clip.get("file")
                 if fmedia:
                     data = _load_media_file(fmedia)
