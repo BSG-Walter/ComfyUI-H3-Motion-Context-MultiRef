@@ -1597,8 +1597,7 @@ class MiniMaxH3Timeline:
                     "tooltip": "Target MiniMax H3 AV latent; defines "
                                "resolution and exact frame count."}),
                 "timeline_state": ("STRING", {
-                    "default": '{"clips":[{"id":1,"kind":"image",'
-                               '"start":1,"strength":1}]}',
+                    "default": '{"clips":[]}',
                     "multiline": False,
                     "tooltip": "Internal UI state. Normally managed by the "
                                "timeline widget."}),
