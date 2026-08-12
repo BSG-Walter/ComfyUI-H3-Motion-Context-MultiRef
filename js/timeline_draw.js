@@ -7,7 +7,7 @@ function paintCover(ctx, el, r) {
     if (!el || (!el.videoWidth && !el.naturalWidth)) return;
     const w = el.videoWidth || el.naturalWidth;
     const h = el.videoHeight || el.naturalHeight;
-    const s = Math.max(r.w / w, r.h / h);
+    const s = Math.min(r.w / w, r.h / h);
     const dw = w * s;
     const dh = h * s;
     ctx.drawImage(el, r.x + (r.w - dw) / 2, r.y + (r.h - dh) / 2, dw, dh);
@@ -64,6 +64,8 @@ export function drawBlock(ctx, color, label, r, ghost, media, node, clip) {
         ctx.beginPath();
     ctx.roundRect(r.x, r.y, r.w, r.h, 3);
         ctx.clip();
+        ctx.fillStyle = "#000";
+        ctx.fillRect(r.x, r.y, r.w, r.h);
         paintCover(ctx, media.img, r);
         ctx.restore();
     } else if (!ghost && media?.kind === "video" && node?._h3Thumbs?.get(clip?.id)?.el) {
@@ -71,6 +73,8 @@ export function drawBlock(ctx, color, label, r, ghost, media, node, clip) {
         ctx.beginPath();
     ctx.roundRect(r.x, r.y, r.w, r.h, 3);
         ctx.clip();
+        ctx.fillStyle = "#000";
+        ctx.fillRect(r.x, r.y, r.w, r.h);
         paintCover(ctx, node._h3Thumbs.get(clip.id).el, r);
         ctx.restore();
     }
