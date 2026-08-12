@@ -9,8 +9,7 @@ export function togglePlay(node) {
     w._playing = !w._playing;
     if (w._playing) {
         if (!node._h3AudioCtx) {
-            node._h3AudioCtx =
-                new (window.AudioContext || window.webkitAudioContext)();
+            node._h3AudioCtx = new AudioContext();
         }
         node._h3AudioCtx.resume?.();
         w._lastTick = null;

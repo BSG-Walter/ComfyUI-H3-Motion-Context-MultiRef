@@ -191,21 +191,25 @@ assert len(avoff.windows) == 0  # the VAE never saw the wired audio
 print("audio_off video clip OK: band deleted, video stays, silent")
 
 
+# --- out-of-range video clamps with a warning, never raises ---
+cond = run('{"clips":[{"id":1,"kind":"video","start":200,"len":22}]}',
+           AudioVAE(), vae=FakeVideoVAE(),
+           video_1=torch.rand(5, 12, 12, 3))
+assert len(cond["minimax_keyframes"]) == 2
+assert cond["minimax_keyframes"][0][pl.MC_KEY] == 80  # parked at frame 81
+print("out-of-range video clamp OK")
+
+
+# --- out-of-range image clamps with a warning, never raises ---
+cond = run('{"clips":[{"id":1,"kind":"image","start":90}]}',
+           AudioVAE(), vae=FakeVideoVAE(),
+           image_1=torch.rand(1, 12, 12, 3))
+assert len(cond["minimax_keyframes"]) == 1
+assert cond["minimax_keyframes"][0][pl.MC_KEY] == 84  # parked at last frame
+print("out-of-range image clamp OK")
+
+
 # --- structural violations still raise ---
-try:
-    run('{"clips":[{"id":1,"kind":"video","start":200,"len":22}]}',
-        AudioVAE(), vae=FakeVideoVAE(),
-        video_1=torch.rand(5, 12, 12, 3))
-    raise AssertionError("video that does not fit must raise")
-except ValueError:
-    pass
-try:
-    run('{"clips":[{"id":1,"kind":"image","start":90}]}',
-        AudioVAE(), vae=FakeVideoVAE(),
-        image_1=torch.rand(1, 12, 12, 3))
-    raise AssertionError("image beyond the clip must raise")
-except ValueError:
-    pass
 try:
     run('{"clips":[{"id":1,"kind":"bogus"}]}')
     raise AssertionError("unknown kind must raise")
@@ -290,6 +294,39 @@ assert len(kfs) == 2, len(kfs)
 assert kfs[0][pl.MC_KEY] == 9 and kfs[1][pl.MC_KEY] == 10
 assert (cond.get("minimax_refs") or []) == []  # mp4 has no audio -> silent
 print("uploaded video file clip OK: src_start window, silent track")
+
+# video file WITH an audio track: the file's own sound becomes a ref with
+# no audio input connected
+import subprocess as _sp
+_av_raw = os.path.join(inp_dir, "h3tl_tmp_av.raw.mp4")
+def _mk_video_with_audio(p):
+    _mk_video(_av_raw)
+    _sp.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", _av_raw,
+             "-i", os.path.join(inp_dir, "h3tl_tmp.wav"),
+             "-c:v", "copy", "-c:a", "aac", p],
+            check=True, capture_output=True)
+avmp4 = _tmpfile("h3tl_tmp_av.mp4", _mk_video_with_audio)
+_tmp.append(_av_raw)
+ava2 = AudioVAE()
+state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 10,
+                               "len": 5, "file": avmp4}]})
+cond = run(state, ava2, vae=FakeVideoVAE())
+refs = cond["minimax_refs"]
+assert len(refs) == 1, refs
+assert refs[0][pl.MC_AUDIO_KEY] == 14.0, refs[0][pl.MC_AUDIO_KEY]
+print("uploaded video-with-audio file clip OK: file sound becomes a ref")
+
+# separated band: unlinked file video keeps its own audio window
+ava3 = AudioVAE()
+state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 10,
+                               "len": 5, "audio_link": False,
+                               "audio_start": 40, "audio_len": 5,
+                               "file": avmp4}]})
+cond = run(state, ava3, vae=FakeVideoVAE())
+refs = cond["minimax_refs"]
+assert len(refs) == 1, refs
+assert refs[0][pl.MC_AUDIO_KEY] == 44.0, refs[0][pl.MC_AUDIO_KEY]
+print("unlinked file band OK: separated audio injects at its own position")
 
 # audio_off also suppresses the file's own sound
 avo2 = AudioVAE()

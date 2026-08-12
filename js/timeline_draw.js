@@ -3,17 +3,6 @@
 import { clamp, COLORS, ghostRect } from "./timeline_core.js";
 import { ensureMedia } from "./timeline_media.js";
 
-export function roundRect(ctx, x, y, w, h, r) {
-    r = Math.min(r, w / 2, h / 2);
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.arcTo(x + w, y, x + w, y + h, r);
-    ctx.arcTo(x + w, y + h, x, y + h, r);
-    ctx.arcTo(x, y + h, x, y, r);
-    ctx.arcTo(x, y, x + w, y, r);
-    ctx.closePath();
-}
-
 function paintCover(ctx, el, r) {
     if (!el || (!el.videoWidth && !el.naturalWidth)) return;
     const w = el.videoWidth || el.naturalWidth;
@@ -64,20 +53,23 @@ export function paintWaveform(ctx, m, r, ghost, node, clip) {
 export function drawBlock(ctx, color, label, r, ghost, media, node, clip) {
     ctx.globalAlpha = ghost ? 0.35 : 0.55;
     ctx.fillStyle = color;
-    roundRect(ctx, r.x, r.y, r.w, r.h, 3);
+    ctx.beginPath();
+    ctx.roundRect(r.x, r.y, r.w, r.h, 3);
     ctx.fill();
     ctx.globalAlpha = 1;
     if (media?.kind === "audio") {
         paintWaveform(ctx, media, r, ghost, node, clip);
     } else if (!ghost && media?.kind === "image" && media.img) {
         ctx.save();
-        roundRect(ctx, r.x, r.y, r.w, r.h, 3);
+        ctx.beginPath();
+    ctx.roundRect(r.x, r.y, r.w, r.h, 3);
         ctx.clip();
         paintCover(ctx, media.img, r);
         ctx.restore();
     } else if (!ghost && media?.kind === "video" && node?._h3Thumbs?.get(clip?.id)?.el) {
         ctx.save();
-        roundRect(ctx, r.x, r.y, r.w, r.h, 3);
+        ctx.beginPath();
+    ctx.roundRect(r.x, r.y, r.w, r.h, 3);
         ctx.clip();
         paintCover(ctx, node._h3Thumbs.get(clip.id).el, r);
         ctx.restore();

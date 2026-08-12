@@ -44,7 +44,7 @@ import {
     addClipWithMedia,
     splitAt,
 } from "./timeline_state.js";
-import { roundRect, drawBlock, drawGhost } from "./timeline_draw.js";
+import { drawBlock, drawGhost } from "./timeline_draw.js";
 import { togglePlay, syncPreview, previewClip } from "./timeline_play.js";
 
 const NODE_NAME = "MiniMaxH3Timeline";
@@ -283,7 +283,8 @@ function setup(node) {
                 const btnChars = ["✂", "🧲", this._playing ? "⏹" : "▶", "F", "−", "+"];
                 for (const [i, ch] of btnChars.entries()) {
                     const x = TOOL_X + i * 20;
-                    roundRect(ctx, x + 0.5, 3, BTN_W, BTN_H, 3);
+                    ctx.beginPath();
+                    ctx.roundRect(x + 0.5, 3, BTN_W, BTN_H, 3);
                     if (i === 1 && snapOn) {
                         ctx.fillStyle = "#3a5a80";
                     } else {
@@ -355,7 +356,8 @@ function setup(node) {
                         ctx.globalAlpha = 0.16;
                         const pr = blockRect(pc, s);
                         ctx.fillStyle = PLAY_COLOR;
-                        roundRect(ctx, pr.x - 2, pr.y - 2, pr.w + 4, pr.h + 4, 3);
+                        ctx.beginPath();
+                        ctx.roundRect(pr.x - 2, pr.y - 2, pr.w + 4, pr.h + 4, 3);
                         ctx.fill();
                         ctx.globalAlpha = 1;
                     }

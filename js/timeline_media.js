@@ -46,10 +46,7 @@ export function computePeaks(buf) {
 
 export function redrawNode(node) {
     const w = node._h3TimelineWidget;
-    if (w) {
-        w.triggerDraw?.();
-        w.redraw?.(node);
-    }
+    if (w) w.redraw?.(node);
 }
 
 export function ensureMedia(node, c) {
@@ -69,6 +66,23 @@ export function ensureMedia(node, c) {
     return m;
 }
 
+function decodeAudio(node, m) {
+    return fetch(m.url)
+        .then((r) => r.arrayBuffer())
+        .then((buf) => {
+            const actx =
+                node._h3AudioCtx ?? (node._h3AudioCtx = new AudioContext());
+            return actx.decodeAudioData(buf);
+        })
+        .then((decoded) => {
+            m.buffer = decoded;
+            m.peaks = computePeaks(decoded);
+            m.loaded = true;
+            redrawNode(node);
+        })
+        .catch(() => {});
+}
+
 function loadMedia(node, _c, m) {
     if (m.kind === "image") {
         const img = new Image();
@@ -83,22 +97,7 @@ function loadMedia(node, _c, m) {
         });
     }
     if (m.kind === "audio") {
-        return fetch(m.url)
-            .then((r) => r.arrayBuffer())
-            .then((buf) => {
-                const actx =
-                    node._h3AudioCtx ??
-                    (node._h3AudioCtx =
-                        new (window.AudioContext || window.webkitAudioContext)());
-                return actx.decodeAudioData(buf);
-            })
-            .then((decoded) => {
-                m.buffer = decoded;
-                m.peaks = computePeaks(decoded);
-                m.loaded = true;
-                redrawNode(node);
-            })
-            .catch(() => {});
+        return decodeAudio(node, m);
     }
     if (m.kind === "video") {
         // thumbnails come from the per-clip <video> elements (seeked on
@@ -107,21 +106,7 @@ function loadMedia(node, _c, m) {
         // used by audio clips — this sidesteps the browser autoplay-with-
         // sound restriction that blocks .play() on a detached <video> once
         // the user gesture has expired.
-        fetch(m.url)
-            .then((r) => r.arrayBuffer())
-            .then((buf) => {
-                const actx =
-                    node._h3AudioCtx ??
-                    (node._h3AudioCtx =
-                        new (window.AudioContext || window.webkitAudioContext)());
-                return actx.decodeAudioData(buf);
-            })
-            .then((decoded) => {
-                m.buffer = decoded;
-                m.peaks = computePeaks(decoded); // drives the ghost waveform
-                redrawNode(node);
-            })
-            .catch(() => {});
+        decodeAudio(node, m);
         return Promise.resolve();
     }
     return Promise.resolve();

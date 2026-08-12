@@ -183,35 +183,38 @@ def _load_media_file(media):
     """Decode an uploaded audio/video file with PyAV.
 
     Returns {"frames": [B,H,W,C]|None, "audio": AUDIO dict|None}, decoding
-    whatever streams the file actually has.
+    whatever streams the file actually has. A single demux pass feeds both
+    decoders: PyAV's decode() discards packets of non-requested streams, so
+    decoding one stream to EOF (or re-demuxing after EOF) drops the other.
     """
     frames, audio = None, None
     with av.open(_media_ref_path(media)) as af:
-        video = af.streams.video
-        if video:
-            collected = []
-            for frame in af.decode(video[0]):
-                arr = frame.to_ndarray(format="rgb24")
-                collected.append(torch.from_numpy(
-                    np.asarray(arr, dtype=np.float32) / 255.0))
-            if collected:
-                frames = torch.stack(collected)
-        sounds = af.streams.audio
-        if sounds:
-            stream = sounds[0]
-            sr = stream.codec_context.sample_rate
-            n_channels = stream.channels
-            chunks = []
-            for frame in af.decode(stream):
-                buf = torch.from_numpy(frame.to_ndarray())
-                if buf.shape[0] != n_channels:
-                    buf = buf.view(-1, n_channels).t()
-                chunks.append(buf)
-            if chunks:
-                audio = {
-                    "waveform": f32_pcm(torch.cat(chunks, dim=1)).unsqueeze(0),
-                    "sample_rate": int(sr),
-                }
+        streams = {s.type: s for s in af.streams}
+        collected, chunks = [], []
+        for packet in af.demux():
+            stype = packet.stream.type if packet.stream is not None else None
+            if stype not in streams:
+                continue
+            if stype == "video":
+                for frame in packet.decode():
+                    arr = frame.to_ndarray(format="rgb24")
+                    collected.append(torch.from_numpy(
+                        np.asarray(arr, dtype=np.float32) / 255.0))
+            elif stype == "audio":
+                n_channels = streams["audio"].channels
+                for frame in packet.decode():
+                    buf = torch.from_numpy(frame.to_ndarray())
+                    if buf.shape[0] != n_channels:
+                        buf = buf.view(-1, n_channels).t()
+                    chunks.append(buf)
+        if collected:
+            frames = torch.stack(collected)
+        if chunks:
+            astream = streams["audio"]
+            audio = {
+                "waveform": f32_pcm(torch.cat(chunks, dim=1)).unsqueeze(0),
+                "sample_rate": int(astream.codec_context.sample_rate),
+            }
     return {"frames": frames, "audio": audio}
 
 
@@ -1725,8 +1728,7 @@ class MiniMaxH3Timeline:
                             "video stream"
                             % (idx, fmedia.get("name")))
                     frames = frames[src_start:]
-                    if audio is None and clip.get("audio_link", True) \
-                            and not clip.get("audio_off") \
+                    if audio is None and not clip.get("audio_off") \
                             and data["audio"] is not None:
                         audio = _slice_audio(
                             data["audio"], src_start / float(FPS))
@@ -1747,10 +1749,18 @@ class MiniMaxH3Timeline:
                         "off the VAE grid; pinning the first %d (usable "
                         "runs: 1, 5, 22, 39)", idx, want, run)
                 if zero + run > frame_count:
-                    raise ValueError(
-                        "h3_motion_context: video clip %d does not fit: %d "
-                        "frames at frame %d in a %d frame clip"
-                        % (idx, run, start, frame_count))
+                    if run > frame_count:
+                        _LOG.warning(
+                            "h3_motion_context: video clip %d needs %d "
+                            "frames, more than the %d frame clip; skipped",
+                            idx, run, frame_count)
+                        continue
+                    _LOG.warning(
+                        "h3_motion_context: video clip %d at frame %d does "
+                        "not fit in the %d frame clip; parked at frame %d",
+                        idx, start, frame_count, frame_count - run + 1)
+                    zero = frame_count - run
+                    start = zero + 1
                 enc = vae.encode(_resize(frames[:run], width, height, crop))
                 steps = int(enc.shape[2])
                 if _pixel_frames(steps) != run:
@@ -1767,7 +1777,8 @@ class MiniMaxH3Timeline:
                         "latent": enc[:, :, k:k + 1],
                     })
 
-                audio = kwargs.get("video_audio_%d" % slot)
+                # audio is the input or the file-derived fallback above;
+                # re-reading the kwarg here would drop the file's track
                 if audio is not None and not clip.get("audio_off"):
                     if clip.get("audio_link", True):
                         a_start, a_len, align = start, run, "head"
@@ -1793,9 +1804,12 @@ class MiniMaxH3Timeline:
 
             elif kind == "image":
                 if zero >= frame_count:
-                    raise ValueError(
+                    _LOG.warning(
                         "h3_motion_context: image clip %d at frame %d is "
-                        "outside 1..%d" % (idx, start, frame_count))
+                        "beyond the %d frame clip; parked at the last frame",
+                        idx, start, frame_count)
+                    zero = frame_count - 1
+                    start = frame_count
                 image = kwargs.get("image_%d" % slot)
                 fmedia = clip.get("file")
                 if fmedia:
