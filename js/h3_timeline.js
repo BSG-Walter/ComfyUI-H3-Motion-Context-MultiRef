@@ -22,6 +22,8 @@ import {
     clamp,
     laneOf,
     laneRange,
+    occupiesLane,
+    laneFree,
     blockRect,
     resolveMove,
     probeSnap,
@@ -510,10 +512,17 @@ function setup(node) {
                             else d.c.start = s2;
                             this._frame = s2;
                         } else if (d.zone === "trimR" || d.zone === "trimAR") {
+                            const lanes =
+                                lane === 0 && d.c.kind === "video" && d.c.audio_link && !d.c.audio_off
+                                    ? [0, 1]
+                                    : [lane];
                             let len = clamp(d.lenAt + step, 1, span - d.startAt + 1);
                             if (nd._h3TimelineWidget?._snapEnabled !== false) {
                                 const end = probeSnap(nd, d.startAt + len, s);
-                                len = clamp(end - d.startAt, 1, span - d.startAt + 1);
+                                const snapped = clamp(end - d.startAt, 1, span - d.startAt + 1);
+                                if (lanes.every((L) => laneFree(nd, d.c, L, d.startAt, snapped))) {
+                                    len = snapped;
+                                }
                             }
                             // no clip can ever grow past the end of its source.
                             if (d.c.file) {
@@ -521,17 +530,25 @@ function setup(node) {
                                     (Number(d.c.src_start) || 0);
                                 if (isFinite(srcMax) && srcMax > 0) len = Math.min(len, srcMax);
                             }
-                            for (const o of nd._h3Clips) {
-                                if (o === d.c || laneOf(o.kind) !== lane) continue;
-                                const r = laneRange(o, lane);
-                                if (r.s >= d.startAt) len = Math.min(len, r.s - d.startAt);
+                            for (const L of lanes) {
+                                for (const o of nd._h3Clips) {
+                                    if (o === d.c || !occupiesLane(o, L)) continue;
+                                    const r = laneRange(o, L);
+                                    if (r.s >= d.startAt) len = Math.min(len, r.s - d.startAt);
+                                    else if (r.e > d.startAt) len = Math.min(len, r.e - d.startAt);
+                                }
                             }
                             len = Math.max(1, len);
                             if (d.zone === "trimAR") d.c.audio_len = len;
                             else d.c.len = len;
                             this._frame = d.startAt + len - 1;
                         } else if (d.zone === "trimL" || d.zone === "trimAL") {
-                            let s2 = clamp(d.startAt + step, 1, d.startAt + d.lenAt - 1);
+                            const lanes =
+                                lane === 0 && d.c.kind === "video" && d.c.audio_link && !d.c.audio_off
+                                    ? [0, 1]
+                                    : [lane];
+                            const rawS2 = clamp(d.startAt + step, 1, d.startAt + d.lenAt - 1);
+                            let s2 = rawS2;
                             if (nd._h3TimelineWidget?._snapEnabled !== false) {
                                 s2 = probeSnap(nd, s2, s);
                             }
@@ -548,22 +565,30 @@ function setup(node) {
                             for (let guard = 0; guard < nd._h3Clips.length; guard++) {
                                 if (s2 >= right) break;
                                 let changed = false;
-                                for (const o of nd._h3Clips) {
-                                    if (o === d.c || laneOf(o.kind) !== lane) continue;
-                                    const r = laneRange(o, lane);
-                                    if (r.s <= s2 && r.e > s2) {
-                                        s2 = r.e;
-                                        changed = true;
-                                    } else if (r.s > s2 && r.s < right) {
-                                        right = r.s;
-                                        changed = true;
+                                for (const L of lanes) {
+                                    for (const o of nd._h3Clips) {
+                                        if (o === d.c || !occupiesLane(o, L)) continue;
+                                        const r = laneRange(o, L);
+                                        if (r.s <= s2 && r.e > s2) {
+                                            s2 = r.e;
+                                            changed = true;
+                                        } else if (r.s > s2 && r.s < right) {
+                                            right = r.s;
+                                            changed = true;
+                                        }
                                     }
                                 }
                                 if (!changed) break;
                             }
-                            s2 = clamp(s2, 1, d.startAt + d.lenAt - 1);
-                            if (s2 >= right) right = s2 + 1;
+                            s2 = Math.min(s2, Math.max(1, right - 1));
                             let len = Math.max(1, right - s2);
+                            // the snap (or push) can strand the edge inside a
+                            // clip that spans the whole remaining length:
+                            // fall back to the un-snapped drag position.
+                            if (!lanes.every((L) => laneFree(nd, d.c, L, s2, len))) {
+                                s2 = rawS2;
+                                len = Math.max(1, d.startAt + d.lenAt - s2);
+                            }
                             if (d.zone === "trimAL") {
                                 d.c.audio_start = s2;
                                 d.c.audio_len = len;

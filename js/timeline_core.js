@@ -83,6 +83,14 @@ export function laneOf(kind) {
     return kind === "audio" ? 1 : 0;
 }
 
+// whether a clip occupies the given lane: video clips also occupy the audio
+// lane through their sound band (unless the band was deleted), so audio
+// clips must never overlap a linked band.
+export function occupiesLane(c, lane) {
+    if (lane === 1) return c.kind === "audio" || (c.kind === "video" && !c.audio_off);
+    return c.kind !== "audio";
+}
+
 export function blockRect(c, s) {
     const len = c.kind === "image" ? 3 : Number(c.len) || 22;
     return {
@@ -163,6 +171,16 @@ export function probeSnap(node, value, scale) {
     return value;
 }
 
+// whether [s, s+len) overlaps any clip occupying `lane` (excluding `c`)
+export function laneFree(node, c, lane, s, len) {
+    for (const o of node._h3Clips) {
+        if (o === c || !occupiesLane(o, lane)) continue;
+        const r = laneRange(o, lane);
+        if (s < r.e && s + len > r.s) return false;
+    }
+    return true;
+}
+
 // magnet-snap to the playhead boundary (and span ends) within SNAP_PLAY_PX.
 // Snapping to other clips is handled by the collision push above: the clip
 // is shoved flush against whichever neighbour it would overlap, so there is
@@ -172,18 +190,28 @@ export function resolveMove(node, c, lane, s, len, grab, px) {
     const clips = node._h3Clips;
     const span = node._h3Span ?? SPAN;
     const hi = Math.max(1, span - len + 1);
+    // a linked video drags its sound band along, so it must not plow
+    // through audio clips either: both lanes block the whole clip.
+    const lanes =
+        lane === 0 && c.kind === "video" && c.audio_link && !c.audio_off
+            ? [0, 1]
+            : [lane];
+    const free = (start) => lanes.every((L) => laneFree(node, c, L, start, len));
     // collision: push the clip flush against the neighbour it would overlap.
     // this doubles as the clip-to-clip snap: once resolved the clip sits
     // edge-to-edge with the neighbour, regardless of how fast you dragged.
     for (let guard = 0; guard < clips.length; guard++) {
         let hit = null;
-        for (const o of clips) {
-            if (o === c || laneOf(o.kind) !== lane) continue;
-            const r = laneRange(o, lane);
-            if (s < r.e && s + len > r.s) {
-                hit = r;
-                break;
+        for (const L of lanes) {
+            for (const o of clips) {
+                if (o === c || !occupiesLane(o, L)) continue;
+                const r = laneRange(o, L);
+                if (s < r.e && s + len > r.s) {
+                    hit = r;
+                    break;
+                }
             }
+            if (hit) break;
         }
         if (!hit) break;
         s = grab < (hit.s + hit.e) / 2 ? hit.s - len : hit.e;
@@ -195,7 +223,7 @@ export function resolveMove(node, c, lane, s, len, grab, px) {
         let best = s;
         let dBest = Infinity;
         const probe = (v) => {
-            if (v < 1 || v > hi) return;
+            if (v < 1 || v > hi || !free(v)) return;
             const d = Math.abs(v - s);
             if (d < dBest) {
                 dBest = d;

@@ -9,6 +9,8 @@ import {
     defaults,
     kindOfFile,
     laneOf,
+    laneRange,
+    occupiesLane,
     playHeadBoundary,
 } from "./timeline_core.js";
 import { pickFile, probeVideoFrames, redrawNode, uploadMedia } from "./timeline_media.js";
@@ -178,13 +180,14 @@ function placeAndPushClip(node, newClip) {
     newClip.start = start;
     const newLen = Number(newClip.len) || (newClip.kind === "image" ? 3 : 22);
 
-    const sameLane = node._h3Clips.filter((c) => c !== newClip && laneOf(c.kind) === lane);
-    sameLane.sort((a, b) => Number(a.start) - Number(b.start));
+    const sameLane = node._h3Clips.filter((c) => c !== newClip && occupiesLane(c, lane));
+    sameLane.sort((a, b) => laneRange(a, lane).s - laneRange(b, lane).s);
 
     let pushCursor = start + newLen;
     for (const c of sameLane) {
-        const cStart = Number(c.start);
-        const cLen = Number(c.len) || 1;
+        const r = laneRange(c, lane);
+        const cStart = r.s;
+        const cLen = r.e - r.s;
         if (cStart >= start && cStart < pushCursor) {
             c.start = pushCursor;
             pushCursor = c.start + cLen;
