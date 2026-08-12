@@ -144,11 +144,11 @@ export function soundRange(c) {
     return { s: Number(start), e: Number(start) + (Number(len) || 22) };
 }
 
-// magnet-snap a value to the playhead boundary (or the span ends). Used by
-// the trim handlers so that resizing a clip "kisses" the playhead without
-// yanking it toward every other clip edge in the timeline — the collision
-// guard already keeps clips from overlapping, so the only free magnet the
-// user actually wants here is the playhead.
+// magnet-snap a value to the playhead boundary or the end-line (span+1).
+// Used by the trim handlers so that resizing a clip "kisses" the playhead
+// or the timeline end without yanking it toward every other clip edge —
+// the collision guard already keeps clips from overlapping, so the only
+// free magnets the user wants are the playhead and the end-line.
 export function probeSnap(node, value, scale) {
     if (node._h3TimelineWidget?._snapEnabled === false) return value;
     const span = node._h3Span ?? SPAN;
@@ -164,9 +164,7 @@ export function probeSnap(node, value, scale) {
     probe(1);
     probe(span + 1);
     const pl = node._h3TimelineWidget?._play;
-    if (pl != null) {
-        probe(clamp(Math.round(pl) + 1, 1, span));
-    }
+    if (pl != null) probe(Math.round(pl) + 1);
     if (dBest <= Math.max(0.5, SNAP_PLAY_PX / scale)) return best;
     return value;
 }
@@ -189,7 +187,7 @@ export function laneFree(node, c, lane, s, len) {
 export function resolveMove(node, c, lane, s, len, grab, px) {
     const clips = node._h3Clips;
     const span = node._h3Span ?? SPAN;
-    const hi = Math.max(1, span - len + 1);
+    const endLine = span + 1;
     // a linked video drags its sound band along, so it must not plow
     // through audio clips either: both lanes block the whole clip.
     const lanes =
@@ -217,13 +215,13 @@ export function resolveMove(node, c, lane, s, len, grab, px) {
         s = grab < (hit.s + hit.e) / 2 ? hit.s - len : hit.e;
         if (s < 1) break;
     }
-    s = clamp(s, 1, hi);
+    s = Math.max(1, s);
 
     if (node._h3TimelineWidget?._snapEnabled !== false) {
         let best = s;
         let dBest = Infinity;
         const probe = (v) => {
-            if (v < 1 || v > hi || !free(v)) return;
+            if (v < 1 || !free(v)) return;
             const d = Math.abs(v - s);
             if (d < dBest) {
                 dBest = d;
@@ -231,16 +229,17 @@ export function resolveMove(node, c, lane, s, len, grab, px) {
             }
         };
         probe(1);
-        probe(hi);
+        probe(endLine);
+        probe(endLine - len);
         const pl = node._h3TimelineWidget?._play;
         if (pl != null) {
-            const f = clamp(Math.round(pl) + 1, 1, node._h3Span ?? SPAN);
+            const f = Math.round(pl) + 1;
             probe(f);
             probe(f - len);
         }
         if (dBest <= Math.max(0.5, SNAP_PLAY_PX / px)) s = best;
     }
-    return clamp(s, 1, hi);
+    return Math.max(1, s);
 }
 
 export function inRect(p, r, pad = 0) {
@@ -267,10 +266,8 @@ export function btnZone(p) {
 export function playHeadBoundary(node) {
     const w = node._h3TimelineWidget;
     const v = w?._play;
-    if (v != null) {
-        return clamp(Math.round(v) + 1, 1, node._h3Span ?? SPAN);
-    }
-    return clamp(w?._frame ?? 1, 1, node._h3Span ?? SPAN);
+    if (v != null) return Math.max(1, Math.round(v) + 1);
+    return Math.max(1, w?._frame ?? 1);
 }
 
 export function hitTest(node, p, s) {
@@ -308,7 +305,7 @@ export function hitTest(node, p, s) {
     return null;
 }
 
-// magnet-snap a playhead boundary to clip edges like resolveMove does;
+// magnet-snap a playhead boundary to clip edges and the end-line;
 // p is 0-based play position, clip boundaries are 1-based frame edges
 export function splitSnap(node, p, s) {
     if (node._h3TimelineWidget?._snapEnabled === false) return p;
@@ -332,6 +329,7 @@ export function splitSnap(node, p, s) {
             probe(v.e - 1);
         }
     }
+    probe(span); // end-line
     if (dBest <= Math.max(0.5, SNAP_PX / s)) return best;
     return p;
 }

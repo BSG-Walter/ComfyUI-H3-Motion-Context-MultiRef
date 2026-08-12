@@ -316,6 +316,20 @@ function setup(node) {
                     }
                 }
 
+                // end-line + dim everything past it
+                {
+                    const ex = OFFSET_X + span * s;
+                    if (ex < WIDTH) {
+                        ctx.fillStyle = "rgba(0,0,0,0.45)";
+                        ctx.fillRect(ex, RULER_H, WIDTH - ex, H - RULER_H);
+                    }
+                    ctx.strokeStyle = "#f8932b";
+                    ctx.beginPath();
+                    ctx.moveTo(ex + 0.5, RULER_H - 6);
+                    ctx.lineTo(ex + 0.5, H);
+                    ctx.stroke();
+                }
+
                 // video thumbnails: the playing clip's element runs on its
                 // own (see syncPreview); every other clip seeks to the frame
                 // the playhead currently sits on when over the clip,
@@ -435,7 +449,7 @@ function setup(node) {
                     if (hit.zone === "ruler") {
                         this._dragPlay = true;
                         const s = this._scale;
-                        const v = clamp(Math.round((p[0] - OFFSET_X) / s), 0, (nd._h3Span ?? SPAN) - 1);
+                        const v = Math.max(0, Math.round((p[0] - OFFSET_X) / s));
                         this._play = splitSnap(nd, v, s);
                         this._frame = null;
                         if (!this._playing) syncPreview(nd);
@@ -478,11 +492,10 @@ function setup(node) {
                 if (type.includes("move")) {
                     nd._h3Hovered = true;
                     this._hover = hitTest(nd, p, this._scale);
-                    const span = nd._h3Span ?? SPAN;
                     const d = this._drag;
                     if (this._dragPlay) {
                         const s = this._scale;
-                        const v = clamp(Math.round((p[0] - OFFSET_X) / s), 0, span - 1);
+                        const v = Math.max(0, Math.round((p[0] - OFFSET_X) / s));
                         this._play = splitSnap(nd, v, s);
                         if (!this._playing) syncPreview(nd);
                         this.redraw(nd);
@@ -505,7 +518,7 @@ function setup(node) {
                                 nd,
                                 d.c,
                                 lane,
-                                clamp(d.startAt + step, 1, span - len + 1),
+                                Math.max(1, d.startAt + step),
                                 len,
                                 d.grab / s + 1,
                                 s,
@@ -518,10 +531,10 @@ function setup(node) {
                                 lane === 0 && d.c.kind === "video" && d.c.audio_link && !d.c.audio_off
                                     ? [0, 1]
                                     : [lane];
-                            let len = clamp(d.lenAt + step, 1, span - d.startAt + 1);
+                            let len = Math.max(1, d.lenAt + step);
                             if (nd._h3TimelineWidget?._snapEnabled !== false) {
                                 const end = probeSnap(nd, d.startAt + len, s);
-                                const snapped = clamp(end - d.startAt, 1, span - d.startAt + 1);
+                                let snapped = Math.max(1, end - d.startAt);
                                 if (lanes.every((L) => laneFree(nd, d.c, L, d.startAt, snapped))) {
                                     len = snapped;
                                 }
@@ -606,7 +619,7 @@ function setup(node) {
                         writeState(nd);
                         this.redraw(nd);
                     } else {
-                        this._frame = clamp(Math.round((p[0] - OFFSET_X) / this._scale + 1), 1, span);
+                        this._frame = Math.max(1, Math.round((p[0] - OFFSET_X) / this._scale + 1));
                         this.redraw(nd);
                     }
                     return true;

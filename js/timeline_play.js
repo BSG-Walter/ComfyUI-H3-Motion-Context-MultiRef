@@ -1,6 +1,6 @@
 // Playback (playhead, preview, sound) for the H3 timeline widget.
 
-import { mediaKey, soundRange } from "./timeline_core.js";
+import { mediaKey, soundRange, SPAN } from "./timeline_core.js";
 import { ensureMedia, redrawNode } from "./timeline_media.js";
 
 export function togglePlay(node) {
