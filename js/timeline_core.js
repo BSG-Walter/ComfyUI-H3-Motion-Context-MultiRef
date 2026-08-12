@@ -270,12 +270,6 @@ export function hitTest(node, p, s) {
         }
         const r = blockRect(c, s);
         if (inRect(p, r, 2)) {
-            if (p[0] < r.x + 16 && p[1] < r.y + 14) {
-                return { i, c, zone: "media" };
-            }
-            if (p[0] > r.x + r.w - 14 && p[1] < r.y + 14) {
-                return { i, c, zone: "remove" };
-            }
             if (c.kind === "image") return { i, c, zone: "move" };
             return { i, c, zone: edgeZone(p, r) || "move" };
         }

@@ -46,6 +46,77 @@ import { togglePlay, syncPreview, previewClip } from "./timeline_play.js";
 
 const NODE_NAME = "MiniMaxH3Timeline";
 
+// --- clip context menu ------------------------------------------------------
+
+let _menu = null;
+let _menuOverlay = null;
+
+function closeClipMenu() {
+    _menu?.remove?.();
+    _menuOverlay?.remove?.();
+    _menu = null;
+    _menuOverlay = null;
+}
+
+function openClipMenu(node, widget, clip, idx, x, y) {
+    closeClipMenu();
+    widget._menuAt = Date.now();
+    const items = [
+        ["Delete clip", () => removeClip(node, idx)],
+        ["Replace clip\u2026", () => replaceClipMedia(node, clip)],
+        ["Copy clip", null],
+        ["Cut clip", null],
+        ["Duplicate", null],
+        ["Move up", null],
+        ["Move down", null],
+        ["Move to playhead", null],
+        ["Change strength", null],
+    ];
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed;inset:0;z-index:3000";
+    overlay.addEventListener("pointerdown", closeClipMenu);
+    document.body.appendChild(overlay);
+    _menuOverlay = overlay;
+
+    const winW = typeof window !== "undefined" ? (window.innerWidth ?? 800) : 800;
+    const winH = typeof window !== "undefined" ? (window.innerHeight ?? 600) : 600;
+    const menu = document.createElement("div");
+    menu.dataset.h3menu = "1";
+    menu.style.cssText =
+        "position:fixed;z-index:3001;min-width:180px;background:#222;border:1px solid #555;" +
+        "border-radius:6px;padding:4px;font:13px sans-serif;color:#ddd;user-select:none;" +
+        "box-shadow:0 4px 16px rgba(0,0,0,0.5);left:" +
+        Math.min(x, winW - 200) + "px;top:" +
+        Math.min(y, winH - items.length * 27 - 10) + "px";
+    for (const [label, cb] of items) {
+        const row = document.createElement("div");
+        const enabled = !!cb;
+        row.style.cssText =
+            "padding:4px 10px;border-radius:4px;cursor:" + (enabled ? "pointer" : "default") +
+            ";color:" + (enabled ? "#ddd" : "#666");
+        row.textContent = label;
+        if (enabled) {
+            row.addEventListener("pointerdown", (e) => {
+                e.stopPropagation();
+                cb();
+                closeClipMenu();
+            });
+            row.addEventListener("pointerenter", () => {
+                row.style.background = "#3a5a80";
+            });
+            row.addEventListener("pointerleave", () => {
+                row.style.background = "transparent";
+            });
+        }
+        menu.appendChild(row);
+    }
+    document.body.appendChild(menu);
+    _menu = menu;
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closeClipMenu();
+    }, { once: true, capture: true });
+}
+
 function setup(node) {
     hideStateWidget(node);
     node._h3Media ??= new Map();
@@ -73,12 +144,14 @@ function setup(node) {
             _play: 0,
             _playing: false,
             _ctxs: new Set(),
+            _boundCtxs: null,
             computeSize: () => [WIDTH, HEIGHT],
             draw(ctx, nd, width, y, H) {
                 // y is the widget row offset inside the node. Canvas
                 // renderer (1.0): widget.y (>= 4). Vue WidgetLegacy (2.0):
                 // always 1, canvas is widget-local. NaN/0 -> keep last.
                 if (ctx?.canvas?.isConnected) this._ctxs.add(ctx);
+                this._bindMenu(ctx?.canvas, nd);
                 if (Number.isFinite(y)) {
                     if (y >= 4) this._yOff = y;
                     else if (y === 1) this._yOff = 1;
@@ -88,6 +161,35 @@ function setup(node) {
                 ctx.translate(0, this._yOff ?? 1);
                 this.paint(ctx, nd, width, H);
                 ctx.restore();
+            },
+            _bindMenu(canvas, nd) {
+                if (!canvas || this._boundCtxs?.has(canvas)) return;
+                (this._boundCtxs ??= new Set()).add(canvas);
+                canvas.addEventListener("contextmenu", (e) => {
+                    // the mouse() right-down path already opened the menu
+                    if (Date.now() - (this._menuAt || 0) < 600) return;
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+                    const isGraph = canvas === app?.canvas?.canvas;
+                    let px;
+                    let py;
+                    if (isGraph) {
+                        try {
+                            app.canvas.adjustMouseEvent?.(e);
+                        } catch (_) {}
+                        const n = this._node ?? nd;
+                        px = (e.canvasX ?? e.offsetX) - (n.pos?.[0] ?? 0);
+                        py = (e.canvasY ?? e.offsetY) - (n.pos?.[1] ?? 0) - this._yOff;
+                    } else {
+                        px = e.offsetX;
+                        py = e.offsetY - this._yOff;
+                    }
+                    const hit = hitTest(nd, [px, py], this._scale);
+                    const idx = hit?.c ? (nd._h3Clips?.indexOf(hit.c) ?? -1) : -1;
+                    if (idx >= 0) {
+                        openClipMenu(nd, this, hit.c, idx, e.clientX, e.clientY);
+                    }
+                }, true);
             },
             _clear(ctx) {
                 // The litegraph graph canvas repaints the whole graph each
@@ -222,18 +324,6 @@ function setup(node) {
                     thumbSeek(nd, c, m, Math.max(0, target));
                 }
 
-                const hov = this._hover;
-                if (hov && clips[hov.i]) {
-                    const r = blockRect(hov.c, s);
-                    ctx.fillStyle = "#e05252";
-                    ctx.font = "10px sans-serif";
-                    ctx.textAlign = "right";
-                    ctx.textBaseline = "top";
-                    ctx.fillText("✕", r.x + r.w - 2, r.y + 2);
-                    ctx.textAlign = "left";
-                    ctx.fillText("📁", r.x + 1, r.y + 1);
-                }
-
                 // playhead
                 if (this._play != null) {
                     const x = OFFSET_X + Math.max(0, this._play) * s;
@@ -280,6 +370,17 @@ function setup(node) {
                 if (this._yOff <= 4 && y > HEIGHT + 4) y = pos[1] - this._rowOf;
                 const p = [pos[0], y];
                 const type = e.type || "";
+                if (type.endsWith("down") && e.button === 2) {
+                    // right click on a clip: open the clip context menu.
+                    const hit = hitTest(nd, p, this._scale);
+                    if (!hit?.c) return false;
+                    e.preventDefault();
+                    const idx = nd._h3Clips?.indexOf(hit.c) ?? -1;
+                    if (idx >= 0) {
+                        openClipMenu(nd, this, hit.c, idx, e.clientX ?? pos[0], e.clientY ?? pos[1]);
+                    }
+                    return true;
+                }
                 if (type.endsWith("down") && e.button === 0) {
                     const hit = hitTest(nd, p, this._scale);
                     if (!hit) return false;
@@ -337,12 +438,6 @@ function setup(node) {
                         }
                         hit.c.audio_link = !hit.c.audio_link;
                         writeState(nd);
-                    } else if (hit.zone === "remove") {
-                        this._drag = null;
-                        this._hover = null;
-                        removeClip(nd, hit.i);
-                    } else if (hit.zone === "media") {
-                        replaceClipMedia(nd, hit.c);
                     } else if (hit.c) {
                         const audioEdit =
                             hit.c.kind === "video" &&
