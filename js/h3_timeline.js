@@ -10,7 +10,9 @@ const PX = 3.5; // pixels per frame (base zoom)
 const ZOOM_MIN = 2; // px/frame limits for zoom buttons
 const ZOOM_MAX = 24;
 const ZOOM_STEP = 1.25;
-const SNAP_PX = 5; // magnet radius for clip snapping
+const SNAP_PX = 12; // magnet radius for clip snapping
+const SNAP_PLAY_PX = 24; // wider magnet radius when clips snap to the playhead
+const OFFSET_X = 16; // left margin offset
 const BTN_W = 16;
 const BTN_H = 12;
 const RULER_H = 18;
@@ -18,7 +20,7 @@ const LANE_H = 34;
 const PAD = 4;
 const WIDTH = 840;
 const HEIGHT = RULER_H + 2 * LANE_H + PAD;
-const TOOL_X = WIDTH - 100; // first toolbar column
+const TOOL_X = WIDTH - 124; // first toolbar column
 
 const COLORS = {
     image: "#7aa2f7",
@@ -298,7 +300,7 @@ function laneOf(kind) {
 function blockRect(c, s) {
     const len = c.kind === "image" ? 3 : Number(c.len) || 22;
     return {
-        x: (Number(c.start) - 1) * s + 2,
+        x: OFFSET_X + (Number(c.start) - 1) * s + 2,
         y: RULER_H + laneOf(c.kind) * LANE_H + 4,
         w: Math.max(2, len * s - 4),
         h: LANE_H - 8,
@@ -309,7 +311,7 @@ function ghostRect(c, s) {
     const start = c.audio_link ? c.start : c.audio_start ?? c.start;
     const len = c.audio_link ? c.len : c.audio_len ?? c.len ?? 22;
     return {
-        x: (Number(start) - 1) * s + 2,
+        x: OFFSET_X + (Number(start) - 1) * s + 2,
         y: RULER_H + LANE_H + 4,
         w: Math.max(2, (Number(len) || 22) * s - 4),
         h: LANE_H - 8,
@@ -327,11 +329,44 @@ function laneRange(c, lane) {
     return { s, e: s + len };
 }
 
-// push s so [s, s+len) never overlaps another clip in the same lane, then
-// magnet-snap to the closest lane edge / ruler boundary within SNAP_PX.
+// magnet-snap a value to the playhead boundary (or the span ends). Used by
+// the trim handlers so that resizing a clip "kisses" the playhead without
+// yanking it toward every other clip edge in the timeline — the collision
+// guard already keeps clips from overlapping, so the only free magnet the
+// user actually wants here is the playhead.
+function probeSnap(node, value, scale) {
+    if (node._h3TimelineWidget?._snapEnabled === false) return value;
+    const span = node._h3Span ?? SPAN;
+    let best = value;
+    let dBest = Infinity;
+    const probe = (v) => {
+        const d = Math.abs(v - value);
+        if (d < dBest) {
+            dBest = d;
+            best = v;
+        }
+    };
+    probe(1);
+    probe(span + 1);
+    const pl = node._h3TimelineWidget?._play;
+    if (pl != null) {
+        probe(clamp(Math.round(pl) + 1, 1, span));
+    }
+    if (dBest <= Math.max(0.5, SNAP_PLAY_PX / scale)) return best;
+    return value;
+}
+
+// magnet-snap to the playhead boundary (and span ends) within SNAP_PLAY_PX.
+// Snapping to other clips is handled by the collision push above: the clip
+// is shoved flush against whichever neighbour it would overlap, so there is
+// no need to probe arbitrary clip edges here — that only made the magnet
+// feel like it was fighting the user at every position.
 function resolveMove(node, c, lane, s, len, grab, px) {
     const clips = node._h3Clips;
     const hi = (node._h3Span ?? SPAN) - len + 1;
+    // collision: push the clip flush against the neighbour it would overlap.
+    // this doubles as the clip-to-clip snap: once resolved the clip sits
+    // edge-to-edge with the neighbour, regardless of how fast you dragged.
     for (let guard = 0; guard < clips.length; guard++) {
         let hit = null;
         for (const o of clips) {
@@ -347,40 +382,28 @@ function resolveMove(node, c, lane, s, len, grab, px) {
         if (s < 1) break;
     }
     s = clamp(s, 1, hi);
-    let best = s;
-    let dBest = Infinity;
-    const probe = (v) => {
-        if (v < 1 || v > hi) return;
-        const d = Math.abs(v - s);
-        if (d < dBest) {
-            dBest = d;
-            best = v;
+
+    if (node._h3TimelineWidget?._snapEnabled !== false) {
+        let best = s;
+        let dBest = Infinity;
+        const probe = (v) => {
+            if (v < 1 || v > hi) return;
+            const d = Math.abs(v - s);
+            if (d < dBest) {
+                dBest = d;
+                best = v;
+            }
+        };
+        probe(1);
+        probe(hi);
+        const pl = node._h3TimelineWidget?._play;
+        if (pl != null) {
+            const f = clamp(Math.round(pl) + 1, 1, node._h3Span ?? SPAN);
+            probe(f);
+            probe(f - len);
         }
-    };
-    // magnet snaps to the edges of every clip in every lane
-    const probeClip = (o) => {
-        const r = laneRange(o, laneOf(o.kind));
-        probe(r.s - len);
-        probe(r.e);
-        if (o.kind === "video") {
-            const v = laneRange(o, 1);
-            probe(v.s - len);
-            probe(v.e);
-        }
-    };
-    for (const o of clips) {
-        if (o !== c) probeClip(o);
+        if (dBest <= Math.max(0.5, SNAP_PLAY_PX / px)) s = best;
     }
-    // and to the playhead boundary
-    const pl = node._h3TimelineWidget?._play;
-    if (pl != null) {
-        const f = clamp(Math.round(pl) + 1, 1, node._h3Span ?? SPAN);
-        probe(f);
-        probe(f - len);
-    }
-    probe(1);
-    probe(hi);
-    if (dBest <= Math.max(0.5, SNAP_PX / px)) s = best;
     return clamp(s, 1, hi);
 }
 
@@ -402,7 +425,7 @@ function edgeZone(p, r) {
 function btnZone(p) {
     if (p[1] > RULER_H || p[0] < TOOL_X) return null;
     const col = Math.floor((p[0] - TOOL_X) / 20);
-    return ["split", "play", "unit", "in", "out"][col] || null;
+    return ["split", "snap", "play", "unit", "in", "out"][col] || null;
 }
 
 function playHeadBoundary(node) {
@@ -695,6 +718,7 @@ function drawGhost(ctx, c, s, node) {
 // --- playhead --------------------------------------------------------------
 
 function splitSnap(node, p, s) {
+    if (node._h3TimelineWidget?._snapEnabled === false) return p;
     // magnet-snap a playhead boundary to clip edges like resolveMove does;
     // p is 0-based play position, clip boundaries are 1-based frame edges
     const span = node._h3Span ?? SPAN;
@@ -913,11 +937,11 @@ function setup(node) {
                 // the parity of label multiples, so the old combined loop
                 // could draw no numbers at all at max zoom-out
                 for (let f = 1; f <= span; f += tick) {
-                    const x = (f - 1) * s;
+                    const x = OFFSET_X + (f - 1) * s;
                     ctx.fillRect(x, RULER_H - 4, 1, 4);
                 }
                 for (let f = label; f <= span; f += label) {
-                    const x = (f - 1) * s;
+                    const x = OFFSET_X + (f - 1) * s;
                     ctx.fillRect(x, RULER_H - 9, 1, 9);
                     let txt = String(f);
                     if (sec) {
@@ -928,11 +952,16 @@ function setup(node) {
                 }
 
                 ctx.strokeStyle = "#888";
-                ctx.fillStyle = "#333";
-                const btnChars = ["✂", this._playing ? "⏹" : "▶", "F", "−", "+"];
+                const snapOn = this._snapEnabled ?? true;
+                const btnChars = ["✂", "🧲", this._playing ? "⏹" : "▶", "F", "−", "+"];
                 for (const [i, ch] of btnChars.entries()) {
                     const x = TOOL_X + i * 20;
                     roundRect(ctx, x + 0.5, 3, BTN_W, BTN_H, 3);
+                    if (i === 1 && snapOn) {
+                        ctx.fillStyle = "#3a5a80";
+                    } else {
+                        ctx.fillStyle = "#333";
+                    }
                     ctx.fill();
                     ctx.stroke();
                 }
@@ -944,8 +973,8 @@ function setup(node) {
                     ctx.fillText(ch, TOOL_X + i * 20 + BTN_W / 2, 3 + BTN_H / 2 + 0.5);
                 }
 
-                ctx.fillText("video", 4, RULER_H + 14);
-                ctx.fillText("audio", 4, RULER_H + LANE_H + 14);
+                ctx.fillText("video", 2, RULER_H + 14);
+                ctx.fillText("audio", 2, RULER_H + LANE_H + 14);
 
                 for (const c of clips) {
                     const media = c.file ? ensureMedia(nd, c) : null;
@@ -989,7 +1018,7 @@ function setup(node) {
 
                 // playhead
                 if (this._play != null) {
-                    const x = Math.max(0, this._play) * s;
+                    const x = OFFSET_X + Math.max(0, this._play) * s;
                     ctx.fillStyle = PLAY_COLOR;
                     ctx.beginPath();
                     ctx.moveTo(x - 4, RULER_H - 7);
@@ -1050,6 +1079,12 @@ function setup(node) {
                     if (hit.zone === "unit") {
                         this._unit = this._unit === "s" ? "f" : "s";
                         writeState(nd);
+                        this.redraw(nd);
+                        return true;
+                    }
+                    if (hit.zone === "snap") {
+                        this._snapEnabled = !(this._snapEnabled ?? true);
+                        this.redraw(nd);
                         return true;
                     }
                     if (hit.zone === "play") {
@@ -1058,14 +1093,17 @@ function setup(node) {
                     }
                     if (hit.zone === "split") {
                         splitAt(nd);
+                        this.redraw(nd);
                         return true;
                     }
                     if (hit.zone === "ruler") {
                         this._dragPlay = true;
                         const s = this._scale;
-                        const v = clamp(Math.round(p[0] / s), 0, (nd._h3Span ?? SPAN) - 1);
+                        const v = clamp(Math.round((p[0] - OFFSET_X) / s), 0, (nd._h3Span ?? SPAN) - 1);
                         this._play = splitSnap(nd, v, s);
                         this._frame = null;
+                        if (!this._playing) syncPreview(nd);
+                        this.redraw(nd);
                         return true;
                     }
                     if (hit.zone === "link") {
@@ -1104,9 +1142,10 @@ function setup(node) {
                     const d = this._drag;
                     if (this._dragPlay) {
                         const s = this._scale;
-                        const v = clamp(Math.round(p[0] / s), 0, span - 1);
+                        const v = clamp(Math.round((p[0] - OFFSET_X) / s), 0, span - 1);
                         this._play = splitSnap(nd, v, s);
                         if (!this._playing) syncPreview(nd);
+                        this.redraw(nd);
                         return true;
                     }
                     if (d) {
@@ -1135,6 +1174,10 @@ function setup(node) {
                             this._frame = s2;
                         } else if (d.zone === "trimR") {
                             let len = clamp(d.lenAt + step, 1, span - d.startAt + 1);
+                            if (nd._h3TimelineWidget?._snapEnabled !== false) {
+                                const end = probeSnap(nd, d.startAt + len, s);
+                                len = clamp(end - d.startAt, 1, span - d.startAt + 1);
+                            }
                             for (const o of nd._h3Clips) {
                                 if (o === d.c || laneOf(o.kind) !== lane) continue;
                                 const r = laneRange(o, lane);
@@ -1145,10 +1188,10 @@ function setup(node) {
                             else d.c.len = len;
                             this._frame = d.startAt + len - 1;
                         } else if (d.zone === "trimL") {
-                            // the right edge stays at startAt+lenAt unless a
-                            // next clip swallows it; the left edge is pushed
-                            // past any clip it lands inside of.
                             let s2 = clamp(d.startAt + step, 1, d.startAt + d.lenAt - 1);
+                            if (nd._h3TimelineWidget?._snapEnabled !== false) {
+                                s2 = probeSnap(nd, s2, s);
+                            }
                             let right = d.startAt + d.lenAt;
                             for (let guard = 0; guard < nd._h3Clips.length; guard++) {
                                 if (s2 >= right) break;
@@ -1179,8 +1222,10 @@ function setup(node) {
                             this._frame = s2;
                         }
                         writeState(nd);
+                        this.redraw(nd);
                     } else {
-                        this._frame = clamp(Math.round(p[0] / this._scale + 1), 1, span);
+                        this._frame = clamp(Math.round((p[0] - OFFSET_X) / this._scale + 1), 1, span);
+                        this.redraw(nd);
                     }
                     return true;
                 }
@@ -1189,6 +1234,7 @@ function setup(node) {
                     this._hover = null;
                     this._dragPlay = false;
                     this._frame = null;
+                    this.redraw(nd);
                     return true;
                 }
                 return false;
