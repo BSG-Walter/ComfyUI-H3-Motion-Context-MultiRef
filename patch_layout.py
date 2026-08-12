@@ -519,8 +519,8 @@ def apply_patch():
                      "another copy may be loaded from elsewhere (a zip, a venv, "
                      "or a stale __pycache__). Search your whole ComfyUI "
                      "directory for folders named *H3-Motion-Context* and delete "
-                     "every copy EXCEPT this fork (ComfyUI-H3-Motion-Context-"
-                     "MultiRef), then restart ComfyUI.")
+                      "every copy EXCEPT this fork (ComfyUI-H3-Motion-Context-"
+                      "Timeline), then restart ComfyUI.")
         _LOG.warning("h3_motion_context: self-test failed (%s), patch not "
                      "applied. Interior keyframe anchors unavailable. This is "
                      "almost always caused by a SECOND copy of the H3-Motion-"

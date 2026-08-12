@@ -20,7 +20,7 @@ import torch
 COMFY_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(COMFY_ROOT))
 
-base = "custom_nodes.ComfyUI-H3-Motion-Context-MultiRef"
+base = "custom_nodes.ComfyUI-H3-Motion-Context-Timeline"
 node_dir = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(
     base, str(node_dir / "__init__.py"),

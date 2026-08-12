@@ -1,11 +1,12 @@
-# Knowledge Base — ComfyUI-H3-Motion-Context-MultiRef
+# Knowledge Base — ComfyUI-H3-Motion-Context-Timeline
 
 Session notes for this fork. Purpose: don't re-run the empirical investigation.
 
 ## Environment
 
-- Node root: `custom_nodes\ComfyUI-H3-Motion-Context-MultiRef` (fork of
-  @smellslikeml's H3 Motion Context).
+- Node root: `custom_nodes\ComfyUI-H3-Motion-Context-Timeline` (fork of
+  seitanism/ComfyUI-H3-Motion-Context-MultiRef, itself a fork of
+  NikoDemon80/ComfyUI-H3-Motion-Context).
 - Python: `C:\Users\Walter\AppData\Local\Comfy-Desktop\ComfyUI-Installs\ComfyUI\ComfyUI\.venv\Scripts\python.exe`
   (needs torch + importable `comfy.ldm.minimax`; the bare python on PATH
   will NOT work).

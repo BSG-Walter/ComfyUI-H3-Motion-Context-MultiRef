@@ -1,13 +1,50 @@
-# H3 Motion Context — MultiRef + Custom Keyframes
+# H3 Motion Context — Timeline
 
-> **Modified fork.** Original project by [NikoDemon80](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context), licensed GPL-3.0.
+> **Fork.** Original project by [NikoDemon80](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context), licensed GPL-3.0.
 
-H3 Motion Context for MiniMax H3, with MultiRef compatibility and arbitrary-position visual keyframes.
+H3 Motion Context for MiniMax H3, with a full **video-editor timeline** widget that lets you place still images, video clips and audio clips at any frame position on a visual canvas.
 
-## Fork additions — 2026-08-10
+## Fork lineage
 
-- **H3 Custom Keyframes** — place still-image keyframes at arbitrary frame positions in the generated video.
-- **H3 Custom Audio** — pin audio clips at arbitrary frame positions of the target clip's audio timeline (beginning, middle or end), the audio counterpart of Custom Keyframes.
+This is **ComfyUI-H3-Motion-Context-Timeline**, a fork of [ComfyUI-H3-Motion-Context-MultiRef](https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef) by seitanism, which is itself a fork of [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) by NikoDemon80.
+
+> **Only one of these projects can be installed at the same time.** They all install the same MiniMax H3 runtime patch, so having two or more side-by-side double-wraps `PackedLayout.__init__` and breaks the self-test. Delete every other H3-Motion-Context folder from `custom_nodes` (keep only this one), clear `__pycache__` if one lingers, and restart ComfyUI.
+
+## What this fork adds
+
+### H3 Timeline Editor (headline feature)
+
+The **H3 Timeline Editor** node (`MiniMaxH3Timeline`) replaces the per-clip Custom Keyframes / Custom Audio / Custom Video nodes with a visual canvas where you arrange everything at once.
+
+- **Canvas timeline** (840px wide) with two lanes (video above, audio below), a frame ruler, zoom controls and a playhead.
+- **Drag-and-drop clips** — still images, video clips and audio clips can be placed at any frame position. Clips can extend past the ruler end-line (a visual delimiter with snapping, like the playhead) and dim automatically when they do.
+- **Per-clip source trim** — drag the left/right edges of a clip to set its length and source start. Linked video/audio drags as one unit; unlinked audio can be moved independently.
+- **Snapping** — clips snap to each other, to the playhead and to the end-line. Toggle with the magnet button.
+- **Zoom slider** — log-scale zoom from the ruler overview down to per-frame detail, plus the standard +/− buttons.
+- **Playable preview** — the playhead plays through the timeline, syncing video thumbnails; playback stops at the end-line.
+- **File-backed clips** — upload videos/images/audio directly into the timeline and they decode on the node (video thumbnails + audio waveform). No need to wire separate LoadImage / VHS nodes when you just want to drop a file.
+- **Out-of-range tolerance** — clips placed beyond the latent's frame count are clamped-and-warned by the backend (parked at the last frame), never fatal. Audio clips parked or trimmed log a warning instead of raising.
+
+### H3 Custom Audio
+
+The **H3 Custom Audio** node (`MiniMaxH3CustomAudio`) pins audio clips at arbitrary positions of the target clip's audio timeline. Audio windows are cut from the head (`head`) or tail (`tail`) of their source, and each slot gets a **strength** slider (see below) controlling how much of the clip the model re-renders vs. pins exactly.
+
+### Per-clip strength slider
+
+Both the **H3 Custom Keyframes** node (from seitanism's fork) and the **H3 Custom Audio** node (ours) gained a **per-clip strength** widget:
+
+```text
+1.0      pinned exactly (default) — the model reproduces it faithfully
+0.5      half pinned, half the model's own re-render
+0.1      a light hint — the model creates most of the output
+```
+
+The strength uses a **pin-then-flip schedule**: the clip is pinned **exact** (clean rows, canonical 0.999 claim) while the schedule's progress stays below the strength, then its tokens are dropped from the layout so the model's own stream covers the region with no reference at all. Nothing noisy is ever shown to the model. The Custom Video node's per-slot strength governs its audio track the same way. The strength lives per slot inside the widget state (`"strengths"` array), so it travels with the graph and survives copies. This slider will also appear on the Timeline node's clips in the future.
+
+### Inherited from the MultiRef fork
+
+- **H3 Custom Keyframes** — place still-image keyframes at arbitrary frame positions.
+- **MultiRef compatibility patch** — Ref2VA image refs and Motion Context timeline audio coexist in the same conditioning.
 - **Lazy runtime patches** — the H3 compatibility patches are installed on first use rather than at ComfyUI startup.
 
 See [MODIFICATIONS.md](MODIFICATIONS.md) for details on the MultiRef changes.
@@ -23,64 +60,19 @@ git clone https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef.git
 
 Then restart ComfyUI and hard-refresh the browser.
 
-## H3 Custom Keyframes
+## H3 Timeline Editor
 
-The node starts with three image keyframes and lets you add or remove more with **+ Add keyframe** and **- Remove keyframe**.
-
-With `indexing = 1-based`, positions can be placed anywhere in the target timeline, for example:
+The `H3 Timeline Editor` node gives you one ordered list of clips, each pinned at a 1-based start frame on a visual canvas:
 
 ```text
-KF1 -> 1
-KF2 -> 22
-KF3 -> 79
-KF4 -> 122
-KF5 -> 362
+image  a still, pinned at its frame (an H3 custom keyframe)
+video  a full clip; every latent step is pinned at its own frame
+audio  a window of sound pinned on the audio track
 ```
 
-The node sorts anchors by frame position, rejects duplicate or out-of-range positions, and VAE-encodes each image as H3 conditioning at that point in the timeline.
+A video's audio is linked by default: it follows the clip's position and length. Unlink to move or trim it independently (`audio_start` / `audio_len` / `audio_align`). Audio windows are cut from the head (`head`) or the tail (`tail`) of their source.
 
-When using **H3 Custom Keyframes**, put all visual keyframes on this node, including first/last-frame anchors if you want them.
-
-These are conditioning anchors rather than deterministic morph points; H3 still generates the motion and transitions between them from the prompt.
-
-## H3 Custom Audio
-
-The audio counterpart of H3 Custom Keyframes: pin audio clips at arbitrary positions of the target clip's own audio timeline, so the model hears them as established sound and generates the rest around them.
-
-The node starts with one audio slot and lets you add or remove more with **+ Add audio** and **- Remove audio**. Each slot takes an `AUDIO` clip and a frame position, plus two node-level controls:
-
-```text
-indexing:  1-based / 0-based frame positions
-align:     end    - the clip finishes at the chosen frame; the model continues from it
-           start  - the clip begins at the chosen frame; the model leads into it
-```
-
-Examples (1-based, align = end):
-
-```text
-AUDIO 1 -> 1      opening sound over the first frame
-AUDIO 2 -> 79     sound leading into frame 79 (middle injection)
-AUDIO 3 -> 22     one clip ending where the next begins: contiguous bed
-```
-
-Unused media is windowed at the anchor: an `end`-aligned clip longer than its position is tail-sliced so it always finishes exactly at the chosen frame; a `start`-aligned clip is head-sliced so it never runs past the last frame. Duplicate end frames and out-of-range positions are rejected. Blocks are appended to any existing `minimax_refs`, so they coexist with Ref2VA refs and Motion Context timeline audio.
-
-### Per-clip strength
-
-Each audio slot gets a **strength** widget (`audio N strength`) that sets how much of the clip the model may re-render:
-
-```text
-1.0      the clip is pinned exactly (default) - the model reproduces it faithfully
-0.9      almost the clip - the model may only reshape minor details
-0.5      half clip, half the model's own re-render
-0.1      a light hint - the model creates most of the sound
-```
-
-Weak audio blocks use the same **pin-then-flip schedule** as video: the clip is pinned **exact** (clean rows, canonical 0.999 claim) while the audio schedule's progress stays below the strength, then its tokens are dropped from the layout, letting the model's own stream cover the region with no reference at all - `1.0` exact, `0.5` pinned half then free, `0.0` a pure prompt block. Nothing noisy is ever shown to the model, so there is no noise floor.
-
-The Custom Video node's per-slot strength governs each clip's audio track the same way. Its **video** strength is the same schedule: the clip is pinned **exact** (clean rows, canonical 0.999 claim) for the first `strength`-fraction of the run and its tokens are then dropped from the layout, letting the model's own stream cover the region with no reference at all - `1.0` exact, `0.5` pinned half then free, `0.0` a pure prompt block.
-
-The strength lives per audio slot inside `audio_state` (the `"strengths"` array), so it travels with the widget state and survives copies.
+**fps** and **total_frames** are widgets you can edit by hand or convert to input slots (right-click → Convert to input) and drive from other nodes. The timeline ruler length follows `total_frames`; the generated frame count still comes from the wired latent (clips past the ruler end-line are dimmed on the canvas and clamped-and-warned at the backend).
 
 ## Recommended Motion Context settings
 
@@ -125,7 +117,7 @@ The MultiRef compatibility patch is specifically for **Ref2VA refs + Motion Cont
 
 ## Troubleshooting
 
-**`self-test failed (found 4 rows in marked audio ref slot ...)` on startup or first run** means a **second copy of the H3-Motion-Context custom node is installed** (the upstream `ComfyUI-H3-Motion-Context` package or an older version of this fork). Both install the same MiniMax H3 runtime patch, and the second application double-wraps `PackedLayout.__init__`, so the self-test finds half the expected rows. **Delete every other H3-Motion-Context folder** from `custom_nodes` (keep only `ComfyUI-H3-Motion-Context-MultiRef`), clear `__pycache__` if one lingers, and restart ComfyUI. When this happens the console now prints a message listing the detected duplicate folders (or a search hint if none is found). As a safety net this fork also takes over from another `h3_motion_context` wrapper it can recognize at install time, but the duplicate install should be removed anyway since this fork replaces the upstream package entirely.
+**`self-test failed (found 4 rows in marked audio ref slot ...)` on startup or first run** means a **second copy of the H3-Motion-Context custom node is installed** (the upstream `ComfyUI-H3-Motion-Context`, the `ComfyUI-H3-Motion-Context-MultiRef` fork, or an older version of this fork). Both install the same MiniMax H3 runtime patch, and the second application double-wraps `PackedLayout.__init__`, so the self-test finds half the expected rows. **Delete every other H3-Motion-Context folder** from `custom_nodes` (keep only this one), clear `__pycache__` if one lingers, and restart ComfyUI. When this happens the console now prints a message listing the detected duplicate folders (or a search hint if none is found). As a safety net this fork also takes over from another `h3_motion_context` wrapper it can recognize at install time, but the duplicate install should be removed anyway since this fork replaces the upstream package entirely.
 
 ## License / upstream
 
