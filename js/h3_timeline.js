@@ -239,6 +239,21 @@ function setup(node) {
                 const clips = nd._h3Clips || [];
                 const s = this._scale;
 
+                // sync fps/total_frames: spinner buttons mutate widget.value
+                // without firing the callback, so poll here each paint.
+                // When the widget was converted to an input slot, the widget
+                // leaves node.widgets and the live value comes from the
+                // connected node at graph-execution time; until then the
+                // last known value persists.
+                const fpsW = nd.widgets?.find((w) => w.name === "fps") || nd._h3FpsWidget;
+                if (fpsW && fpsW.value != null && Number.isFinite(Number(fpsW.value))) {
+                    this._fps = Math.max(1, Math.round(Number(fpsW.value) || 24));
+                }
+                const spanW = nd.widgets?.find((w) => w.name === "total_frames") || nd._h3SpanWidget;
+                if (spanW && spanW.value != null && Number.isFinite(Number(spanW.value))) {
+                    nd._h3Span = Math.max(1, Math.round(Number(spanW.value) || SPAN));
+                }
+
                 ctx.fillStyle = "rgba(0,0,0,0.25)";
                 ctx.fillRect(0, 0, width, H);
                 ctx.strokeStyle = "rgba(255,255,255,0.15)";
@@ -714,7 +729,14 @@ function setup(node) {
         node._h3KeyHandler = onKey;
     }
 
+    // fps widget: Python may have already created it from the optional
+    // INT input, so look it up first
     if (!node._h3FpsWidget) {
+        node._h3FpsWidget = node.widgets?.find((w) => w.name === "fps");
+    }
+    // skip widget creation if it was already converted to an input slot
+    const fpsIsInput = node.inputs?.some((i) => i.name === "fps");
+    if (!node._h3FpsWidget && !fpsIsInput) {
         const w = node.addWidget(
             "number",
             "fps",
@@ -730,12 +752,22 @@ function setup(node) {
         );
         node._h3FpsWidget = w;
     }
-    node._h3FpsWidget.value = Math.max(1, Math.round(Number(node._h3FpsWidget.value) || 24));
+    if (node._h3FpsWidget && (node._h3FpsWidget.value == null || !Number.isFinite(Number(node._h3FpsWidget.value)))) {
+        node._h3FpsWidget.value = 24;
+    }
+    if (node._h3FpsWidget) {
+        node._h3FpsWidget.value = Math.max(1, Math.round(Number(node._h3FpsWidget.value) || 24));
+    }
 
+    // total_frames widget: same pattern as fps
     if (!node._h3SpanWidget) {
+        node._h3SpanWidget = node.widgets?.find((w) => w.name === "total_frames");
+    }
+    const spanIsInput = node.inputs?.some((i) => i.name === "total_frames");
+    if (!node._h3SpanWidget && !spanIsInput) {
         const w = node.addWidget(
             "number",
-            "frames",
+            "total_frames",
             SPAN,
             (v) => {
                 node._h3Span = Math.max(1, Math.round(Number(v) || SPAN));
@@ -745,11 +777,18 @@ function setup(node) {
         );
         node._h3SpanWidget = w;
     }
-    node._h3Span = Math.max(1, Math.round(Number(node._h3SpanWidget.value) || SPAN));
+    if (node._h3SpanWidget && (node._h3SpanWidget.value == null || !Number.isFinite(Number(node._h3SpanWidget.value)))) {
+        node._h3SpanWidget.value = SPAN;
+    }
+    if (node._h3SpanWidget) {
+        node._h3Span = Math.max(1, Math.round(Number(node._h3SpanWidget.value) || SPAN));
+    } else {
+        node._h3Span = node._h3Span ?? SPAN;
+    }
 
     const tw = node._h3TimelineWidget;
     if (tw) {
-        tw._fps = node._h3FpsWidget.value;
+        tw._fps = node._h3FpsWidget?.value ?? 24;
         let unit = "f";
         try {
             const p = JSON.parse(stateWidget(node)?.value || "{}");

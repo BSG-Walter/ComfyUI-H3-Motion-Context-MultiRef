@@ -1611,6 +1611,16 @@ class MiniMaxH3Timeline:
                 ("video_audio_", ("AUDIO",)),
                 ("image_", ("IMAGE",)),
                 ("audio_", ("AUDIO",)),
+                fps=("INT", {
+                    "default": 24, "min": 1, "max": 240, "step": 1,
+                    "tooltip": "Override the timeline fps used for audio "
+                               "trimming. When connected, drives the node; "
+                               "otherwise the UI widget sets it."}),
+                total_frames=("INT", {
+                    "default": 240, "min": 1, "max": 100000, "step": 10,
+                    "tooltip": "Override the total frame count (ruler length). "
+                               "When connected, drives the node; otherwise "
+                               "the UI widget sets it."}),
             ),
         }
 
@@ -1623,7 +1633,8 @@ class MiniMaxH3Timeline:
                    "linked to it; unlink to move or trim it alone.")
 
     @staticmethod
-    def _audio_ref(audio_vae, audio, idx, strength, a_start, a_len, align):
+    def _audio_ref(audio_vae, audio, idx, strength, a_start, a_len, align,
+                   fps=FPS):
         """Build one timeline audio ref ending at frame a_start + a_len."""
         if audio_vae is None:
             raise ValueError(
@@ -1635,7 +1646,7 @@ class MiniMaxH3Timeline:
                 "h3_motion_context: clip %d expected an AUDIO clip [B,C,L]"
                 % idx)
         z, rt = _encode_audio_window(
-            audio_vae, audio, a_len / float(FPS), tail=(align == "tail"))
+            audio_vae, audio, a_len / float(fps), tail=(align == "tail"))
         if rt < 1:
             raise ValueError(
                 "h3_motion_context: clip %d audio encoded to zero latent "
@@ -1676,6 +1687,7 @@ class MiniMaxH3Timeline:
         # arrive through **kwargs
         vae = kwargs.get("video vae")
         audio_vae = kwargs.get("audio vae")
+        fps = int(kwargs.get("fps") or FPS)
         _ensure_h3_runtime_patches()
 
         try:
@@ -1731,7 +1743,7 @@ class MiniMaxH3Timeline:
                     if audio is None and not clip.get("audio_off") \
                             and data["audio"] is not None:
                         audio = _slice_audio(
-                            data["audio"], src_start / float(FPS))
+                            data["audio"], src_start / float(fps))
                 if frames is None:
                     raise ValueError(
                         "h3_motion_context: video clip %d has no frames "
@@ -1790,7 +1802,7 @@ class MiniMaxH3Timeline:
                         align = clip.get("audio_align", "head")
                     refs.append(self._audio_ref(
                         audio_vae, audio, idx, strength,
-                        a_start, a_len, align))
+                        a_start, a_len, align, fps=fps))
                     link = "linked" if clip.get("audio_link", True) else \
                         "unlinked"
                     infos.append(
@@ -1857,14 +1869,14 @@ class MiniMaxH3Timeline:
                             % (idx, fmedia.get("name")))
                     audio = _slice_audio(
                         audio,
-                        max(0, int(clip.get("src_start") or 0)) / float(FPS))
+                        max(0, int(clip.get("src_start") or 0)) / float(fps))
                 if audio is None:
                     raise ValueError(
                         "h3_motion_context: audio clip %d has no clip "
                         "connected" % idx)
                 refs.append(self._audio_ref(
                     audio_vae, audio, idx, strength,
-                    a_start, a_len, clip.get("align", "head")))
+                    a_start, a_len, clip.get("align", "head"), fps=fps))
                 infos.append("clip %d: audio %d..%d"
                              % (idx, a_start, a_start + a_len - 1))
 
