@@ -32,8 +32,9 @@ n, pl = pkg.nodes, pkg.patch_layout
 
 class FakeVideoVAE:
     def encode(self, pix):
-        # real H3 video VAE: 1 frame -> 1 still step, 5 frames -> 2 steps
-        steps = 1 if pix.shape[0] == 1 else 2
+        # real H3 video VAE: 1 frame -> 1 step, else ceil(n/17)*5-3
+        n = pix.shape[0]
+        steps = 1 if n == 1 else (n + 16) // 17 * 5 - 3
         return torch.zeros(pix.shape[0], 4, steps, 2, 2)
 
 
@@ -490,6 +491,44 @@ cond = run(state, avo2, vae=FakeVideoVAE())
 assert len(cond["minimax_keyframes"]) == 2
 assert (cond.get("minimax_refs") or []) == []
 print("audio_off file video OK: file sound suppressed")
+
+# off-grid video lengths split into consecutive grid runs: 36 = 22+5+5+1+
+# 1+1+1, every frame 0..35 covered, no silent tail-drop
+avs = AudioVAE()
+state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 1,
+                               "len": 36, "audio_link": False}]})
+cond = run(state, avs, vae=FakeVideoVAE(),
+           video_1=torch.rand(36, 12, 12, 3))
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 15, len(kfs)  # 7 + 2 + 2 + 1 + 1 + 1 + 1 steps
+assert sorted(kf[pl.MC_KEY] for kf in kfs) == \
+    [0, 1, 5, 9, 13, 17, 18, 22, 23, 27, 28, 32, 33, 34, 35]
+assert all(kf[pl.MC_VIDEO_STRENGTH] == 1.0 for kf in kfs)
+# the same clip is hard-injected: the whole 36-frame window is chunk-aligned
+# (36 = 17*2+2), so every token of it pins exactly, pixels 0..35, and the
+# last token (span [35,39)) is kept even though it is mostly held-edge so
+# the clip's final frame is sent
+hard = cond.get("minimax_hard_video") or []
+assert [h["index"] for h in hard] == list(range(12)), \
+    [h["index"] for h in hard]
+print("video grid split OK: 36 frames -> runs 22+5+5+1+1+1+1, "
+      "full coverage")
+
+# two contiguous video clips (1..19 and 20..36) are hard-injected as ONE
+# block: a single chunk-aligned window encodes to 12 exact tokens covering
+# both clips, with no held-edge seam at the clip boundary
+avt = AudioVAE()
+state = json.dumps({"clips": [
+    {"id": 1, "kind": "video", "start": 1, "len": 19, "audio_link": False},
+    {"id": 2, "kind": "video", "start": 20, "len": 17, "audio_link": False},
+]})
+cond = run(state, avt, vae=FakeVideoVAE(),
+           video_1=torch.rand(19, 12, 12, 3),
+           video_2=torch.rand(17, 12, 12, 3))
+hard = cond.get("minimax_hard_video") or []
+assert [h["index"] for h in hard] == list(range(12)), \
+    [h["index"] for h in hard]
+print("contiguous clips OK: 19+17 frames injected as one 12-token block")
 
 # audio file clip with src_start: 2 s wav, drop 1 s, window the rest
 ava = AudioVAE()
