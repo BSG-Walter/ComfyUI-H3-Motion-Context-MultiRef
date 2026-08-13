@@ -294,17 +294,61 @@ def _load_image_file(media):
     return torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0)[None]
 
 
-def _load_media_file(media):
+def _resample_video_frames(collected_timed_frames, target_fps):
+    """Resample a list of (timestamp_seconds, frame_tensor) to target_fps."""
+    if not collected_timed_frames:
+        return None
+    if target_fps is None or target_fps <= 0:
+        return torch.stack([item[1] for item in collected_timed_frames])
+
+    times = [item[0] for item in collected_timed_frames]
+    frames = [item[1] for item in collected_timed_frames]
+
+    if len(frames) == 1 or times[-1] <= times[0]:
+        return torch.stack(frames)
+
+    start_t = times[0]
+    end_t = times[-1]
+    duration = end_t - start_t
+    num_target = max(1, int(round(duration * target_fps)) + 1)
+
+    import bisect
+    resampled = []
+    dt = 1.0 / float(target_fps)
+    for i in range(num_target):
+        target_t = start_t + i * dt
+        if target_t > end_t + dt * 0.5:
+            break
+        pos = bisect.bisect_left(times, target_t)
+        if pos == 0:
+            best_idx = 0
+        elif pos >= len(times):
+            best_idx = len(times) - 1
+        else:
+            d_prev = abs(target_t - times[pos - 1])
+            d_next = abs(target_t - times[pos])
+            best_idx = pos - 1 if d_prev <= d_next else pos
+        resampled.append(frames[best_idx])
+
+    return torch.stack(resampled)
+
+
+def _load_media_file(media, fps=None):
     """Decode an uploaded audio/video file with PyAV.
 
     Returns {"frames": [B,H,W,C]|None, "audio": AUDIO dict|None}, decoding
     whatever streams the file actually has. A single demux pass feeds both
     decoders: PyAV's decode() discards packets of non-requested streams, so
     decoding one stream to EOF (or re-demuxing after EOF) drops the other.
+    When `fps` is supplied, video frames are resampled to that target frame rate.
     """
     frames, audio = None, None
     with av.open(_media_ref_path(media)) as af:
         streams = {s.type: s for s in af.streams}
+        vstream = streams.get("video")
+        vtimebase = float(vstream.time_base) if vstream and vstream.time_base is not None else None
+        vrate = float(vstream.average_rate) if vstream and vstream.average_rate else 24.0
+
         collected, chunks = [], []
         for packet in af.demux():
             stype = packet.stream.type if packet.stream is not None else None
@@ -313,8 +357,12 @@ def _load_media_file(media):
             if stype == "video":
                 for frame in packet.decode():
                     arr = frame.to_ndarray(format="rgb24")
-                    collected.append(torch.from_numpy(
-                        np.asarray(arr, dtype=np.float32) / 255.0))
+                    if frame.pts is not None and vtimebase is not None:
+                        t_sec = float(frame.pts * vtimebase)
+                    else:
+                        t_sec = float(len(collected) / vrate)
+                    collected.append((t_sec, torch.from_numpy(
+                        np.asarray(arr, dtype=np.float32) / 255.0)))
             elif stype == "audio":
                 n_channels = streams["audio"].channels
                 for frame in packet.decode():
@@ -323,7 +371,11 @@ def _load_media_file(media):
                         buf = buf.view(-1, n_channels).t()
                     chunks.append(buf)
         if collected:
-            frames = torch.stack(collected)
+            collected.sort(key=lambda item: item[0])
+            if fps is not None and fps > 0:
+                frames = _resample_video_frames(collected, fps)
+            else:
+                frames = torch.stack([item[1] for item in collected])
         if chunks:
             astream = streams["audio"]
             audio = {
@@ -1898,7 +1950,7 @@ class MiniMaxH3Timeline:
                 src_start = max(0, int(clip.get("src_start") or 0))
                 fmedia = clip.get("file")
                 if fmedia:
-                    data = _load_media_file(fmedia)
+                    data = _load_media_file(fmedia, fps=fps)
                     frames = data["frames"]
                     if frames is None:
                         raise ValueError(
@@ -1916,6 +1968,17 @@ class MiniMaxH3Timeline:
                             and data["audio"] is not None:
                         audio = _slice_audio(
                             data["audio"], src_start / float(fps))
+                elif frames is not None and src_start > 0:
+                    if src_start >= int(frames.shape[0]):
+                        _LOG.warning(
+                            "h3_motion_context: video clip %d src_start %d "
+                            "past the %d frame input; holding the last frame",
+                            idx, src_start, int(frames.shape[0]))
+                        src_start = max(0, int(frames.shape[0]) - 1)
+                    frames = frames[src_start:]
+                    if audio is not None and not clip.get("audio_off"):
+                        audio = _slice_audio(
+                            audio, src_start / float(fps))
                 if frames is None:
                     raise ValueError(
                         "h3_motion_context: video clip %d has no frames "
@@ -1967,7 +2030,7 @@ class MiniMaxH3Timeline:
                         })
                     run_acc += run
 
-                video_blocks.append((zero, want, frames))
+                video_blocks.append((zero, want, frames[:want]))
 
                 # audio is the input or the file-derived fallback above;
                 # re-reading the kwarg here would drop the file's track
@@ -2000,13 +2063,13 @@ class MiniMaxH3Timeline:
                     link = "linked" if clip.get("audio_link", True) else \
                         "unlinked"
                     infos.append(
-                        "clip %d: video %d..%d + audio %d..%d (%s)"
-                        % (idx, zero + 1, zero + want, a_start,
+                        "clip %d: video %d..%d (src_start=%d) + audio %d..%d (%s)"
+                        % (idx, zero + 1, zero + want, src_start, a_start,
                            a_start + a_len - 1, link))
                 else:
                     infos.append(
-                        "clip %d: video %d..%d, silent"
-                        % (idx, zero + 1, zero + want))
+                        "clip %d: video %d..%d (src_start=%d), silent"
+                        % (idx, zero + 1, zero + want, src_start))
 
             elif kind == "image":
                 want = max(1, int(clip.get("len") or 1))
@@ -2075,6 +2138,7 @@ class MiniMaxH3Timeline:
                 a_start, a_len = self._fit_audio(
                     start, clip.get("len") or 22, frame_count, idx)
                 audio = kwargs.get("audio_%d" % slot)
+                src_start = max(0, int(clip.get("src_start") or 0))
                 fmedia = clip.get("file")
                 if fmedia:
                     data = _load_media_file(fmedia)
@@ -2086,7 +2150,11 @@ class MiniMaxH3Timeline:
                             % (idx, fmedia.get("name")))
                     audio = _slice_audio(
                         audio,
-                        max(0, int(clip.get("src_start") or 0)) / float(fps))
+                        src_start / float(fps))
+                elif audio is not None and src_start > 0:
+                    audio = _slice_audio(
+                        audio,
+                        src_start / float(fps))
                 if audio is None:
                     raise ValueError(
                         "h3_motion_context: audio clip %d has no clip "

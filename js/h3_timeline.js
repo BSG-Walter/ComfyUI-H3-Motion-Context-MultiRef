@@ -505,7 +505,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                             (playFrame - (Number(c.start) - 1) + (Number(c.src_start) || 0)) /
                             fps;
                     } else {
-                        target = (Number(c.start) - 1 + (Number(c.src_start) || 0)) / fps;
+                        target = (Number(c.src_start) || 0) / fps;
                     }
                     thumbSeek(nd, c, m, Math.max(0, target));
                 }
