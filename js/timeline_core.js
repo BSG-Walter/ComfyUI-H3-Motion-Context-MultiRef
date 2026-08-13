@@ -278,6 +278,10 @@ export function edgeZone(p, r) {
 
 export function btnZone(node, p) {
     if (p[1] > RULER_H) return null;
+    // toolbar (buttons + slider) only spans the top strip; the ruler-number
+    // band below it (drawn at RULER_H - 15) must stay ruler hits even when
+    // its x overlaps a button
+    if (p[1] > RULER_H - 16) return "ruler";
     const w = node._h3TimelineWidget;
     const btns = Array.isArray(w?._btns) ? w._btns : [];
     const s = w?._sliderX;
