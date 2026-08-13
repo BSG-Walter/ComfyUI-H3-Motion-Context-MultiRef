@@ -835,6 +835,10 @@ function setup(node) {
                             if (d.zone !== "trimAL" && d.c.file) {
                                 const minStart = d.startAt - origSrc;
                                 s2 = Math.max(s2, minStart);
+                                const srcMax = sourceFrames(nd, d.c) - origSrc;
+                                if (isFinite(srcMax) && srcMax > 0) {
+                                    s2 = Math.min(s2, d.startAt + srcMax - 1);
+                                }
                             }
                             let right = d.startAt + d.lenAt;
                             for (let guard = 0; guard < nd._h3Clips.length; guard++) {

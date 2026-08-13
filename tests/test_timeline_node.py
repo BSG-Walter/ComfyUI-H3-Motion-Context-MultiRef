@@ -411,6 +411,18 @@ assert kfs[0][pl.MC_KEY] == 9 and kfs[1][pl.MC_KEY] == 10
 assert (cond.get("minimax_refs") or []) == []  # mp4 has no audio -> silent
 print("uploaded video file clip OK: src_start window, silent track")
 
+# src_start past the end of the source (trimmed beyond the file): clamps to
+# the last frame instead of crashing on an empty slice
+avv2 = AudioVAE()
+state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 10,
+                               "len": 5, "src_start": 99,
+                               "file": vid_media}]})
+cond = run(state, avv2, vae=FakeVideoVAE())
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 1, len(kfs)
+assert kfs[0][pl.MC_KEY] == 9, kfs[0][pl.MC_KEY]
+print("video file clip OK: src_start past the end holds the last frame")
+
 # video file WITH an audio track: the file's own sound becomes a ref with
 # no audio input connected
 import subprocess as _sp

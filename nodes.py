@@ -1816,6 +1816,12 @@ class MiniMaxH3Timeline:
                             "h3_motion_context: video clip %d file %r has no "
                             "video stream"
                             % (idx, fmedia.get("name")))
+                    if src_start >= int(frames.shape[0]):
+                        _LOG.warning(
+                            "h3_motion_context: video clip %d src_start %d "
+                            "past the %d frame file; holding the last frame",
+                            idx, src_start, int(frames.shape[0]))
+                        src_start = max(0, int(frames.shape[0]) - 1)
                     frames = frames[src_start:]
                     if audio is None and not clip.get("audio_off") \
                             and data["audio"] is not None:
