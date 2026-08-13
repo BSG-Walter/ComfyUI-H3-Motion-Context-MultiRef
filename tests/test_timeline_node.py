@@ -169,6 +169,49 @@ assert len(cond["minimax_refs"]) == 2
 print("timeline stable clip ids OK")
 
 
+# --- strength envelope: per-frame video strengths + segmented audio ---
+av5 = AudioVAE()
+state = '{"clips":[' \
+        '{"id":1,"kind":"video","start":10,"len":22,"audio_link":true,' \
+        '"env":[[0,0.2],[10,1.0]],"strength":0.7},' \
+        '{"id":2,"kind":"audio","start":60,"len":22,' \
+        '"env":[[0,1.0],[11,0.5],[21,0.2]]}]}'
+cond = run(state, av5, vae=FakeVideoVAE(),
+           video_1=torch.rand(5, 12, 12, 3), video_audio_1=audio(),
+           audio_2=audio())
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 2, len(kfs)
+s0, s1 = kfs[0][pl.MC_VIDEO_STRENGTH], kfs[1][pl.MC_VIDEO_STRENGTH]
+assert s0 == 0.2, s0  # step 0 at pixel offset 0
+assert abs(s1 - 0.28) < 1e-9, s1  # step 1 at offset 1, ramping 0.2 -> 1.0 over 10 frames
+refs = cond["minimax_refs"]
+# video audio: 5-frame run, the frame-10 cut is outside the window -> one
+# flat ref at the envelope's first strength (the flat `strength` is ignored)
+assert len(refs) == 4, len(refs)
+assert refs[0][pl.MC_AUDIO_KEY] == 14.0, refs[0][pl.MC_AUDIO_KEY]
+assert refs[0]["ref_audio_t"] == 12
+assert refs[0][pl.MC_AUDIO_STRENGTH] == 0.2
+seg = refs[1:]
+# audio clip: cuts at frames 11 and 21 split the 12 latent steps 6/5/1
+assert [r["ref_audio_t"] for r in seg] == [6, 5, 1], \
+    [r["ref_audio_t"] for r in seg]
+assert [r[pl.MC_AUDIO_STRENGTH] for r in seg] == [1.0, 0.5, 0.2], \
+    [r[pl.MC_AUDIO_STRENGTH] for r in seg]
+assert [r[pl.MC_AUDIO_KEY] for r in seg] == [70.0, 80.0, 81.0], \
+    [r[pl.MC_AUDIO_KEY] for r in seg]
+# the window was encoded once, then sliced: exactly 2 encode calls total
+assert len(av5.windows) == 2, len(av5.windows)
+# a single-point envelope flattens the clip at that strength
+av6 = AudioVAE()
+state = '{"clips":[{"id":1,"kind":"video","start":4,"len":22,' \
+        '"env":[[7,0.3]]}]}'
+cond = run(state, av6, vae=FakeVideoVAE(),
+           video_1=torch.rand(5, 12, 12, 3))
+assert all(kf[pl.MC_VIDEO_STRENGTH] == 0.3
+           for kf in cond["minimax_keyframes"])
+print("strength envelope OK: per-frame video strengths + segmented audio")
+
+
 # --- out-of-range audio clamps with a warning, never raises ---
 av4 = AudioVAE()
 state = '{"clips":[{"id":1,"kind":"audio","start":200,"len":22}]}'

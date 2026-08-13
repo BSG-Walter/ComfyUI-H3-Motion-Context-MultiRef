@@ -27,10 +27,18 @@ import {
     occupiesLane,
     laneFree,
     blockRect,
+    ghostRect,
     resolveMove,
     probeSnap,
     splitSnap,
     hitTest,
+    envLen,
+    envField,
+    envPts,
+    envNormalize,
+    envStrengthAtY,
+    envStrengthAt,
+    envY,
 } from "./timeline_core.js";
 import { ensureMedia, thumbSeek, sourceFrames } from "./timeline_media.js";
 import {
@@ -46,7 +54,7 @@ import {
     addClipWithMedia,
     splitAt,
 } from "./timeline_state.js";
-import { drawBlock, drawGhost } from "./timeline_draw.js";
+import { drawBlock, drawGhost, drawEnvelope } from "./timeline_draw.js";
 import { togglePlay, syncPreview, previewClip } from "./timeline_play.js";
 
 const NODE_NAME = "MiniMaxH3Timeline";
@@ -63,7 +71,7 @@ function closeClipMenu() {
     _menuOverlay = null;
 }
 
-function openClipMenu(node, widget, clip, idx, x, y, zone) {
+function openClipMenu(node, widget, clip, idx, x, y, zone, envHit) {
     closeClipMenu();
     widget._menuAt = Date.now();
     // right-clicking the separated audio band of a video clip targets the
@@ -80,6 +88,37 @@ function openClipMenu(node, widget, clip, idx, x, y, zone) {
         items.push(["Delete clip", () => removeClip(node, idx)]);
         items.push(["Replace clip\u2026", () => replaceClipMedia(node, clip)]);
     }
+    if (envHit?.pt) {
+        // right-clicked an envelope point: offer to remove it
+        items.push([
+            "Remove strength point",
+            () => {
+                const env = envField(clip, envHit.ghost);
+                const i = Array.isArray(env) ? env.indexOf(envHit.pt) : -1;
+                if (i >= 0) env.splice(i, 1);
+                writeState(node);
+                widget.redraw(node);
+            },
+        ]);
+    } else if (envHit) {
+        // right-clicked the envelope line: offer to add a point there
+        items.push([
+            "Add strength point",
+            () => {
+                const s = widget._scale;
+                const r = envHit.ghost ? ghostRect(clip, s) : blockRect(clip, s);
+                const env = envNormalize(clip, envHit.ghost);
+                const pt = [
+                    clamp(Math.round((envHit.p[0] - r.x) / s), 0, envLen(clip, envHit.ghost)),
+                    envStrengthAtY(r, envHit.p[1]),
+                ];
+                env.push(pt);
+                env.sort((a, b) => a[0] - b[0]);
+                writeState(node);
+                widget.redraw(node);
+            },
+        ]);
+    }
     items.push(
         ["Copy clip", null],
         ["Cut clip", null],
@@ -87,7 +126,6 @@ function openClipMenu(node, widget, clip, idx, x, y, zone) {
         ["Move up", null],
         ["Move down", null],
         ["Move to playhead", null],
-        ["Change strength", null],
     );
     const overlay = document.createElement("div");
     overlay.style.cssText = "position:fixed;inset:0;z-index:3000";
@@ -156,7 +194,12 @@ function setup(node) {
             _unit: "f",
             _fps: 24,
             _drag: null,
+            _dragEnv: null,
+            _dragFlat: null,
             _hover: null,
+            _hoverPos: null,
+            _lastDown: 0,
+            _lastDownPos: null,
             _dragPlay: false,
             _play: 0,
             _playing: false,
@@ -204,7 +247,11 @@ function setup(node) {
                         const hit = hitTest(nd, [px, py], this._scale);
                         const idx = hit?.c ? (nd._h3Clips?.indexOf(hit.c) ?? -1) : -1;
                         if (idx >= 0) {
-                            openClipMenu(nd, this, hit.c, idx, e.clientX, e.clientY, hit.zone);
+                            const envHit =
+                                hit.zone === "envpt" || hit.zone === "envln"
+                                    ? { ghost: hit.ghost, p: [px, py], pt: hit.pt }
+                                    : null;
+                            openClipMenu(nd, this, hit.c, idx, e.clientX, e.clientY, hit.zone, envHit);
                         }
                 }, true);
             },
@@ -344,15 +391,24 @@ function setup(node) {
                 ctx.fillText("video", 2, RULER_H + 14);
                 ctx.fillText("audio", 2, RULER_H + LANE_H + 14);
 
+                const envPlayX =
+                    this._play != null
+                        ? OFFSET_X + Math.max(0, this._play) * s
+                        : this._frame != null
+                          ? OFFSET_X + (this._frame - 1) * s
+                          : null;
                 for (const c of clips) {
                     const media = c.file ? ensureMedia(nd, c) : null;
                     if (c.kind === "video") drawGhost(ctx, c, s, nd);
                     if (c.kind === "image") {
                         drawBlock(ctx, COLORS.image, `img ${c.id}`, blockRect(c, s), false, media, nd, c);
                     } else if (c.kind === "video") {
+                        if (!c.audio_off) drawEnvelope(ctx, ghostRect(c, s), c, s, true, envPlayX);
                         drawBlock(ctx, COLORS.video, `video ${c.id}`, blockRect(c, s), false, media, nd, c);
+                        drawEnvelope(ctx, blockRect(c, s), c, s, false, envPlayX);
                     } else {
                         drawBlock(ctx, COLORS.audio, `audio ${c.id}`, blockRect(c, s), false, media, nd, c);
+                        drawEnvelope(ctx, blockRect(c, s), c, s, false, envPlayX);
                     }
                 }
 
@@ -429,6 +485,74 @@ function setup(node) {
                             : `frame ${Math.round(fr) + (this._play != null ? 1 : 0)}`;
                     ctx.fillText(txt, WIDTH - 4, H - 6);
                 }
+
+                // envelope affordances: live value chip while dragging, a
+                // "+" marker where a double-click adds a point, and a one
+                // line hint for what the hovered zone does
+                if (this._dragEnv) {
+                    const de = this._dragEnv;
+                    const r = de.ghost ? ghostRect(de.c, this._scale) : blockRect(de.c, this._scale);
+                    const bx = clamp(r.x + r.w - 2, 0, WIDTH);
+                    ctx.fillStyle = "rgba(0,0,0,0.65)";
+                    ctx.beginPath();
+                    ctx.roundRect(bx - 40, r.y + 4, 38, 13, 3);
+                    ctx.fill();
+                    ctx.fillStyle = "#66ff66";
+                    ctx.font = "9px sans-serif";
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    ctx.fillText(de.pt[1].toFixed(2), bx - 21, r.y + 11);
+                }
+                if (this._dragFlat) {
+                    const dfl = this._dragFlat;
+                    const r = dfl.ghost ? ghostRect(dfl.c, this._scale) : blockRect(dfl.c, this._scale);
+                    const f = this._hoverPos ? (this._hoverPos[0] - r.x) / this._scale : 0;
+                    const v = envStrengthAt(dfl.c, dfl.ghost, f);
+                    const bx = clamp(r.x + r.w - 2, 0, WIDTH);
+                    ctx.fillStyle = "rgba(0,0,0,0.65)";
+                    ctx.beginPath();
+                    ctx.roundRect(bx - 40, r.y + 4, 38, 13, 3);
+                    ctx.fill();
+                    ctx.fillStyle = "#66ff66";
+                    ctx.font = "9px sans-serif";
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    ctx.fillText(v.toFixed(2), bx - 21, r.y + 11);
+                }
+                if (!this._drag && !this._dragEnv && !this._dragFlat && this._hover?.c && this._hoverPos) {
+                    const h = this._hover;
+                    const r = h.ghost ? ghostRect(h.c, this._scale) : blockRect(h.c, this._scale);
+                    if (h.zone === "envln") {
+                        const x = clamp(this._hoverPos[0], r.x + 1, r.x + r.w - 1);
+                        const y = envY(r, envStrengthAt(h.c, h.ghost, (x - r.x) / this._scale));
+                        ctx.strokeStyle = "#66ff66";
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(x - 5, y - 5);
+                        ctx.lineTo(x + 5, y + 5);
+                        ctx.moveTo(x + 5, y - 5);
+                        ctx.lineTo(x - 5, y + 5);
+                        ctx.stroke();
+                    }
+                    const hint =
+                        h.zone === "envpt"
+                            ? "drag: value · right-click: remove"
+                            : h.zone === "envln"
+                              ? "drag: level · double-click: add point"
+                              : null;
+                    if (hint) {
+                        ctx.fillStyle = "rgba(0,0,0,0.6)";
+                        ctx.font = "9px sans-serif";
+                        const tw = ctx.measureText(hint).width + 10;
+                        ctx.beginPath();
+                        ctx.roundRect(4, H - 18, tw, 14, 3);
+                        ctx.fill();
+                        ctx.fillStyle = "#ffe08a";
+                        ctx.textAlign = "left";
+                        ctx.textBaseline = "middle";
+                        ctx.fillText(hint, 9, H - 11);
+                    }
+                }
             },
             mouse(e, pos, nd) {
                 // pos space varies: canvas renderer passes node-relative
@@ -442,17 +566,29 @@ function setup(node) {
                 const p = [pos[0], y];
                 const type = e.type || "";
                 if (type.endsWith("down") && e.button === 2) {
-                    // right click on a clip: open the clip context menu.
+                    // right click opens the clip menu; on the strength
+                    // envelope it carries an add/remove point entry
                     const hit = hitTest(nd, p, this._scale);
                     if (!hit?.c) return false;
                     e.preventDefault();
                     const idx = nd._h3Clips?.indexOf(hit.c) ?? -1;
                     if (idx >= 0) {
-                        openClipMenu(nd, this, hit.c, idx, e.clientX ?? pos[0], e.clientY ?? pos[1], hit.zone);
+                        const envHit =
+                            hit.zone === "envpt" || hit.zone === "envln"
+                                ? { ghost: hit.ghost, p, pt: hit.pt }
+                                : null;
+                        openClipMenu(nd, this, hit.c, idx, e.clientX ?? pos[0], e.clientY ?? pos[1], hit.zone, envHit);
                     }
                     return true;
                 }
                 if (type.endsWith("down") && e.button === 0) {
+                    const now = performance.now();
+                    const dbl =
+                        now - this._lastDown < 400 &&
+                        this._lastDownPos &&
+                        Math.hypot(p[0] - this._lastDownPos[0], p[1] - this._lastDownPos[1]) < 6;
+                    this._lastDown = now;
+                    this._lastDownPos = p;
                     const hit = hitTest(nd, p, this._scale);
                     if (!hit) return false;
                     e.preventDefault();
@@ -504,6 +640,43 @@ function setup(node) {
                         this.redraw(nd);
                         return true;
                     }
+                    if (hit.zone === "envpt" || hit.zone === "envln") {
+                        // strength envelope: double-click a point to remove
+                        // it or the line to add one, drag a point, or drag
+                        // the flat line to set the flat level when no points
+                        // exist
+                        const s = this._scale;
+                        const c = hit.c;
+                        const r = hit.ghost ? ghostRect(c, s) : blockRect(c, s);
+                        const len = envLen(c, hit.ghost);
+                        if (hit.zone === "envpt" && dbl) {
+                            const env = envField(c, hit.ghost);
+                            const i = Array.isArray(env) ? env.indexOf(hit.pt) : -1;
+                            if (i >= 0) env.splice(i, 1);
+                            writeState(nd);
+                            this.redraw(nd);
+                            return true;
+                        }
+                        if (hit.zone === "envpt") {
+                            this._dragEnv = { c, ghost: hit.ghost, pt: hit.pt, len };
+                        } else if (dbl) {
+                            const env = envNormalize(c, hit.ghost);
+                            const pt = [
+                                clamp(Math.round((p[0] - r.x) / s), 0, len),
+                                envStrengthAtY(r, p[1]),
+                            ];
+                            env.push(pt);
+                            env.sort((a, b) => a[0] - b[0]);
+                            this._dragEnv = { c, ghost: hit.ghost, pt, len };
+                        } else if (!envPts(c, hit.ghost).length) {
+                            this._dragFlat = { c, ghost: hit.ghost };
+                        } else {
+                            return true;
+                        }
+                        writeState(nd);
+                        this.redraw(nd);
+                        return true;
+                    }
                     if (hit.zone === "link") {
                         // unlinking freezes the ghost at its current spot so
                         // later edits to the video no longer move it; linking
@@ -540,10 +713,31 @@ function setup(node) {
                 if (type.includes("move")) {
                     nd._h3Hovered = true;
                     this._hover = hitTest(nd, p, this._scale);
+                    this._hoverPos = p;
                     if (this._dragSlider) {
                         const minS = Math.max(0.5, Math.min(ZOOM_MIN, WIDTH / (nd._h3Span ?? SPAN)));
                         const tn = clamp((p[0] - SLIDER_X) / SLIDER_W, 0, 1);
                         this._scale = Math.exp(tn * Math.log(ZOOM_MAX / minS)) * minS;
+                        this.redraw(nd);
+                        return true;
+                    }
+                    if (this._dragEnv) {
+                        const s = this._scale;
+                        const de = this._dragEnv;
+                        const r = de.ghost ? ghostRect(de.c, s) : blockRect(de.c, s);
+                        de.pt[0] = clamp(Math.round((p[0] - r.x) / s), 0, de.len);
+                        de.pt[1] = envStrengthAtY(r, p[1]);
+                        envField(de.c, de.ghost).sort((a, b) => a[0] - b[0]);
+                        writeState(nd);
+                        this.redraw(nd);
+                        return true;
+                    }
+                    if (this._dragFlat) {
+                        const s = this._scale;
+                        const dfl = this._dragFlat;
+                        const r = dfl.ghost ? ghostRect(dfl.c, s) : blockRect(dfl.c, s);
+                        dfl.c[dfl.ghost ? "audio_strength" : "strength"] = envStrengthAtY(r, p[1]);
+                        writeState(nd);
                         this.redraw(nd);
                         return true;
                     }
@@ -680,10 +874,24 @@ function setup(node) {
                     return true;
                 }
                 if (type.includes("up")) {
+                    // a drag between two clicks voids the pending double
+                    // click so a second click after a drag never deletes —
+                    // but only when the mouse actually traveled, otherwise a
+                    // plain click keeps the dbl alive (needed to add the
+                    // first point on an empty line)
+                    if (
+                        this._lastDownPos &&
+                        Math.hypot(p[0] - this._lastDownPos[0], p[1] - this._lastDownPos[1]) > 4
+                    ) {
+                        this._lastDown = 0;
+                    }
                     this._drag = null;
                     this._hover = null;
+                    this._hoverPos = null;
                     this._dragPlay = false;
                     this._dragSlider = false;
+                    this._dragEnv = null;
+                    this._dragFlat = null;
                     this._frame = null;
                     this.redraw(nd);
                     return true;

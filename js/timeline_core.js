@@ -273,6 +273,126 @@ export function playHeadBoundary(node) {
     return Math.max(1, w?._frame ?? 1);
 }
 
+// --- strength envelope (volume-automation style) ---------------------------
+//
+// Each video/audio clip may carry a strength envelope: `env` for the video
+// block, `audio_env` for a video's sound band (ghost), `env` for plain
+// audio clips. Points are [[content_frame, strength], ...], frames relative
+// to the clip's own content (0 = first frame of the clip's window),
+// strengths in [0.05, 1]. No points = flat at `strength` (or
+// `audio_strength` for the band). The green line edits it like an audio
+// volume lane: click/double-click adds a point, drag moves it, right-click
+// removes it.
+
+export const ENV_MIN = 0.05;
+export const ENV_MAX = 1.0;
+
+// the envelope field a block edits: video/audio blocks use `env`, the
+// sound band of a video uses its own `audio_env`
+export function envField(c, ghost) {
+    return ghost ? c.audio_env : c.env;
+}
+
+// flat strength of a block when its envelope has no points
+export function envFlat(c, ghost) {
+    return Number(ghost ? c.audio_strength : c.strength) || ENV_MAX;
+}
+
+export function envLen(c, ghost) {
+    if (c.kind === "audio") return Number(c.len) || 22;
+    return ghost ? Number(c.audio_len ?? c.len ?? 22) : Number(c.len) || 22;
+}
+
+export function envPts(c, ghost) {
+    const e = Array.isArray(envField(c, ghost)) ? envField(c, ghost) : [];
+    return e.filter(
+        (p) => Array.isArray(p) && Number.isFinite(Number(p[0])) && Number.isFinite(Number(p[1])),
+    );
+}
+
+// normalize the block's envelope in place: valid numeric pairs, clamped,
+// sorted by frame
+export function envNormalize(c, ghost) {
+    const field = envField(c, ghost);
+    const clean = envPts(c, ghost).map((p) => [Math.max(0, Number(p[0])), clamp(Number(p[1]), ENV_MIN, ENV_MAX)]);
+    clean.sort((a, b) => a[0] - b[0]);
+    if (ghost) c.audio_env = clean;
+    else c.env = clean;
+    return clean;
+}
+
+// strength at a content frame: linear between points, flat when no points
+export function envStrengthAt(c, ghost, frame) {
+    const pts = envPts(c, ghost);
+    if (!pts.length) return clamp(envFlat(c, ghost), ENV_MIN, ENV_MAX);
+    if (pts.length === 1 || frame <= pts[0][0]) return pts[0][1];
+    const last = pts[pts.length - 1];
+    if (frame >= last[0]) return last[1];
+    for (let i = 0; i < pts.length - 1; i++) {
+        const f0 = pts[i][0];
+        const s0 = pts[i][1];
+        const f1 = pts[i + 1][0];
+        const s1 = pts[i + 1][1];
+        if (frame <= f1) {
+            if (f1 <= f0) return s1;
+            return s0 + ((s1 - s0) * (frame - f0)) / (f1 - f0);
+        }
+    }
+    return last[1];
+}
+
+// pixel y of a strength inside a block rect (top = 1.0, bottom = 0.05)
+export function envY(r, v) {
+    return r.y + r.h - 6 - ((clamp(v, ENV_MIN, ENV_MAX) - ENV_MIN) / (ENV_MAX - ENV_MIN)) * (r.h - 12);
+}
+
+// strength from a pixel y inside a block rect
+export function envStrengthAtY(r, y) {
+    return clamp(ENV_MIN + ((r.y + r.h - 6 - y) / (r.h - 12)) * (ENV_MAX - ENV_MIN), ENV_MIN, ENV_MAX);
+}
+
+// pixel x of a content frame inside a block rect
+export function envX(r, f, s) {
+    return clamp(r.x + f * s, r.x + 0.5, r.x + r.w - 0.5);
+}
+
+// envelope hit zone for one clip: points first, then the line. The ghost's
+// unlink toggle and the block edges keep priority over the line.
+export function envZone(c, p, s) {
+    if (c.kind === "image") return null;
+    const rects = [];
+    if (c.kind === "video") {
+        if (!c.audio_off) rects.push([ghostRect(c, s), true]);
+        rects.push([blockRect(c, s), false]);
+    } else {
+        rects.push([blockRect(c, s), false]);
+    }
+    for (const [r, ghost] of rects) {
+        if (p[0] < r.x || p[0] > r.x + r.w || p[1] < r.y || p[1] > r.y + r.h) continue;
+        if (ghost) {
+            const bx = r.x + 8;
+            const by = r.y + r.h / 2;
+            if (Math.hypot(p[0] - bx, p[1] - by) < 9) continue; // unlink toggle wins
+        }
+        const L = envLen(c, ghost);
+        const pts = envPts(c, ghost);
+        for (const pt of pts) {
+            if (pt[0] < -0.5 || pt[0] > L + 0.5) continue;
+            if (Math.hypot(p[0] - envX(r, pt[0], s), p[1] - envY(r, pt[1])) <= 6) {
+                return { zone: "envpt", ghost, pt };
+            }
+        }
+        // the trim edges keep priority over the line so resizing still
+        // works where the envelope passes the borders
+        if (p[0] < r.x + 5 || p[0] > r.x + r.w - 5) continue;
+        const frame = (p[0] - r.x) / s;
+        if (Math.abs(p[1] - envY(r, envStrengthAt(c, ghost, frame))) <= 5) {
+            return { zone: "envln", ghost };
+        }
+    }
+    return null;
+}
+
 export function hitTest(node, p, s) {
     if (p[1] < RULER_H) {
         const b = btnZone(p);
@@ -280,6 +400,8 @@ export function hitTest(node, p, s) {
     }
     for (let i = node._h3Clips.length - 1; i >= 0; i--) {
         const c = node._h3Clips[i];
+        const ez = envZone(c, p, s);
+        if (ez) return { i, c, ...ez };
         if (c.kind === "video" && !c.audio_off) {
             const g = ghostRect(c, s);
             if (inRect(p, g, 4)) {

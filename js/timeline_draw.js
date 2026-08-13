@@ -1,6 +1,6 @@
 // Canvas painting helpers for the H3 timeline widget.
 
-import { clamp, COLORS, ghostRect } from "./timeline_core.js";
+import { clamp, COLORS, ghostRect, WIDTH, envFlat, envLen, envPts, envStrengthAt, envX, envY } from "./timeline_core.js";
 import { ensureMedia } from "./timeline_media.js";
 
 function paintCover(ctx, el, r) {
@@ -108,4 +108,79 @@ export function drawGhost(ctx, c, s, node) {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(c.audio_link ? "🔗" : "⛓", bx, by + 0.5);
+}
+
+const ENV_COLOR = "#66ff66";
+
+function envChip(ctx, x, y, text) {
+    const font = "8px sans-serif";
+    ctx.font = font;
+    const tw = ctx.measureText(text).width + 8;
+    const cx = clamp(x - tw, 0, WIDTH - tw);
+    ctx.fillStyle = "rgba(0,0,0,0.65)";
+    ctx.beginPath();
+    ctx.roundRect(cx, y - 6, tw, 11, 3);
+    ctx.fill();
+    ctx.fillStyle = ENV_COLOR;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, cx + tw / 2, y + 0.5);
+}
+
+// the block's strength envelope as a green automation line: flat at the
+// block's own flat strength when no points, a polyline through the points
+// otherwise, with each point labeled and a live value chip at the right
+// end. When `playX` (pixel x) sits across the block, a dot on the curve
+// plus a chip show the strength the playhead is currently touching. A dark
+// backing stroke keeps it readable over thumbnails and waveforms; the
+// ghost band draws it dimmed.
+export function drawEnvelope(ctx, r, c, s, ghost, playX) {
+    if (c.kind === "image") return;
+    const flat = envFlat(c, ghost);
+    const L = envLen(c, ghost);
+    const pts = envPts(c, ghost).filter((p) => p[0] >= 0 && p[0] <= L);
+    const seg = [];
+    if (!pts.length) {
+        seg.push([r.x + 0.5, envY(r, flat)], [r.x + r.w - 0.5, envY(r, flat)]);
+    } else {
+        seg.push([r.x + 0.5, envY(r, pts[0][1])]);
+        for (const [f, v] of pts) seg.push([envX(r, f, s), envY(r, v)]);
+        seg.push([r.x + r.w - 0.5, envY(r, pts[pts.length - 1][1])]);
+    }
+    const trace = () => {
+        ctx.beginPath();
+        seg.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+        ctx.stroke();
+    };
+    ctx.save();
+    ctx.globalAlpha = ghost ? 0.45 : 0.95;
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "rgba(0,0,0,0.45)";
+    trace();
+    ctx.lineWidth = ghost ? 1 : 1.5;
+    ctx.strokeStyle = ENV_COLOR;
+    trace();
+    ctx.font = "8px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom";
+    for (const [f, v] of pts) {
+        ctx.beginPath();
+        ctx.arc(envX(r, f, s), envY(r, v), ghost ? 2.5 : 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = ENV_COLOR;
+        ctx.fill();
+        ctx.fillStyle = ghost ? "#aafaa0" : "#d8ffd4";
+        ctx.fillText(v.toFixed(2), envX(r, f, s), envY(r, v) - 5);
+    }
+    if (playX != null && playX >= r.x && playX <= r.x + r.w) {
+        const v = envStrengthAt(c, ghost, (playX - r.x) / s);
+        const y = envY(r, v);
+        ctx.beginPath();
+        ctx.arc(playX, y, ghost ? 3 : 4, 0, Math.PI * 2);
+        ctx.fillStyle = "#ffd166";
+        ctx.fill();
+        envChip(ctx, playX + 6, y, v.toFixed(2));
+    }
+    const endV = pts.length ? pts[pts.length - 1][1] : flat;
+    if (r.w > 40) envChip(ctx, r.x + r.w - 2, envY(r, endV), endV.toFixed(2));
+    ctx.restore();
 }
