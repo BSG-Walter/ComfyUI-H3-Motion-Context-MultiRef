@@ -456,6 +456,31 @@ assert len(refs) == 1, refs
 assert refs[0][pl.MC_AUDIO_KEY] == 44.0, refs[0][pl.MC_AUDIO_KEY]
 print("unlinked file band OK: separated audio injects at its own position")
 
+# unlinked band with a frozen source window: the band slices the file at
+# audio_src_start, never at the video's current src_start, so trimming the
+# video no longer moves the band's sound
+avb = AudioVAE()
+state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 10,
+                               "len": 5, "src_start": 32,
+                               "audio_link": False,
+                               "audio_start": 40, "audio_len": 5,
+                               "audio_src_start": 24,
+                               "file": avmp4}]})
+cond = run(state, avb, vae=FakeVideoVAE())
+refs = cond["minimax_refs"]
+assert len(refs) == 1, refs
+assert refs[0][pl.MC_AUDIO_KEY] == 44.0, refs[0][pl.MC_AUDIO_KEY]
+# the band's window must come from the file sliced at audio_src_start (24
+# frames = 1.0 s), never at the video's src_start (32 frames = 1.33 s)
+raw = n._load_media_file(avmp4)["audio"]
+want = int(round(5 / 24.0 * 16000))
+expect = head(n._slice_audio(raw, 24 / 24.0)["waveform"], want)
+wrong = head(n._slice_audio(raw, 32 / 24.0)["waveform"], want)
+w = avb.windows[0]
+assert torch.allclose(w[0], expect), "band not sliced at audio_src_start"
+assert not torch.allclose(w[0], wrong), "band followed the video's src_start"
+print("unlinked band OK: frozen audio_src_start slices its own file window")
+
 # audio_off also suppresses the file's own sound
 avo2 = AudioVAE()
 state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 4,

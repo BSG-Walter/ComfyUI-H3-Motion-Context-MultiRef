@@ -1,6 +1,6 @@
 // Playback (playhead, preview, sound) for the H3 timeline widget.
 
-import { clipLen, mediaKey, soundRange, SPAN } from "./timeline_core.js";
+import { bandSrc, clipLen, soundRange, SPAN } from "./timeline_core.js";
 import { ensureMedia, redrawNode } from "./timeline_media.js";
 
 export function togglePlay(node) {
@@ -129,20 +129,27 @@ export function syncPreview(node) {
 }
 
 function startSound(node, c) {
-    const key = mediaKey(c.file);
+    const r = soundRange(c);
+    // the sound identity is the clip's own window, not just the file: two
+    // split halves of one file must restart at their own content and stop
+    // at their own end, or the preview plays through the cut.
+    const key = c.id + ":" + r.s + ":" + r.e;
     if (node._h3Sound && node._h3SoundClip !== key) stopSound(node);
-    if (node._h3Sound) return; // already playing this track
+    if (node._h3Sound) return; // already playing this window
     const m = ensureMedia(node, c);
     if (!m?.buffer || !node._h3AudioCtx) return;
     const play = node._h3TimelineWidget?._play ?? 0;
     const fps = node._h3TimelineWidget?._fps || 24;
-    const r = soundRange(c);
-    const off = (play - (r.s - 1)) / fps + (Number(c.src_start) || 0) / fps;
+    const src0 = bandSrc(c);
+    const off = (play - (r.s - 1)) / fps + src0 / fps;
+    const end = src0 / fps + (r.e - r.s) / fps;
+    if (off >= end) return; // playhead already past this window
     try {
         const src = node._h3AudioCtx.createBufferSource();
         src.buffer = m.buffer;
         src.connect(node._h3AudioCtx.destination);
         src.start(0, Math.max(0, off));
+        src.stop(node._h3AudioCtx.currentTime + (end - Math.max(0, off)));
         node._h3Sound = src;
         node._h3SoundClip = key;
     } catch (_) {}

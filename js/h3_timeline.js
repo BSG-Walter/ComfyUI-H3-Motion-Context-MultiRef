@@ -15,6 +15,7 @@ import {
     LANE_H,
     WIDTH,
     HEIGHT,
+    SB_H,
     TOOL_X,
     SLIDER_X,
     SLIDER_W,
@@ -247,7 +248,7 @@ function setup(node) {
                         px = e.offsetX;
                         py = e.offsetY - this._yOff;
                     }
-                        const hit = hitTest(nd, [px, py], this._scale);
+                        const hit = hitTest(nd, [px, py], this._scale, this._pan);
                         const idx = hit?.c ? (nd._h3Clips?.indexOf(hit.c) ?? -1) : -1;
                         if (idx >= 0) {
                             const envHit =
@@ -284,10 +285,13 @@ function setup(node) {
                     this.paint(ctx, nd, WIDTH, HEIGHT);
                     ctx.restore();
                 }
+                nd._h3ScrollWidget?.redraw?.(nd);
             },
             paint(ctx, nd, width, H) {
                 const clips = nd._h3Clips || [];
                 const s = this._scale;
+                const span0 = nd._h3Span ?? SPAN;
+                this._pan = clamp(this._pan ?? 0, 0, Math.max(0, OFFSET_X + span0 * s - width + 4));
 
                 // sync fps/total_frames: spinner buttons mutate widget.value
                 // without firing the callback, so poll here each paint.
@@ -311,6 +315,13 @@ function setup(node) {
                 ctx.moveTo(0, RULER_H + LANE_H + 0.5);
                 ctx.lineTo(width, RULER_H + LANE_H + 0.5);
                 ctx.stroke();
+
+                // the ruler labels/ticks scroll with the content; the
+                // toolbar and zoom slider are canvas-fixed chrome drawn
+                // over them after the restore (their backdrop hides any
+                // labels that slid underneath)
+                ctx.save();
+                ctx.translate(-(this._pan ?? 0), 0);
 
                 const span = nd._h3Span ?? SPAN;
                 let tick = 1;
@@ -344,6 +355,7 @@ function setup(node) {
                     }
                     ctx.fillText(txt, x + 2, 2);
                 }
+                ctx.restore();
 
                 // opaque backdrop over the toolbar so ruler labels don't
                 // bleed through the buttons and zoom slider
@@ -393,6 +405,9 @@ function setup(node) {
 
                 ctx.fillText("video", 2, RULER_H + 14);
                 ctx.fillText("audio", 2, RULER_H + LANE_H + 14);
+
+                ctx.save();
+                ctx.translate(-(this._pan ?? 0), 0);
 
                 const envPlayX =
                     this._play != null
@@ -476,6 +491,7 @@ function setup(node) {
                         ctx.globalAlpha = 1;
                     }
                 }
+                ctx.restore();
 
                 const fr = this._play != null ? this._play : this._frame;
                 if (fr != null) {
@@ -568,11 +584,14 @@ function setup(node) {
                 let y = pos[1] - this._yOff;
                 if (this._yOff <= 4 && y > HEIGHT + 4) y = pos[1] - this._rowOf;
                 const p = [pos[0], y];
+                // content position: the timeline scrolls under the fixed
+                // toolbar, so frame math uses the panned x
+                const cx = pos[0] + (this._pan ?? 0);
                 const type = e.type || "";
                 if (type.endsWith("down") && e.button === 2) {
                     // right click opens the clip menu; on the strength
                     // envelope it carries an add/remove point entry
-                    const hit = hitTest(nd, p, this._scale);
+                    const hit = hitTest(nd, p, this._scale, this._pan);
                     if (!hit?.c) return false;
                     e.preventDefault();
                     const idx = nd._h3Clips?.indexOf(hit.c) ?? -1;
@@ -593,7 +612,7 @@ function setup(node) {
                         Math.hypot(p[0] - this._lastDownPos[0], p[1] - this._lastDownPos[1]) < 6;
                     this._lastDown = now;
                     this._lastDownPos = p;
-                    const hit = hitTest(nd, p, this._scale);
+                    const hit = hitTest(nd, p, this._scale, this._pan);
                     if (!hit) return false;
                     e.preventDefault();
                     if (hit.zone === "slider") {
@@ -635,9 +654,9 @@ function setup(node) {
                         return true;
                     }
                     if (hit.zone === "ruler") {
-                        this._dragPlay = true;
+this._dragPlay = true;
                         const s = this._scale;
-                        const v = Math.max(0, Math.round((p[0] - OFFSET_X) / s));
+                        const v = Math.max(0, Math.round((cx - OFFSET_X) / s));
                         this._play = splitSnap(nd, v, s);
                         this._frame = null;
                         if (!this._playing) syncPreview(nd);
@@ -666,7 +685,7 @@ function setup(node) {
                         } else if (dbl) {
                             const env = envNormalize(c, hit.ghost);
                             const pt = [
-                                clamp(Math.round((p[0] - r.x) / s), 0, len),
+                                clamp(Math.round((cx - r.x) / s), 0, len),
                                 envStrengthAtY(r, p[1]),
                             ];
                             env.push(pt);
@@ -693,9 +712,13 @@ function setup(node) {
                                 ? Number(hit.c.strength)
                                 : ENV_MAX;
                             hit.c.audio_env = cloneEnv(hit.c.env);
+                            // the band freezes its own slice of the file, so
+                            // trimming the video no longer moves the sound
+                            hit.c.audio_src_start = Number(hit.c.src_start) || 0;
                         } else {
                             delete hit.c.audio_start;
                             delete hit.c.audio_len;
+                            delete hit.c.audio_src_start;
                         }
                         hit.c.audio_link = !hit.c.audio_link;
                         writeState(nd);
@@ -722,8 +745,8 @@ function setup(node) {
                 }
                 if (type.includes("move")) {
                     nd._h3Hovered = true;
-                    this._hover = hitTest(nd, p, this._scale);
-                    this._hoverPos = p;
+                    this._hover = hitTest(nd, p, this._scale, this._pan);
+                    this._hoverPos = [cx, p[1]];
                     if (this._dragSlider) {
                         const minS = Math.max(0.5, Math.min(ZOOM_MIN, WIDTH / (nd._h3Span ?? SPAN)));
                         const tn = clamp((p[0] - SLIDER_X) / SLIDER_W, 0, 1);
@@ -735,7 +758,7 @@ function setup(node) {
                         const s = this._scale;
                         const de = this._dragEnv;
                         const r = de.ghost ? ghostRect(de.c, s) : blockRect(de.c, s);
-                        de.pt[0] = clamp(Math.round((p[0] - r.x) / s), 0, de.len);
+                        de.pt[0] = clamp(Math.round((cx - r.x) / s), 0, de.len);
                         de.pt[1] = envStrengthAtY(r, p[1]);
                         envField(de.c, de.ghost).sort((a, b) => a[0] - b[0]);
                         writeState(nd);
@@ -830,16 +853,15 @@ function setup(node) {
                             }
                             // dragging the left edge shifts the source window:
                             // the same source frame stays under the grab point
-                            // unless src_start would go negative. The ghost
-                            // keeps its shared source window fixed instead.
-                            // Split halves are their own files: their left
-                            // edge can never retreat into the sibling's part.
+                            // unless src_start would fall below its floor (0
+                            // for a plain clip, the split cut for halves) —
+                            // past that the clip would play frames it no
+                            // longer owns, so the edge stops there. The ghost
+                            // band keeps its frozen source window instead.
                             const origSrc = d.srcAt;
                             if (d.zone !== "trimAL" && d.c.file) {
-                                let minStart = d.startAt - origSrc;
-                                if (Number.isFinite(Number(d.c.source_end))) {
-                                    minStart = d.startAt;
-                                }
+                                const srcFloor = Number(d.c.src_floor) || 0;
+                                const minStart = d.startAt - (origSrc - srcFloor);
                                 s2 = Math.max(s2, minStart);
                                 const srcMax = sourceFrames(nd, d.c) - origSrc;
                                 if (isFinite(srcMax) && srcMax > 0) {
@@ -889,7 +911,7 @@ function setup(node) {
                         writeState(nd);
                         this.redraw(nd);
                     } else {
-                        this._frame = Math.max(1, Math.round((p[0] - OFFSET_X) / this._scale + 1));
+                        this._frame = Math.max(1, Math.round((cx - OFFSET_X) / this._scale + 1));
                         this.redraw(nd);
                     }
                     return true;
@@ -924,6 +946,99 @@ function setup(node) {
         widget.serialize = false;
         node.addCustomWidget(widget);
         node._h3TimelineWidget = widget;
+    }
+
+    // horizontal scrollbar under the timeline: pans the timeline content
+    // (the widget's _pan) when zoomed in past the canvas width
+    if (!node._h3ScrollWidget) {
+        const sb = {
+            name: "h3_scrollbar",
+            type: "h3_scrollbar",
+            width: WIDTH,
+            computedHeight: SB_H,
+            y: 0,
+            _yOff: 1,
+            _rowOf: 1,
+            _dragOff: null,
+            _geo: null,
+            _ctxs: new Set(),
+            computeSize: () => [WIDTH, SB_H],
+            draw(ctx, nd, width, y, H) {
+                if (ctx?.canvas?.isConnected) this._ctxs.add(ctx);
+                if (Number.isFinite(y)) {
+                    if (y >= 4) this._yOff = y;
+                    else if (y === 1) this._yOff = 1;
+                }
+                this.paint(ctx, nd, WIDTH, SB_H);
+            },
+            redraw(nd) {
+                for (const ctx of this._ctxs) {
+                    if (!ctx.canvas || !ctx.canvas.isConnected) {
+                        this._ctxs.delete(ctx);
+                        continue;
+                    }
+                    this.paint(ctx, nd, WIDTH, SB_H);
+                }
+            },
+            paint(ctx, nd, width, H) {
+                const tw = nd._h3TimelineWidget;
+                const s = tw?._scale ?? PX;
+                const span = nd._h3Span ?? SPAN;
+                const content = OFFSET_X + span * s;
+                const maxPan = Math.max(0, content - width);
+                if (tw) tw._pan = clamp(tw._pan ?? 0, 0, maxPan);
+                ctx.clearRect(0, 0, width, H);
+                ctx.fillStyle = "#1a1a2a";
+                ctx.fillRect(0, 0, width, H);
+                ctx.fillStyle = "#333";
+                ctx.beginPath();
+                ctx.roundRect(2, 2, width - 4, H - 4, 3);
+                ctx.fill();
+                const twW = Math.max(28, Math.min(width - 4, Math.round(width * width / content)));
+                const twX = maxPan > 0 && tw
+                    ? 2 + (tw._pan / maxPan) * ((width - 4) - twW)
+                    : 2;
+                ctx.fillStyle = "#3a5a80";
+                ctx.beginPath();
+                ctx.roundRect(twX, 3, twW, H - 6, 2);
+                ctx.fill();
+                this._geo = { maxPan, twX, twW, width };
+            },
+            mouse(e, pos, nd) {
+                let y = pos[1] - this._yOff;
+                if (this._yOff <= 4 && y > SB_H + 4) y = pos[1] - this._rowOf;
+                const p = [pos[0], y];
+                const type = e.type || "";
+                const tw = nd._h3TimelineWidget;
+                const g = this._geo;
+                if (!tw || !g || g.maxPan <= 0) return false;
+                if (type.endsWith("down") && e.button === 0) {
+                    e.preventDefault();
+                    this._dragOff = p[0] - g.twX;
+                    this._setPan(nd, tw, p[0] - this._dragOff, g);
+                    return true;
+                }
+                if (type.includes("move") && this._dragOff != null) {
+                    this._setPan(nd, tw, p[0] - this._dragOff, g);
+                    return true;
+                }
+                if (type.includes("up")) {
+                    this._dragOff = null;
+                    return true;
+                }
+                return false;
+            },
+            _setPan(nd, tw, x, g) {
+                const range = (g.width - 4) - g.twW;
+                tw._pan = clamp(Math.round(((x - 2) / range) * g.maxPan), 0, g.maxPan);
+                tw.redraw?.(nd);
+                this.redraw(nd);
+            },
+        };
+        sb.options = { serialize: false };
+        sb.serialize = false;
+        node.addCustomWidget(sb);
+        node._h3ScrollWidget = sb;
     }
 
     if (!node._h3AddButtons) {

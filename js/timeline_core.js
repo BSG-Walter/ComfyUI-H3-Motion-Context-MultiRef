@@ -20,6 +20,7 @@ export const LANE_H = 68;
 export const PAD = 4;
 export const WIDTH = 840;
 export const HEIGHT = RULER_H + 2 * LANE_H + PAD;
+export const SB_H = 16; // horizontal scrollbar height under the timeline
 export const TOOL_X = WIDTH - 230; // first toolbar column
 export const SLIDER_X = TOOL_X + 6 * 20 + 6; // zoom slider start (6px gap after last button)
 export const SLIDER_W = 74; // zoom slider track width
@@ -150,6 +151,17 @@ export function soundRange(c) {
     const start = c.audio_link ? c.start : c.audio_start ?? c.start;
     const len = c.audio_link ? c.len : c.audio_len ?? c.len ?? 22;
     return { s: Number(start), e: Number(start) + (Number(len) || 22) };
+}
+
+// the source frame where a clip's sound content begins: a separated
+// (unlinked) band froze its own slice of the file at unlink time
+// (audio_src_start), so later trims to the video no longer shift the sound;
+// otherwise it follows the clip's own src_start.
+export function bandSrc(c) {
+    if (!c) return 0;
+    return Number.isFinite(Number(c.audio_src_start))
+        ? Number(c.audio_src_start)
+        : Number(c.src_start) || 0;
 }
 
 // magnet-snap a value to the playhead boundary or the end-line (span+1).
@@ -419,28 +431,32 @@ export function envZone(c, p, s) {
     return null;
 }
 
-export function hitTest(node, p, s) {
+// p is in canvas space; `pan` (px) shifts the timeline content: chrome
+// (buttons, slider) stays canvas-fixed, everything else compares against
+// the panned content position.
+export function hitTest(node, p, s, pan = 0) {
+    const q = pan ? [p[0] + pan, p[1]] : p;
     if (p[1] < RULER_H) {
         const b = btnZone(p);
         return b ? { zone: b } : { zone: "ruler" };
     }
     for (let i = node._h3Clips.length - 1; i >= 0; i--) {
         const c = node._h3Clips[i];
-        const ez = envZone(c, p, s);
+        const ez = envZone(c, q, s);
         if (ez) return { i, c, ...ez };
         if (c.kind === "video" && !c.audio_off) {
             const g = ghostRect(c, s);
-            if (inRect(p, g, 4)) {
+            if (inRect(q, g, 4)) {
                 // edge trims win over the link toggle so the ghost's
                 // borders stay grabbable; the toggle keeps the middle.
                 if (!c.audio_link) {
-                    const ez = edgeZone(p, g);
+                    const ez = edgeZone(q, g);
                     if (ez === "trimL") return { i, c, zone: "trimAL" };
                     if (ez === "trimR") return { i, c, zone: "trimAR" };
                 }
                 const bx = g.x + 8;
                 const by = g.y + g.h / 2;
-                if (Math.hypot(p[0] - bx, p[1] - by) < 9) {
+                if (Math.hypot(q[0] - bx, q[1] - by) < 9) {
                     return { i, c, zone: "link" };
                 }
                 if (!c.audio_link) return { i, c, zone: "audio" };
@@ -448,8 +464,8 @@ export function hitTest(node, p, s) {
             }
         }
         const r = blockRect(c, s);
-        if (inRect(p, r, 2)) {
-            return { i, c, zone: edgeZone(p, r) || "move" };
+        if (inRect(q, r, 2)) {
+            return { i, c, zone: edgeZone(q, r) || "move" };
         }
     }
     return null;

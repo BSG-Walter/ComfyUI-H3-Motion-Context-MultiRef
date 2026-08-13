@@ -6,6 +6,7 @@ import {
     WIDTH,
     HEIGHT,
     MAX_CLIPS,
+    bandSrc,
     defaults,
     kindOfFile,
     clipLen,
@@ -95,6 +96,12 @@ export function fixNodeSize(node) {
         w.y = widgetYOffset(node, w.y);
         w._rowOf = widgetYOffset(node, w._rowOf);
     }
+    const sb = node._h3ScrollWidget;
+    if (sb) {
+        const off = widgetYOffset(node, w?.y ?? 0) + HEIGHT;
+        sb.y = off;
+        sb._rowOf = off;
+    }
 }
 
 export function ensureInputs(node) {
@@ -131,7 +138,7 @@ export function removeClip(node, i) {
         a.env = cloneEnv(clip.audio_env ?? clip.env);
         if (clip.file) {
             a.file = clip.file;
-            a.src_start = Number(clip.src_start) || 0;
+            a.src_start = bandSrc(clip);
         }
         node._h3Clips.push(a);
     }
@@ -171,7 +178,7 @@ export async function addClipWithMedia(node, kind) {
     const detected = kindOfFile(info);
     const useKind = detected || kind;
     let len = null;
-    if (useKind === "video") {
+    if (useKind === "video" || useKind === "audio") {
         len = await probeVideoFrames(node, info, file);
     }
     addClip(node, useKind, info, len);
@@ -230,7 +237,8 @@ export async function replaceClipMedia(node, c) {
     c.src_start = 0;
     delete c.source_len;
     delete c.source_end;
-    if (c.kind === "video") {
+    delete c.src_floor;
+    if (c.kind === "video" || c.kind === "audio") {
         const frames = await probeVideoFrames(node, info);
         if (frames && Number.isFinite(frames) && frames > 0) {
             c.source_len = frames;
@@ -279,12 +287,14 @@ export function splitAt(node) {
         audio_env: cloneEnv(c.audio_env),
         audio_len: Math.min(Number(c.audio_len ?? c.len ?? 22) || 1, cut),
         source_end: src + cut,
+        src_floor: src,
     };
     const right = {
         ...c,
         start: f,
         len: (Number(c.len) || 1) - cut,
         src_start: src + cut,
+        src_floor: src + cut,
         id: (clips.at(-1)?.id ?? 0) + 1,
         env: spliceEnv(c.env, cut),
         audio_env: spliceEnv(c.audio_env, cut),

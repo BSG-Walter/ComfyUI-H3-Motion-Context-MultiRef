@@ -1,6 +1,6 @@
 // Canvas painting helpers for the H3 timeline widget.
 
-import { clamp, COLORS, ghostRect, WIDTH, envFlat, envLen, envPts, envStrengthAt, envX, envY } from "./timeline_core.js";
+import { bandSrc, clamp, COLORS, ghostRect, WIDTH, envFlat, envLen, envPts, envStrengthAt, envX, envY } from "./timeline_core.js";
 import { ensureMedia } from "./timeline_media.js";
 
 function paintCover(ctx, el, r) {
@@ -28,7 +28,7 @@ export function paintWaveform(ctx, m, r, ghost, node, clip) {
               ? Number(clip.len) || 22
               : Number(clip.audio_len ?? clip.len ?? 22);
     if (len < 1) return;
-    const srcStart = Number(clip?.src_start) || 0;
+    const srcStart = bandSrc(clip);
     const fps = node?._h3TimelineWidget?._fps || 24;
     const sr = buf.sampleRate || 48000;
     const s0 = Math.floor((srcStart / fps) * sr);
@@ -104,7 +104,7 @@ export function drawGhost(ctx, c, s, node) {
     const g = ghostRect(c, s);
     drawBlock(ctx, COLORS.audio, `♪ ${c.id}`, g, true, null, node);
     const m = c.file ? ensureMedia(node, c) : null;
-    if (m?.peaks) paintWaveform(ctx, m, g, true, node, c);
+    if (m?.buffer) paintWaveform(ctx, m, g, true, node, c);
     const bx = g.x + 8;
     const by = g.y + g.h / 2;
     ctx.fillStyle = "#222";

@@ -1884,6 +1884,14 @@ class MiniMaxH3Timeline:
                             clip.get("audio_len") or run,
                             frame_count, idx)
                         align = clip.get("audio_align", "head")
+                        # an unlinked band froze its own slice of the file at
+                        # unlink time (audio_src_start); slice at that offset,
+                        # not the video's current src_start, so trims to the
+                        # video no longer move the band's sound.
+                        asrc = clip.get("audio_src_start")
+                        if fmedia and asrc is not None:
+                            audio = _slice_audio(
+                                data["audio"], float(asrc) / float(fps))
                     ast = clip.get("audio_strength")
                     aenv = clip.get("audio_env")
                     if aenv is None:
