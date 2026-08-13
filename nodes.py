@@ -1879,11 +1879,14 @@ class MiniMaxH3Timeline:
                             frame_count, idx)
                         align = clip.get("audio_align", "head")
                     ast = clip.get("audio_strength")
+                    aenv = clip.get("audio_env")
+                    if aenv is None:
+                        aenv = clip.get("env")
                     refs.extend(self._audio_ref(
                         audio_vae, audio, idx,
                         float(ast if ast is not None else strength),
                         a_start, a_len, align, fps=fps,
-                        env=clip.get("audio_env") or clip.get("env")))
+                        env=aenv))
                     link = "linked" if clip.get("audio_link", True) else \
                         "unlinked"
                     infos.append(

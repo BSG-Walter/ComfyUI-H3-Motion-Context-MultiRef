@@ -13,6 +13,7 @@ import {
     laneRange,
     occupiesLane,
     playHeadBoundary,
+    cloneEnv,
 } from "./timeline_core.js";
 import { pickFile, probeVideoFrames, redrawNode, uploadMedia } from "./timeline_media.js";
 
@@ -125,8 +126,9 @@ export function removeClip(node, i) {
         a.id = (node._h3Clips.at(-1)?.id ?? 0) + 1;
         a.start = Number(clip.audio_start ?? clip.start);
         a.len = Number(clip.audio_len ?? clip.len) || 22;
-        a.strength = Number(clip.strength) || 1;
+        a.strength = clip.audio_strength ?? clip.strength ?? 1;
         a.align = clip.audio_align ?? "head";
+        a.env = cloneEnv(clip.audio_env ?? clip.env);
         if (clip.file) {
             a.file = clip.file;
             a.src_start = Number(clip.src_start) || 0;
@@ -239,6 +241,19 @@ export async function replaceClipMedia(node, c) {
     fixNodeSize(node);
 }
 
+// envelope points of the right half of a split: content shifts by `cut`
+// frames, so points before the cut stay with the left half and the rest
+// move with the right half
+function spliceEnv(env, cut) {
+    if (!Array.isArray(env)) return env;
+    const out = [];
+    for (const p of env) {
+        const f = Number(p[0]);
+        if (f >= cut) out.push([f - cut, Number(p[1])]);
+    }
+    return out;
+}
+
 export function splitAt(node) {
     const clips = node._h3Clips;
     const f = playHeadBoundary(node);
@@ -252,13 +267,23 @@ export function splitAt(node) {
     if (i < 0) return;
     const c = clips[i];
     const cut = f - Number(c.start);
-    const left = { ...c, len: cut };
+    const left = {
+        ...c,
+        len: cut,
+        env: cloneEnv(c.env),
+        audio_env: cloneEnv(c.audio_env),
+        audio_len: Math.min(Number(c.audio_len ?? c.len ?? 22) || 1, cut),
+    };
     const right = {
         ...c,
         start: f,
         len: (Number(c.len) || 1) - cut,
         src_start: (Number(c.src_start) || 0) + cut,
         id: (clips.at(-1)?.id ?? 0) + 1,
+        env: spliceEnv(c.env, cut),
+        audio_env: spliceEnv(c.audio_env, cut),
+        audio_start: (Number(c.audio_start ?? c.start) || 1) + cut,
+        audio_len: Math.max(1, (Number(c.audio_len ?? c.len ?? 22) || 1) - cut),
     };
     clips.splice(i, 1, left, right);
     writeState(node);

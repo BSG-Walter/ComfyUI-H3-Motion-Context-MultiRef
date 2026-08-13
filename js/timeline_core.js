@@ -293,18 +293,32 @@ export function playHeadBoundary(node) {
 export const ENV_MIN = 0.0;
 export const ENV_MAX = 1.0;
 
-// the envelope field a block edits: video/audio blocks use `env`, the
-// sound band of a video uses its own `audio_env`
+// deep copy of an envelope so two clips never share point arrays
+export function cloneEnv(env) {
+    return Array.isArray(env) ? env.map((p) => [Number(p[0]), Number(p[1])]) : env;
+}
+
+// the envelope a block edits: video/audio blocks use `env`, the sound band
+// of a video uses its own `audio_env`; while linked and without an own
+// curve the band shares the video's curve (separation freezes a copy)
 export function envField(c, ghost) {
-    return ghost ? c.audio_env : c.env;
+    if (!ghost) return c.env;
+    if (Array.isArray(c.audio_env)) return c.audio_env;
+    return c.audio_link ? c.env : c.audio_env;
 }
 
 // flat strength of a block when its envelope has no points; the band of a
-// video falls back to the video's own strength until dragged on its own
+// video falls back to the video's own strength until separated
 export function envFlat(c, ghost) {
-    const own = Number(ghost ? c.audio_strength : c.strength);
-    if (own) return own;
-    if (ghost) return Number(c.strength) || ENV_MAX;
+    if (ghost) {
+        const own = Number(c.audio_strength);
+        if (Number.isFinite(own)) return own;
+        const v = Number(c.strength);
+        if (Number.isFinite(v)) return v;
+        return ENV_MAX;
+    }
+    const own = Number(c.strength);
+    if (Number.isFinite(own)) return own;
     return ENV_MAX;
 }
 
@@ -323,11 +337,14 @@ export function envPts(c, ghost) {
 // normalize the block's envelope in place: valid numeric pairs, clamped,
 // sorted by frame
 export function envNormalize(c, ghost) {
-    const field = envField(c, ghost);
     const clean = envPts(c, ghost).map((p) => [Math.max(0, Number(p[0])), clamp(Number(p[1]), ENV_MIN, ENV_MAX)]);
     clean.sort((a, b) => a[0] - b[0]);
-    if (ghost) c.audio_env = clean;
-    else c.env = clean;
+    if (ghost) {
+        if (Array.isArray(c.audio_env) || !c.audio_link) c.audio_env = clean;
+        else c.env = clean;
+    } else {
+        c.env = clean;
+    }
     return clean;
 }
 

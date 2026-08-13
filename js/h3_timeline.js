@@ -40,6 +40,8 @@ import {
     envStrengthAtY,
     envStrengthAt,
     envY,
+    cloneEnv,
+    ENV_MAX,
 } from "./timeline_core.js";
 import { ensureMedia, thumbSeek, sourceFrames } from "./timeline_media.js";
 import {
@@ -681,11 +683,16 @@ function setup(node) {
                     }
                     if (hit.zone === "link") {
                         // unlinking freezes the ghost at its current spot so
-                        // later edits to the video no longer move it; linking
-                        // drops the frozen position and follows the video again.
+                        // later edits to the video no longer move it; the
+                        // band's strength/env are frozen as copies too, so
+                        // it stops following the video's curve.
                         if (hit.c.audio_link) {
                             hit.c.audio_start = hit.c.start;
                             hit.c.audio_len = hit.c.len;
+                            hit.c.audio_strength = Number.isFinite(Number(hit.c.strength))
+                                ? Number(hit.c.strength)
+                                : ENV_MAX;
+                            hit.c.audio_env = cloneEnv(hit.c.env);
                         } else {
                             delete hit.c.audio_start;
                             delete hit.c.audio_len;
@@ -738,7 +745,12 @@ function setup(node) {
                         const s = this._scale;
                         const dfl = this._dragFlat;
                         const r = dfl.ghost ? ghostRect(dfl.c, s) : blockRect(dfl.c, s);
-                        dfl.c[dfl.ghost ? "audio_strength" : "strength"] = envStrengthAtY(r, p[1]);
+                        dfl.c[
+                            dfl.ghost &&
+                            (Array.isArray(dfl.c.audio_env) || !dfl.c.audio_link)
+                                ? "audio_strength"
+                                : "strength"
+                        ] = envStrengthAtY(r, p[1]);
                         writeState(nd);
                         this.redraw(nd);
                         return true;
