@@ -32,7 +32,7 @@ export const COLORS = {
 export const PLAY_COLOR = "#ff5252";
 
 export const defaults = {
-    image: () => ({ kind: "image", start: 1, strength: 1 }),
+    image: () => ({ kind: "image", start: 1, strength: 1, len: 22 }),
     video: () => ({
         kind: "video",
         start: 1,
@@ -85,6 +85,12 @@ export function laneOf(kind) {
     return kind === "audio" ? 1 : 0;
 }
 
+// a clip's length in frames: `len` when set, 3 for legacy images that were
+// placed before images were stretchable, 22 for everything else
+export function clipLen(c) {
+    return Number(c.len) || (c.kind === "image" ? 3 : 22);
+}
+
 // whether a clip occupies the given lane: video clips also occupy the audio
 // lane through their sound band (unless the band was deleted), so audio
 // clips must never overlap a linked band.
@@ -94,7 +100,7 @@ export function occupiesLane(c, lane) {
 }
 
 export function blockRect(c, s) {
-    const len = c.kind === "image" ? 3 : Number(c.len) || 22;
+    const len = clipLen(c);
     return {
         x: OFFSET_X + (Number(c.start) - 1) * s + 2,
         y: RULER_H + laneOf(c.kind) * LANE_H + 4,
@@ -117,7 +123,7 @@ export function ghostRect(c, s) {
 // occupied [s, e) frame range of a clip inside a given lane
 export function laneRange(c, lane) {
     if (lane === 0) {
-        const len = c.kind === "image" ? 3 : Number(c.len) || 22;
+        const len = clipLen(c);
         return { s: Number(c.start), e: Number(c.start) + len };
     }
     if (c.audio_off) return { s: 0, e: 0 };
@@ -279,12 +285,12 @@ export function playHeadBoundary(node) {
 // block, `audio_env` for a video's sound band (ghost), `env` for plain
 // audio clips. Points are [[content_frame, strength], ...], frames relative
 // to the clip's own content (0 = first frame of the clip's window),
-// strengths in [0.05, 1]. No points = flat at `strength` (or
+// strengths in [0, 1]. No points = flat at `strength` (or
 // `audio_strength` for the band). The green line edits it like an audio
 // volume lane: click/double-click adds a point, drag moves it, right-click
 // removes it.
 
-export const ENV_MIN = 0.05;
+export const ENV_MIN = 0.0;
 export const ENV_MAX = 1.0;
 
 // the envelope field a block edits: video/audio blocks use `env`, the
@@ -293,14 +299,18 @@ export function envField(c, ghost) {
     return ghost ? c.audio_env : c.env;
 }
 
-// flat strength of a block when its envelope has no points
+// flat strength of a block when its envelope has no points; the band of a
+// video falls back to the video's own strength until dragged on its own
 export function envFlat(c, ghost) {
-    return Number(ghost ? c.audio_strength : c.strength) || ENV_MAX;
+    const own = Number(ghost ? c.audio_strength : c.strength);
+    if (own) return own;
+    if (ghost) return Number(c.strength) || ENV_MAX;
+    return ENV_MAX;
 }
 
 export function envLen(c, ghost) {
     if (c.kind === "audio") return Number(c.len) || 22;
-    return ghost ? Number(c.audio_len ?? c.len ?? 22) : Number(c.len) || 22;
+    return ghost ? Number(c.audio_len ?? c.len ?? 22) : clipLen(c);
 }
 
 export function envPts(c, ghost) {
@@ -341,7 +351,7 @@ export function envStrengthAt(c, ghost, frame) {
     return last[1];
 }
 
-// pixel y of a strength inside a block rect (top = 1.0, bottom = 0.05)
+// pixel y of a strength inside a block rect (top = 1.0, bottom = 0.0)
 export function envY(r, v) {
     return r.y + r.h - 6 - ((clamp(v, ENV_MIN, ENV_MAX) - ENV_MIN) / (ENV_MAX - ENV_MIN)) * (r.h - 12);
 }
@@ -359,7 +369,6 @@ export function envX(r, f, s) {
 // envelope hit zone for one clip: points first, then the line. The ghost's
 // unlink toggle and the block edges keep priority over the line.
 export function envZone(c, p, s) {
-    if (c.kind === "image") return null;
     const rects = [];
     if (c.kind === "video") {
         if (!c.audio_off) rects.push([ghostRect(c, s), true]);
@@ -423,7 +432,6 @@ export function hitTest(node, p, s) {
         }
         const r = blockRect(c, s);
         if (inRect(p, r, 2)) {
-            if (c.kind === "image") return { i, c, zone: "move" };
             return { i, c, zone: edgeZone(p, r) || "move" };
         }
     }

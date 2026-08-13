@@ -26,7 +26,7 @@ Adds an optional per-audio-slot strength control on top of the core's global `au
 
 1. **`patch_layout.py`** defines the ref payload key `motion_context_audio_strength`.
 2. **`patch_payload.py`** wraps `MiniMaxH3Model._cond_audio_rows` with `_patched_cond_audio_rows` (marked rows pinned exact, unmarked stock) and the forward wrapper flips weak audio blocks out of the layout on the audio schedule (`t_a`).
-3. **`nodes.py`** parses `"strengths"` from `audio_state`, clamps each to `0.05..1.0`, and rides the value on the ref dict. `_ensure_h3_runtime_patches()` now installs the layout, extra_conds, cond-audio rows, cond-video rows and forward patches.
+3. **`nodes.py`** parses `"strengths"` from `audio_state`, clamps each to `0.0..1.0`, and rides the value on the ref dict. `_ensure_h3_runtime_patches()` now installs the layout, extra_conds, cond-audio rows, cond-video rows and forward patches.
 4. **`js/h3_custom_audio.js`** adds per-slot `audio N strength` number widgets (non-serialized, kept in `audio_state`).
 
 All three runtime patches (layout, extra_conds, cond-audio) support adoption/takeover so the fork can coexist with the upstream `ComfyUI-H3-Motion-Context` package, which otherwise double-wraps `PackedLayout.__init__` and breaks the self-test.
@@ -53,7 +53,7 @@ to the model.
 - `s = 1.0` pins the clip exactly; `s = 0.9` almost the clip; `s = 0.5`
   half pinned / half free; `s = 0.1` a light early-structure hint.
 - **`patch_layout.py`** rides `motion_context_audio_strength` /
-  `motion_context_video_strength` (clamped `0.05..1.0`) on refs/keyframes,
+  `motion_context_video_strength` (clamped `0.0..1.0`) on refs/keyframes,
   untouched by the layout patch (identical `position_ids` with or without
   the keys).
 - **`patch_payload.py`**:

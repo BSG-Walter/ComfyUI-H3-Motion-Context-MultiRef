@@ -135,7 +135,6 @@ function envChip(ctx, x, y, text) {
 // backing stroke keeps it readable over thumbnails and waveforms; the
 // ghost band draws it dimmed.
 export function drawEnvelope(ctx, r, c, s, ghost, playX) {
-    if (c.kind === "image") return;
     const flat = envFlat(c, ghost);
     const L = envLen(c, ghost);
     const pts = envPts(c, ghost).filter((p) => p[0] >= 0 && p[0] <= L);

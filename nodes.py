@@ -89,7 +89,7 @@ def _env_curve(env, flat):
     """Normalize a clip's strength envelope to sorted [(frame, strength)].
 
     Frames are content-relative (0 = first frame of the clip's window),
-    strengths clamped to [0.05, 1.0]. A clip without points collapses to a
+    strengths clamped to [0.0, 1.0]. A clip without points collapses to a
     flat curve at `flat`, and a leading implicit frame-0 point pins the
     value before the first explicit point.
     """
@@ -100,9 +100,10 @@ def _env_curve(env, flat):
             s = float(p[1])
         except (TypeError, ValueError, IndexError):
             continue
-        pts.append((max(0.0, f), min(1.0, max(0.05, s))))
+        pts.append((max(0.0, f), min(1.0, max(0.0, s))))
     if not pts:
-        return [(0.0, min(1.0, max(0.05, float(flat) or 1.0)))]
+        return [(0.0, 1.0 if flat is None
+                 else min(1.0, max(0.0, float(flat))))]
     pts.sort(key=lambda t: t[0])
     if pts[0][0] > 0.0:
         pts.insert(0, (0.0, pts[0][1]))
@@ -937,7 +938,7 @@ class _DynamicInputs(dict):
 class MiniMaxH3CustomKeyframes:
     """Attach still-image H3 keyframes at arbitrary timeline positions.
 
-    Each slot has a strength ("keyframe N strength") between 0.05 and 1.0
+    Each slot has a strength ("keyframe N strength") between 0.0 and 1.0
     that sets how much of the run the image stays pinned: the rows are
     pinned EXACT (clean, under the canonical 0.999 claim) while the video
     schedule's progress stays below the strength, then the block's tokens
@@ -1051,7 +1052,7 @@ class MiniMaxH3CustomKeyframes:
             )
         if len(strengths) < count:
             strengths = [1.0] * count
-        strengths = [min(1.0, max(0.05, float(s)))
+        strengths = [min(1.0, max(0.0, float(s)))
                      for s in strengths[:count]]
 
         video = _video_from_latent(latent)
@@ -1182,7 +1183,7 @@ class MiniMaxH3CustomAudio:
     align=start: the audio block STARTS at the chosen frame. Sound from that
                 instant on is pinned, the model leads into it.
 
-    Each slot has a strength ("audio N strength") between 0.05 and 1.0 that
+    Each slot has a strength ("audio N strength") between 0.0 and 1.0 that
     sets how much of the clip stays pinned: the rows are pinned EXACT (clean,
     no noise) while the audio schedule's progress stays below the strength,
     then the block's tokens are dropped from the layout and the model's own
@@ -1304,7 +1305,7 @@ class MiniMaxH3CustomAudio:
         if len(strengths) < count:
             strengths = [1.0] * count
         strengths = [
-            min(1.0, max(0.05, float(s)))
+            min(1.0, max(0.0, float(s)))
             for s in strengths[:count]
         ]
 
@@ -1418,7 +1419,7 @@ class MiniMaxH3CustomVideo:
     windowed to that clip's duration (a longer track is cut from its start)
     and end-aligned with the clip's last frame.
 
-    Each slot has a strength ("video N strength") between 0.05 and 1.0 that
+    Each slot has a strength ("video N strength") between 0.0 and 1.0 that
     sets how much of the clip stays pinned: the clip is pinned EXACT (clean
     rows under the canonical 0.999 claim) for the first `strength`-fraction
     of the run, then its tokens are dropped from the layout and the model's
@@ -1498,7 +1499,7 @@ class MiniMaxH3CustomVideo:
                 "positions" % (count, len(positions)))
         if len(strengths) < count:
             strengths = [1.0] * count
-        strengths = [min(1.0, max(0.05, float(s)))
+        strengths = [min(1.0, max(0.0, float(s)))
                      for s in strengths[:count]]
 
         target = _video_from_latent(latent)
@@ -1660,7 +1661,7 @@ class MiniMaxH3Timeline:
                                "trimming. When connected, drives the node; "
                                "otherwise the UI widget sets it."}),
                 total_frames=("INT", {
-                    "default": 240, "min": 1, "max": 100000, "step": 10,
+                    "default": 240, "min": 1, "max": 100000, "step": 1,
                     "tooltip": "Override the total frame count (ruler length). "
                                "When connected, drives the node; otherwise "
                                "the UI widget sets it."}),
@@ -1680,10 +1681,12 @@ class MiniMaxH3Timeline:
                    fps=FPS, env=None):
         """Build the audio refs for one clip window.
 
-        A strength envelope splits the window into one ref per segment
-        (back-to-back on the latent grid), each with the strength of its
-        start frame; a flat envelope yields the single stock ref. Returns a
-        list so callers can `extend` unconditionally.
+        Like video keyframes, a strength envelope is sampled per latent step
+        (linear interpolation between points), giving one back-to-back ref
+        per step with that step's own strength. A flat envelope (no points
+        or a constant curve) still yields the single stock ref so the common
+        case costs nothing. Returns a list so callers can `extend`
+        unconditionally.
         """
         if audio_vae is None:
             raise ValueError(
@@ -1701,9 +1704,7 @@ class MiniMaxH3Timeline:
                 "h3_motion_context: clip %d audio encoded to zero latent "
                 "steps" % idx)
         pts = _env_curve(env, strength)
-        cuts = sorted({min(float(a_len), max(0.0, float(f[0])))
-                       for f in pts if 0.0 < float(f[0]) < float(a_len)})
-        if not cuts or rt < 2:
+        if rt < 2:
             return [{
                 "kind": "audio",
                 "ref_audio_t": rt,
@@ -1711,32 +1712,26 @@ class MiniMaxH3Timeline:
                 MC_AUDIO_KEY: float(a_start - 1 + a_len),
                 MC_AUDIO_STRENGTH: _env_strength(pts, 0.0),
             }]
-        refs = []
-        bounds = [0.0] + cuts + [float(a_len)]
-        for f0, f1 in zip(bounds, bounds[1:]):
-            if f1 <= f0:
-                continue
-            k0 = int(round(rt * f0 / float(a_len)))
-            k1 = max(k0 + 1, int(round(rt * f1 / float(a_len))))
-            if k1 > rt:
-                k1 = rt
-            if k1 <= k0:
-                continue
-            refs.append({
-                "kind": "audio",
-                "ref_audio_t": k1 - k0,
-                "audio_latent": z[:, :, :, k0:k1],
-                MC_AUDIO_KEY: float(a_start - 1 + f1),
-                MC_AUDIO_STRENGTH: _env_strength(pts, f0),
-            })
-        if not refs:
-            refs = [{
+        strengths = [_env_strength(pts, a_len * k / float(rt))
+                     for k in range(rt)]
+        if len(set(strengths)) == 1:
+            return [{
                 "kind": "audio",
                 "ref_audio_t": rt,
                 "audio_latent": z,
                 MC_AUDIO_KEY: float(a_start - 1 + a_len),
-                MC_AUDIO_STRENGTH: _env_strength(pts, 0.0),
+                MC_AUDIO_STRENGTH: strengths[0],
             }]
+        refs = []
+        for k in range(rt):
+            f1 = a_len * (k + 1) / float(rt)
+            refs.append({
+                "kind": "audio",
+                "ref_audio_t": 1,
+                "audio_latent": z[:, :, :, k:k + 1],
+                MC_AUDIO_KEY: float(a_start - 1 + f1),
+                MC_AUDIO_STRENGTH: strengths[k],
+            })
         return refs
 
     @staticmethod
@@ -1803,7 +1798,9 @@ class MiniMaxH3Timeline:
                 raise ValueError(
                     "h3_motion_context: timeline clip %d start %d is below 1"
                     % (idx, start))
-            strength = min(1.0, max(0.05, float(clip.get("strength") or 1.0)))
+            sv = clip.get("strength")
+            strength = min(1.0, max(0.0, float(
+                sv if sv is not None else 1.0)))
             zero = start - 1
 
             if kind == "video":
@@ -1881,10 +1878,12 @@ class MiniMaxH3Timeline:
                             clip.get("audio_len") or run,
                             frame_count, idx)
                         align = clip.get("audio_align", "head")
+                    ast = clip.get("audio_strength")
                     refs.extend(self._audio_ref(
-                        audio_vae, audio, idx, strength,
+                        audio_vae, audio, idx,
+                        float(ast if ast is not None else strength),
                         a_start, a_len, align, fps=fps,
-                        env=clip.get("env")))
+                        env=clip.get("audio_env") or clip.get("env")))
                     link = "linked" if clip.get("audio_link", True) else \
                         "unlinked"
                     infos.append(
@@ -1897,13 +1896,27 @@ class MiniMaxH3Timeline:
                         % (idx, zero + 1, zero + run))
 
             elif kind == "image":
-                if zero >= frame_count:
-                    _LOG.warning(
-                        "h3_motion_context: image clip %d at frame %d is "
-                        "beyond the %d frame clip; parked at the last frame",
-                        idx, start, frame_count)
-                    zero = frame_count - 1
-                    start = frame_count
+                want = max(1, int(clip.get("len") or 1))
+                steps = 1
+                while _pixel_frames(steps) < want:
+                    steps += 1
+                cover = _pixel_frames(steps)
+                if zero >= frame_count or zero + cover > frame_count:
+                    if cover >= frame_count:
+                        _LOG.warning(
+                            "h3_motion_context: image clip %d stretched to %d "
+                            "frames; holding it over the whole %d frame clip",
+                            idx, want, frame_count)
+                        zero = 0
+                    else:
+                        _LOG.warning(
+                            "h3_motion_context: image clip %d at frame %d "
+                            "does not fit with %d frames in the %d frame "
+                            "clip; parked at frame %d",
+                            idx, start, cover, frame_count,
+                            frame_count - cover + 1)
+                        zero = frame_count - cover
+                    start = zero + 1
                 image = kwargs.get("image_%d" % slot)
                 fmedia = clip.get("file")
                 if fmedia:
@@ -1924,13 +1937,22 @@ class MiniMaxH3Timeline:
                         "h3_motion_context: image clip %d encoded to %s; "
                         "expected one H3 still latent [B,C,1,H,W]"
                         % (idx, tuple(getattr(encoded, "shape", ()))))
-                keyframes.append({
-                    "resolved_frame_index": 0,
-                    MC_KEY: zero,
-                    MC_VIDEO_STRENGTH: strength,
-                    "latent": encoded,
-                })
-                infos.append("clip %d: image at frame %d" % (idx, start))
+                if cover != want:
+                    _LOG.warning(
+                        "h3_motion_context: image clip %d stretched to %d "
+                        "frames, off the latent grid; holding it over %d "
+                        "frames", idx, want, cover)
+                enc = encoded.repeat(1, 1, steps, 1, 1)
+                vpts = _env_curve(clip.get("env"), strength)
+                for k, off in enumerate(_step_offsets(steps)):
+                    keyframes.append({
+                        "resolved_frame_index": 0,
+                        MC_KEY: zero + off,
+                        MC_VIDEO_STRENGTH: _env_strength(vpts, off),
+                        "latent": enc[:, :, k:k + 1],
+                    })
+                infos.append("clip %d: image at frame %d, held %d frames"
+                             % (idx, start, cover))
 
             else:  # audio
                 if audio_vae is None:

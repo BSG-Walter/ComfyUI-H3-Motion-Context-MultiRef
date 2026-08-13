@@ -111,7 +111,7 @@ The fork does NOT modify ComfyUI on disk: it is a runtime-patch custom node.
 - The claim must ALWAYS tell the truth (0.999 or 1.0 for clean rows).
 - `aug=0.0` (pure noise) never; `aug=1.0` is the replicated stock boundary
   in the packers.
-- Strength clamps in the nodes: `0.05..1.0` (1-based mode).
+- Strength clamps in the nodes: `0.0..1.0` (1-based mode).
 - Runs without keyframes / weak refs pass through the wrapper untouched
   (payload untouched) — verified by test.
 - BEWARE `dict.get(key, default)` when the default is a model attribute:

@@ -26,6 +26,7 @@ import {
     laneRange,
     occupiesLane,
     laneFree,
+    clipLen,
     blockRect,
     ghostRect,
     resolveMove,
@@ -402,6 +403,7 @@ function setup(node) {
                     if (c.kind === "video") drawGhost(ctx, c, s, nd);
                     if (c.kind === "image") {
                         drawBlock(ctx, COLORS.image, `img ${c.id}`, blockRect(c, s), false, media, nd, c);
+                        drawEnvelope(ctx, blockRect(c, s), c, s, false, envPlayX);
                     } else if (c.kind === "video") {
                         if (!c.audio_off) drawEnvelope(ctx, ghostRect(c, s), c, s, true, envPlayX);
                         drawBlock(ctx, COLORS.video, `video ${c.id}`, blockRect(c, s), false, media, nd, c);
@@ -757,12 +759,9 @@ function setup(node) {
                             d.zone === "audio" || d.zone === "trimAL" || d.zone === "trimAR";
                         const lane = audioEdit ? 1 : laneOf(d.c.kind);
                         if (d.zone === "move" || d.zone === "audio") {
-                            const img = d.c.kind === "image";
-                            const len = img
-                                ? 3
-                                : audioEdit
-                                  ? (d.c.audio_len ?? d.c.len ?? 22)
-                                  : (d.c.len ?? 22);
+                            const len = audioEdit
+                                ? (d.c.audio_len ?? d.c.len ?? 22)
+                                : clipLen(d.c);
                             const s2 = resolveMove(
                                 nd,
                                 d.c,
@@ -981,7 +980,7 @@ function setup(node) {
                 node._h3Span = Math.max(1, Math.round(Number(v) || SPAN));
                 node._h3TimelineWidget?.redraw?.(node);
             },
-            { min: 1, max: 100000, step: 10 },
+            { min: 1, max: 100000, step: 1 },
         );
         node._h3SpanWidget = w;
     }

@@ -8,6 +8,7 @@ import {
     MAX_CLIPS,
     defaults,
     kindOfFile,
+    clipLen,
     laneOf,
     laneRange,
     occupiesLane,
@@ -178,7 +179,7 @@ function placeAndPushClip(node, newClip) {
     const lane = laneOf(newClip.kind);
     const start = playHeadBoundary(node);
     newClip.start = start;
-    const newLen = Number(newClip.len) || (newClip.kind === "image" ? 3 : 22);
+    const newLen = clipLen(newClip);
 
     const sameLane = node._h3Clips.filter((c) => c !== newClip && occupiesLane(c, lane));
     sameLane.sort((a, b) => laneRange(a, lane).s - laneRange(b, lane).s);
