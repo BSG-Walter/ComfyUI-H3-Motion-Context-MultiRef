@@ -17,7 +17,6 @@ import {
     HEIGHT,
     SB_H,
     TOOL_X,
-    SLIDER_X,
     SLIDER_W,
     COLORS,
     PLAY_COLOR,
@@ -57,6 +56,9 @@ import {
     replaceClipMedia,
     addClipWithMedia,
     splitAt,
+    clearAll,
+    exportState,
+    importState,
 } from "./timeline_state.js";
 import { drawBlock, drawGhost, drawEnvelope } from "./timeline_draw.js";
 import { togglePlay, syncPreview, previewClip } from "./timeline_play.js";
@@ -353,44 +355,62 @@ function setup(node) {
                         const v = (f - 1) / fps;
                         txt = Number.isInteger(v) ? String(v) : v.toFixed(1);
                     }
-                    ctx.fillText(txt, x + 2, 2);
+                    ctx.fillText(txt, x + 2, RULER_H - 15);
                 }
                 ctx.restore();
 
-                // opaque backdrop over the toolbar so ruler labels don't
-                // bleed through the buttons and zoom slider
-                ctx.fillStyle = "#1a1a2a";
-                ctx.fillRect(TOOL_X - 4, 0, WIDTH - TOOL_X + 4, RULER_H);
+                // opaque backdrop over the toolbar strip (buttons + slider) so ruler
+// labels don't bleed through; the number band below stays clear
+ctx.fillStyle = "#1a1a2a";
+ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
 
+                // toolbar: text buttons measured at paint time; _btns/_sliderX
+                // are reused by btnZone for hit-testing
                 ctx.strokeStyle = "#888";
-                const snapOn = this._snapEnabled ?? true;
-                const btnChars = ["✂", "🧲", this._playing ? "⏹" : "▶", "F", "−", "+"];
-                for (const [i, ch] of btnChars.entries()) {
-                    const x = TOOL_X + i * 20;
-                    ctx.beginPath();
-                    ctx.roundRect(x + 0.5, 3, BTN_W, BTN_H, 3);
-                    if (i === 1 && snapOn) {
-                        ctx.fillStyle = "#3a5a80";
-                    } else {
-                        ctx.fillStyle = "#333";
-                    }
-                    ctx.fill();
-                    ctx.stroke();
-                }
                 ctx.fillStyle = "#ddd";
-                ctx.font = "11px sans-serif";
+                ctx.font = "10px sans-serif";
                 ctx.textAlign = "center";
                 ctx.textBaseline = "middle";
-                for (const [i, ch] of btnChars.entries()) {
-                    ctx.fillText(ch, TOOL_X + i * 20 + BTN_W / 2, 3 + BTN_H / 2 + 0.5);
+                const snapOn = this._snapEnabled ?? true;
+                const defs = [
+                    ["✂ Split", "split"],
+                    ["🧲 Snap", "snap"],
+                    [this._playing ? "⏹ Stop" : "▶ Play", "play"],
+                    ["F", "unit"],
+                    ["−", "out"],
+                    ["+", "in"],
+                    ["🗑 Clear", "clear"],
+                    ["⤓ Export", "export"],
+                    ["⤒ Import", "import"],
+                ];
+                this._btns = [];
+                let bx = TOOL_X;
+                const btnY = 3;
+                for (const [label, zone] of defs) {
+                    const w = Math.max(BTN_W, ctx.measureText(label).width + 10);
+                    ctx.beginPath();
+                    ctx.roundRect(bx + 0.5, btnY, w, BTN_H, 3);
+                    ctx.fillStyle =
+                        zone === "snap" && snapOn
+                            ? "#3a5a80"
+                            : zone === "play" && this._playing
+                              ? "#3a5a80"
+                              : "#333";
+                    ctx.fill();
+                    ctx.stroke();
+                    ctx.fillStyle = "#ddd";
+                    ctx.fillText(label, bx + w / 2, btnY + BTN_H / 2 + 0.5);
+                    this._btns.push({ zone, x: bx, w });
+                    bx += w + 3;
                 }
+                this._sliderX = bx + 4;
 
                 // zoom slider: log-scale track from minS to ZOOM_MAX
                 {
                     const minS = Math.max(0.5, Math.min(ZOOM_MIN, WIDTH / span));
                     const trackY = 3 + BTN_H / 2 + 0.5;
-                    const t0 = SLIDER_X;
-                    const t1 = SLIDER_X + SLIDER_W;
+                    const t0 = this._sliderX ?? TOOL_X;
+                    const t1 = t0 + SLIDER_W;
                     ctx.fillStyle = "#222";
                     ctx.beginPath();
                     ctx.roundRect(t0, trackY - 2, SLIDER_W, 4, 2);
@@ -618,7 +638,7 @@ function setup(node) {
                     if (hit.zone === "slider") {
                         this._dragSlider = true;
                         const minS = Math.max(0.5, Math.min(ZOOM_MIN, WIDTH / (nd._h3Span ?? SPAN)));
-                        const tn = clamp((p[0] - SLIDER_X) / SLIDER_W, 0, 1);
+                        const tn = clamp((p[0] - (this._sliderX ?? TOOL_X)) / SLIDER_W, 0, 1);
                         this._scale = Math.exp(tn * Math.log(ZOOM_MAX / minS)) * minS;
                         this.redraw(nd);
                         return true;
@@ -637,6 +657,19 @@ function setup(node) {
                         this._unit = this._unit === "s" ? "f" : "s";
                         writeState(nd);
                         this.redraw(nd);
+                        return true;
+                    }
+                    if (hit.zone === "clear") {
+                        clearAll(nd);
+                        this.redraw(nd);
+                        return true;
+                    }
+                    if (hit.zone === "export") {
+                        exportState(nd);
+                        return true;
+                    }
+                    if (hit.zone === "import") {
+                        importState(nd);
                         return true;
                     }
                     if (hit.zone === "snap") {
@@ -749,7 +782,7 @@ this._dragPlay = true;
                     this._hoverPos = [cx, p[1]];
                     if (this._dragSlider) {
                         const minS = Math.max(0.5, Math.min(ZOOM_MIN, WIDTH / (nd._h3Span ?? SPAN)));
-                        const tn = clamp((p[0] - SLIDER_X) / SLIDER_W, 0, 1);
+                        const tn = clamp((p[0] - (this._sliderX ?? TOOL_X)) / SLIDER_W, 0, 1);
                         this._scale = Math.exp(tn * Math.log(ZOOM_MAX / minS)) * minS;
                         this.redraw(nd);
                         return true;

@@ -14,15 +14,14 @@ export const SNAP_PX = 12; // magnet radius for clip snapping
 export const SNAP_PLAY_PX = 24; // wider magnet radius when clips snap to the playhead
 export const OFFSET_X = 16; // left margin offset
 export const BTN_W = 16;
-export const BTN_H = 12;
-export const RULER_H = 18;
+export const BTN_H = 14;
+export const RULER_H = 34;
 export const LANE_H = 68;
 export const PAD = 4;
 export const WIDTH = 840;
 export const HEIGHT = RULER_H + 2 * LANE_H + PAD;
 export const SB_H = 16; // horizontal scrollbar height under the timeline
-export const TOOL_X = WIDTH - 230; // first toolbar column
-export const SLIDER_X = TOOL_X + 6 * 20 + 6; // zoom slider start (6px gap after last button)
+export const TOOL_X = WIDTH - 460; // first toolbar button x (measured widths, so slack)
 export const SLIDER_W = 74; // zoom slider track width
 
 export const COLORS = {
@@ -277,11 +276,15 @@ export function edgeZone(p, r) {
     return null;
 }
 
-export function btnZone(p) {
-    if (p[1] > RULER_H || p[0] < TOOL_X) return null;
-    if (p[0] >= SLIDER_X && p[0] <= SLIDER_X + SLIDER_W) return "slider";
-    const col = Math.floor((p[0] - TOOL_X) / 20);
-    return ["split", "snap", "play", "unit", "in", "out"][col] || null;
+export function btnZone(node, p) {
+    if (p[1] > RULER_H) return null;
+    const w = node._h3TimelineWidget;
+    const btns = Array.isArray(w?._btns) ? w._btns : [];
+    const s = w?._sliderX;
+    if (btns.length && p[0] < btns[0].x - 4) return null;
+    if (s != null && p[0] >= s && p[0] <= s + SLIDER_W) return "slider";
+    for (const b of btns) if (p[0] >= b.x && p[0] <= b.x + b.w) return b.zone;
+    return "ruler";
 }
 
 export function playHeadBoundary(node) {
@@ -437,7 +440,7 @@ export function envZone(c, p, s) {
 export function hitTest(node, p, s, pan = 0) {
     const q = pan ? [p[0] + pan, p[1]] : p;
     if (p[1] < RULER_H) {
-        const b = btnZone(p);
+        const b = btnZone(node, p);
         return b ? { zone: b } : { zone: "ruler" };
     }
     for (let i = node._h3Clips.length - 1; i >= 0; i--) {

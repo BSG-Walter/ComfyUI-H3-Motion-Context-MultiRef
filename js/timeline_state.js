@@ -17,6 +17,7 @@ import {
     cloneEnv,
 } from "./timeline_core.js";
 import { pickFile, probeVideoFrames, redrawNode, uploadMedia } from "./timeline_media.js";
+import { togglePlay } from "./timeline_play.js";
 
 function clipInputs(c) {
     if (c.file) return [];
@@ -66,6 +67,75 @@ export function hideStateWidget(node) {
     widget.options ??= {};
     widget.options.hidden = true;
     widget.computeSize = () => [0, -4];
+}
+
+// wipe every clip off the timeline (thumbs too; the decoded media cache is
+// kept — the same files are likely re-imported soon)
+export function clearAll(node) {
+    if (!node._h3Clips?.length) return;
+    if (typeof window !== "undefined" && !window.confirm("Clear all timeline clips?")) return;
+    if (node._h3TimelineWidget?._playing) togglePlay(node);
+    node._h3Clips.length = 0;
+    node._h3Thumbs?.clear();
+    ensureInputs(node);
+    writeState(node);
+    fixNodeSize(node);
+}
+
+// download the timeline (clips + unit) as a JSON file
+export function exportState(node) {
+    const data = JSON.stringify(
+        {
+            clips: node._h3Clips ?? [],
+            unit: node._h3TimelineWidget?._unit ?? "f",
+        },
+        null,
+        2,
+    );
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "h3_timeline.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+}
+
+// load a timeline JSON produced by exportState (or any {clips:[...]} shape)
+export function importState(node) {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "application/json,.json";
+    input.onchange = () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            try {
+                const parsed = JSON.parse(String(reader.result));
+                if (!Array.isArray(parsed?.clips)) {
+                    throw new Error("no clips array");
+                }
+                node._h3Clips = parsed.clips.filter(
+                    (c) => c && c.kind && Number.isFinite(Number(c.start)),
+                );
+                if (node._h3TimelineWidget) {
+                    node._h3TimelineWidget._unit =
+                        parsed.unit === "s" ? "s" : "f";
+                }
+                node._h3Thumbs?.clear();
+                ensureInputs(node);
+                writeState(node);
+                fixNodeSize(node);
+            } catch (err) {
+                window.alert?.(`Import failed: ${err.message}`);
+            }
+        };
+        reader.readAsText(file);
+    };
+    input.click();
 }
 
 function widgetYOffset(node, fallback) {
