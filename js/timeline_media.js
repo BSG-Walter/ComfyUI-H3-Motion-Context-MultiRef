@@ -24,26 +24,6 @@ export function pickFile() {
     });
 }
 
-export function computePeaks(buf) {
-    const data = buf.getChannelData(0);
-    const n = 128;
-    const peaks = [];
-    const step = Math.max(1, Math.floor(data.length / n));
-    for (let i = 0; i < n; i++) {
-        const s = i * step;
-        const e = Math.min(data.length, s + step);
-        let mn = 1;
-        let mx = -1;
-        for (let j = s; j < e; j++) {
-            const v = data[j];
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
-        }
-        peaks.push((mn + mx) / 2, Math.max(0.02, mx - mn));
-    }
-    return peaks; // [mid, amp] pairs
-}
-
 export function redrawNode(node) {
     const w = node._h3TimelineWidget;
     if (w) w.redraw?.(node);
@@ -76,7 +56,6 @@ function decodeAudio(node, m) {
         })
         .then((decoded) => {
             m.buffer = decoded;
-            m.peaks = computePeaks(decoded);
             m.loaded = true;
             redrawNode(node);
         })

@@ -713,6 +713,7 @@ function setup(node) {
                             lenAt: Number(
                                 audioEdit ? hit.c.audio_len ?? hit.c.len ?? 22 : hit.c.len ?? 22,
                             ),
+                            srcAt: Number(hit.c.src_start) || 0,
                         };
                     } else {
                         return true;
@@ -831,7 +832,7 @@ function setup(node) {
                             // the same source frame stays under the grab point
                             // unless src_start would go negative. The ghost
                             // keeps its shared source window fixed instead.
-                            const origSrc = Number(d.c.src_start) || 0;
+                            const origSrc = d.srcAt;
                             if (d.zone !== "trimAL" && d.c.file) {
                                 const minStart = d.startAt - origSrc;
                                 s2 = Math.max(s2, minStart);

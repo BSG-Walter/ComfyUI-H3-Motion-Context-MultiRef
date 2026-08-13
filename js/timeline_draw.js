@@ -14,38 +14,49 @@ function paintCover(ctx, el, r) {
 }
 
 // draws the peaks of the SOURCE window [src_start, src_start+len) across
-// the block, so trimming crops the waveform instead of stretching it. The
-// frame->peak mapping uses the decoded buffer duration (the same data the
-// peaks were computed from), so it is exact the moment peaks exist; when
-// they don't, nothing is drawn rather than a stretched full-source guess.
+// the block. Peaks are re-bucketed from the decoded buffer for the window
+// itself (one bucket per block pixel), so a short clip over a long file
+// still draws a dense waveform and trimming crops cleanly instead of
+// zooming the whole-file peaks into nothing.
 export function paintWaveform(ctx, m, r, ghost, node, clip) {
-    if (!m?.peaks) return;
-    const n = m.peaks.length / 2;
-    if (n < 2) return;
-    ctx.fillStyle = "rgba(0,0,0," + (ghost ? 0.25 : 0.35) + ")";
-    ctx.fillRect(r.x, r.y, r.w, r.h);
-    ctx.fillStyle = ghost ? "rgba(255,255,255,0.5)" : "#fff";
-    const len = clip
-        ? clip.kind === "audio"
+    const buf = m?.buffer;
+    if (!buf || !clip) return;
+    const len =
+        clip.kind === "audio"
             ? Number(clip.len) || 22
             : clip.audio_link
               ? Number(clip.len) || 22
-              : Number(clip.audio_len ?? clip.len ?? 22)
-        : Infinity;
+              : Number(clip.audio_len ?? clip.len ?? 22);
+    if (len < 1) return;
     const srcStart = Number(clip?.src_start) || 0;
     const fps = node?._h3TimelineWidget?._fps || 24;
-    const bufDur = m.buffer?.duration;
-    const k = bufDur > 0 && isFinite(len) ? n / Math.max(1e-3, bufDur * fps) : 0;
-    if (!(k > 0)) return;
-    let i0 = clamp(Math.floor(srcStart * k), 0, n - 1);
-    let i1 = clamp(Math.ceil((srcStart + len) * k), 1, n);
-    const count = i1 - i0;
-    if (count < 2) return;
-    const cw = (r.w - 4) / (count - 1);
-    for (let i = i0; i < i1; i++) {
-        const amp = Math.min(1, Math.max(0.02, m.peaks[i * 2 + 1]));
+    const sr = buf.sampleRate || 48000;
+    const s0 = Math.floor((srcStart / fps) * sr);
+    const s1 = Math.ceil(((srcStart + len) / fps) * sr);
+    const data = buf.getChannelData(0).subarray(
+        Math.max(0, s0),
+        Math.min(buf.length, s1),
+    );
+    if (data.length < 2) return;
+    const n = Math.max(2, Math.min(1024, Math.floor(r.w) || 64));
+    const step = Math.max(1, Math.floor(data.length / n));
+    ctx.fillStyle = "rgba(0,0,0," + (ghost ? 0.25 : 0.35) + ")";
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = ghost ? "rgba(255,255,255,0.5)" : "#fff";
+    const cw = (r.w - 4) / (n - 1);
+    for (let i = 0; i < n; i++) {
+        const s = i * step;
+        const e = Math.min(data.length, s + step);
+        let mn = 1;
+        let mx = -1;
+        for (let j = s; j < e; j++) {
+            const v = data[j];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+        }
+        const amp = Math.min(1, Math.max(0.02, mx - mn));
         const bh = Math.max(1.5, amp * (r.h - 6));
-        const x = r.x + 2 + (i - i0) * cw;
+        const x = r.x + 2 + i * cw;
         ctx.fillRect(x, r.y + (r.h - bh) / 2, Math.max(1, cw * 0.7), bh);
     }
 }
