@@ -40,6 +40,7 @@ import {
     envStrengthAtY,
     envStrengthAt,
     envY,
+    tokenSnap,
     cloneEnv,
     ENV_MAX,
 } from "./timeline_core.js";
@@ -114,8 +115,12 @@ function openClipMenu(node, widget, clip, idx, x, y, zone, envHit) {
                 const s = widget._scale;
                 const r = envHit.ghost ? ghostRect(clip, s) : blockRect(clip, s);
                 const env = envNormalize(clip, envHit.ghost);
+                const len = envLen(clip, envHit.ghost);
+                const rawF = clamp(Math.round((envHit.p[0] - r.x) / s), 0, len);
                 const pt = [
-                    clamp(Math.round((envHit.p[0] - r.x) / s), 0, envLen(clip, envHit.ghost)),
+                    clip.kind === "video" && !envHit.ghost
+                        ? tokenSnap(rawF, len)
+                        : rawF,
                     envStrengthAtY(r, envHit.p[1]),
                 ];
                 env.push(pt);
@@ -717,8 +722,11 @@ this._dragPlay = true;
                             this._dragEnv = { c, ghost: hit.ghost, pt: hit.pt, len };
                         } else if (dbl) {
                             const env = envNormalize(c, hit.ghost);
+                            const rawF = clamp(Math.round((cx - r.x) / s), 0, len);
                             const pt = [
-                                clamp(Math.round((cx - r.x) / s), 0, len),
+                                c.kind === "video" && !hit.ghost
+                                    ? tokenSnap(rawF, len)
+                                    : rawF,
                                 envStrengthAtY(r, p[1]),
                             ];
                             env.push(pt);
@@ -791,7 +799,11 @@ this._dragPlay = true;
                         const s = this._scale;
                         const de = this._dragEnv;
                         const r = de.ghost ? ghostRect(de.c, s) : blockRect(de.c, s);
-                        de.pt[0] = clamp(Math.round((cx - r.x) / s), 0, de.len);
+                        const rawF = clamp(Math.round((cx - r.x) / s), 0, de.len);
+                        de.pt[0] =
+                            de.c.kind === "video" && !de.ghost
+                                ? tokenSnap(rawF, de.len)
+                                : rawF;
                         de.pt[1] = envStrengthAtY(r, p[1]);
                         envField(de.c, de.ghost).sort((a, b) => a[0] - b[0]);
                         writeState(nd);

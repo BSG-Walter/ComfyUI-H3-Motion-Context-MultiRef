@@ -178,3 +178,15 @@ into the diffusion trajectory at the covered steps.
 - Constraint: a window whose first frame is off the 17-pixel boundary is
   not injected at all (head-padded tokens have no real coverage and the
   mid-chunk tokens cannot be recovered exactly by any standalone encode).
+
+## Strength envelope matches the token grid (2026-08-13)
+
+The editor now shows exactly what the model applies for video clips. The
+node samples a video block's strength once per latent token, and tokens are
+built from greedy VAE-grid runs (39, 22, 5, 1 frames; within a run the
+1,4,4,4,4 pattern gives offsets 0,1,5,9,13 + 17k). Envelope points on video
+blocks now snap to those token-start frames when added (double-click,
+right-click menu) or dragged, and the curve draws as a stepped per-token
+line instead of a smooth polyline — no more editing points the sampler
+never reads. Image clips and audio bands keep their true linear behavior
+(fine-grained tokens).

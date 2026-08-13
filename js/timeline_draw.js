@@ -1,6 +1,6 @@
 // Canvas painting helpers for the H3 timeline widget.
 
-import { bandSrc, clamp, COLORS, ghostRect, WIDTH, envFlat, envLen, envPts, envStrengthAt, envX, envY } from "./timeline_core.js";
+import { bandSrc, clamp, COLORS, ghostRect, WIDTH, envFlat, envLen, envPts, envStrengthAt, envX, envY, videoTokenStarts } from "./timeline_core.js";
 import { ensureMedia } from "./timeline_media.js";
 
 function paintCover(ctx, el, r) {
@@ -149,9 +149,24 @@ export function drawEnvelope(ctx, r, c, s, ghost, playX) {
     const flat = envFlat(c, ghost);
     const L = envLen(c, ghost);
     const pts = envPts(c, ghost).filter((p) => p[0] >= 0 && p[0] <= L);
+    // video blocks: the node samples the strength once per latent token at
+    // the token's first frame (5 tokens per 17 frames), so draw the applied
+    // stepped curve instead of a smooth polyline; everything else (image
+    // clips, audio bands) is truly linear between points.
+    const stepped = c.kind === "video" && !ghost;
     const seg = [];
     if (!pts.length) {
         seg.push([r.x + 0.5, envY(r, flat)], [r.x + r.w - 0.5, envY(r, flat)]);
+    } else if (stepped) {
+        let lastY = envY(r, envStrengthAt(c, ghost, 0));
+        seg.push([r.x + 0.5, lastY]);
+        for (const t of videoTokenStarts(L + 1).slice(1)) {
+            const x = envX(r, t, s);
+            const y = envY(r, envStrengthAt(c, ghost, t));
+            if (y !== lastY) seg.push([x, lastY], [x, y]);
+            lastY = y;
+        }
+        seg.push([r.x + r.w - 0.5, lastY]);
     } else {
         seg.push([r.x + 0.5, envY(r, pts[0][1])]);
         for (const [f, v] of pts) seg.push([envX(r, f, s), envY(r, v)]);

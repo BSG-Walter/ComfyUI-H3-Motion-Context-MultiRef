@@ -383,6 +383,51 @@ export function envStrengthAt(c, ghost, frame) {
     return last[1];
 }
 
+// --- video token grid ------------------------------------------------------
+// The node rebuilds a video clip window as greedy VAE-grid runs (39, 22, 5,
+// 1 frames) and samples the strength envelope once per latent token, at the
+// token's first frame. Within a run the 5-token pattern 1,4,4,4,4 repeats
+// every 17 frames (offsets 0,1,5,9,13), so each run's token starts are its
+// own truncated pattern. Only edits on these frames matter — anything
+// between is interpolated but never read. Snapping edits here makes the
+// editor match the applied curve exactly.
+export const TOKEN_OFFSETS = [0, 1, 5, 9, 13];
+const RUN_GRID = [39, 22, 5, 1];
+const RUN_STEPS = { 39: 12, 22: 7, 5: 2, 1: 1 };
+
+// content-frame of each token start up to (but not past) `len`
+export function videoTokenStarts(len) {
+    const out = [];
+    let acc = 0;
+    while (acc < len) {
+        const rem = len - acc;
+        const r = RUN_GRID.find((g) => g <= rem);
+        const steps = RUN_STEPS[r];
+        for (let k = 0; k < steps; k++) {
+            const o = Math.floor(k / 5) * 17 + TOKEN_OFFSETS[k % 5];
+            if (acc + o >= len) break;
+            out.push(acc + o);
+        }
+        acc += r;
+    }
+    return out;
+}
+
+// nearest token-start frame, clamped to [0, len]
+export function tokenSnap(f, len) {
+    const starts = videoTokenStarts(len + 1);
+    let best = 0;
+    let bd = Infinity;
+    for (const t of starts) {
+        const d = Math.abs(t - f);
+        if (d < bd) {
+            bd = d;
+            best = t;
+        }
+    }
+    return Math.min(best, len);
+}
+
 // pixel y of a strength inside a block rect (top = 1.0, bottom = 0.0)
 export function envY(r, v) {
     return r.y + r.h - 6 - ((clamp(v, ENV_MIN, ENV_MAX) - ENV_MIN) / (ENV_MAX - ENV_MIN)) * (r.h - 12);
