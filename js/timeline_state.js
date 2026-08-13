@@ -229,6 +229,7 @@ export async function replaceClipMedia(node, c) {
     c.file = info;
     c.src_start = 0;
     delete c.source_len;
+    delete c.source_end;
     if (c.kind === "video") {
         const frames = await probeVideoFrames(node, info);
         if (frames && Number.isFinite(frames) && frames > 0) {
@@ -267,23 +268,29 @@ export function splitAt(node) {
     if (i < 0) return;
     const c = clips[i];
     const cut = f - Number(c.start);
+    const src = Number(c.src_start) || 0;
+    // each half becomes a brand-new file of its own window: source_end caps
+    // growth at the original window's end so a half can never reclaim the
+    // part the split cut off.
     const left = {
         ...c,
         len: cut,
         env: cloneEnv(c.env),
         audio_env: cloneEnv(c.audio_env),
         audio_len: Math.min(Number(c.audio_len ?? c.len ?? 22) || 1, cut),
+        source_end: src + cut,
     };
     const right = {
         ...c,
         start: f,
         len: (Number(c.len) || 1) - cut,
-        src_start: (Number(c.src_start) || 0) + cut,
+        src_start: src + cut,
         id: (clips.at(-1)?.id ?? 0) + 1,
         env: spliceEnv(c.env, cut),
         audio_env: spliceEnv(c.audio_env, cut),
         audio_start: (Number(c.audio_start ?? c.start) || 1) + cut,
         audio_len: Math.max(1, (Number(c.audio_len ?? c.len ?? 22) || 1) - cut),
+        source_end: src + (Number(c.len) || 1),
     };
     clips.splice(i, 1, left, right);
     writeState(node);

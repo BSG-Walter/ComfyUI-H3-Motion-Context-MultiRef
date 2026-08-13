@@ -832,9 +832,14 @@ function setup(node) {
                             // the same source frame stays under the grab point
                             // unless src_start would go negative. The ghost
                             // keeps its shared source window fixed instead.
+                            // Split halves are their own files: their left
+                            // edge can never retreat into the sibling's part.
                             const origSrc = d.srcAt;
                             if (d.zone !== "trimAL" && d.c.file) {
-                                const minStart = d.startAt - origSrc;
+                                let minStart = d.startAt - origSrc;
+                                if (Number.isFinite(Number(d.c.source_end))) {
+                                    minStart = d.startAt;
+                                }
                                 s2 = Math.max(s2, minStart);
                                 const srcMax = sourceFrames(nd, d.c) - origSrc;
                                 if (isFinite(srcMax) && srcMax > 0) {

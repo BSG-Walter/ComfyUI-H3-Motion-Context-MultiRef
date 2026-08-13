@@ -123,9 +123,13 @@ function thumbEl(node, c, m) {
     return t;
 }
 
-// source length in frames for any file-backed clip (video metadata or the
-// decoded audio buffer), Infinity while unknown so loading is non-blocking.
+// source length in frames for any file-backed clip: `source_end` (set by
+// split: an absolute source frame the clip's content may not pass, turning
+// each half into its own file) first, then video metadata or the decoded
+// audio buffer, Infinity while unknown so loading is non-blocking.
 export function sourceFrames(node, c) {
+    const end = Number(c?.source_end);
+    if (end > 0 && isFinite(end)) return end;
     const saved = Number(c?.source_len);
     if (saved > 0 && isFinite(saved)) return saved;
     const m = ensureMedia(node, c);
