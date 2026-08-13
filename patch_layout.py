@@ -63,6 +63,16 @@ _FOREIGN_ORIG_NAMES = (
     "_unpatched_init",
     "_orig_initializer",
     "_base_init",
+    # payload-side candidates, used by patch_payload's installs
+    "_orig_extra_conds",
+    "_orig_cond_audio_rows",
+    "_orig_cond_video_rows",
+    "_original_extra_conds",
+    "_original_cond_audio_rows",
+    "_original_cond_video_rows",
+    "_stock_extra_conds",
+    "_stock_cond_audio_rows",
+    "_stock_cond_video_rows",
 )
 
 _orig_init = None
@@ -130,19 +140,7 @@ def _ref_cursor_advance(refs):
 
 
 def _cond_t(text_len, latent_t, frame_count, p):
-    """Time coordinate for a keyframe anchored at pixel frame p.
-
-    The endpoints reuse stock's exact expressions rather than the general
-    formula. They are mathematically identical, but stock accumulates
-    latent_t float additions where the general form does one multiply, and
-    those differ in the last bits (about 7e-15). Matching stock bit for bit
-    means an existing first/last graph builds byte-identical positions
-    after this patch is applied, and lets the self-test stay strict.
-    """
-    if p == 0:
-        return float(text_len)
-    if frame_count is not None and p == frame_count - 1:
-        return float(text_len) + sum(mm._video_t_spans(latent_t)) - mm.FRAME_RESCALE
+    """Time coordinate for a keyframe anchored at pixel frame p."""
     return float(text_len) + mm.FRAME_RESCALE * float(p)
 
 
@@ -256,10 +254,21 @@ def _assert_moved(td, te, slots, cond_rows, want_shift=None):
                 "audio rows shifted non-uniformly or by the wrong amount: "
                 "%s vs %.6f" % (deltas[:4], want_shift))
 
+def _init_layout(layout, text_len, latent_t, lh, lw, audio_t, keyframes=None, refs=None, frame_count=None):
+    kw = {}
+    if keyframes is not None:
+        kw["keyframes"] = keyframes
+    if refs is not None:
+        kw["refs"] = refs
+    if frame_count is not None and "frame_count" in getattr(_orig_init, "__code__", object()).co_varnames:
+        kw["frame_count"] = frame_count
+    _orig_init(layout, text_len, latent_t, lh, lw, audio_t, **kw)
+
+
 def _patched_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
-                  keyframes=None, refs=None, frame_count=None):
-    _orig_init(self, text_len, latent_t, latent_h, latent_w, audio_t,
-               keyframes=keyframes, refs=refs, frame_count=frame_count)
+                  keyframes=None, refs=None, frame_count=None, **kwargs):
+    _init_layout(self, text_len, latent_t, latent_h, latent_w, audio_t,
+                 keyframes=keyframes, refs=refs, frame_count=frame_count)
     has_mc_kf = bool(keyframes) and any(
         kf.get(MC_KEY) is not None for kf in keyframes)
     has_mc_audio = bool(refs) and any(
@@ -281,19 +290,20 @@ def _self_test():
     """
     text_len, latent_t, lh, lw, audio_t = 7, 7, 22, 38, 16
     frame_count = sum(mm.FRAME_PER_TOKEN[k % 5] for k in range(latent_t))
+    dummy_lat = torch.zeros(1, 16, 1, lh, lw)
 
-    stock_kf = [{"resolved_frame_index": 0},
-                {"resolved_frame_index": frame_count - 1}]
-    ours_kf = [{"resolved_frame_index": 0, MC_KEY: 0},
-               {"resolved_frame_index": 0, MC_KEY: frame_count - 1}]
+    stock_kf = [{"resolved_frame_index": 0, "latent": dummy_lat},
+                {"resolved_frame_index": frame_count - 1, "latent": dummy_lat}]
+    ours_kf = [{"resolved_frame_index": 0, MC_KEY: 0, "latent": dummy_lat},
+               {"resolved_frame_index": 0, MC_KEY: frame_count - 1, "latent": dummy_lat}]
 
     a = mm.PackedLayout.__new__(mm.PackedLayout)
-    _orig_init(a, text_len, latent_t, lh, lw, audio_t,
-               keyframes=stock_kf, frame_count=frame_count)
+    _init_layout(a, text_len, latent_t, lh, lw, audio_t,
+                 keyframes=stock_kf, frame_count=frame_count)
 
     b = mm.PackedLayout.__new__(mm.PackedLayout)
-    _orig_init(b, text_len, latent_t, lh, lw, audio_t,
-               keyframes=ours_kf, frame_count=frame_count)
+    _init_layout(b, text_len, latent_t, lh, lw, audio_t,
+                 keyframes=ours_kf, frame_count=frame_count)
     _fixup(b, text_len, latent_t, frame_count, ours_kf)
 
     if a.position_ids.shape != b.position_ids.shape:
@@ -304,10 +314,10 @@ def _self_test():
 
     # a consecutive run must land on strictly increasing coordinates inside
     # the span the two endpoints define
-    run = [{"resolved_frame_index": 0, MC_KEY: i} for i in range(4)]
+    run = [{"resolved_frame_index": 0, MC_KEY: i, "latent": dummy_lat} for i in range(4)]
     c = mm.PackedLayout.__new__(mm.PackedLayout)
-    _orig_init(c, text_len, latent_t, lh, lw, audio_t,
-               keyframes=run, frame_count=frame_count)
+    _init_layout(c, text_len, latent_t, lh, lw, audio_t,
+                 keyframes=run, frame_count=frame_count)
     _fixup(c, text_len, latent_t, frame_count, run)
     ts = [float(c.position_ids[s, 0]) for s, _, k in c.segments if k == "cond"]
     if len(ts) != len(run):
@@ -331,8 +341,8 @@ def _self_test():
     # advance the cursor, this fails and the patch is not applied.
     ref = [{"kind": "audio", "ref_audio_t": 8}]
     d = mm.PackedLayout.__new__(mm.PackedLayout)
-    _orig_init(d, text_len, latent_t, lh, lw, audio_t,
-               keyframes=run, refs=ref, frame_count=frame_count)
+    _init_layout(d, text_len, latent_t, lh, lw, audio_t,
+                 keyframes=run, refs=ref, frame_count=frame_count)
     _fixup(d, text_len, latent_t, frame_count, run, refs=ref)
     ts_ref = [float(d.position_ids[s, 0]) for s, _, k in d.segments if k == "cond"]
     if len(ts_ref) != len(ts):
@@ -360,8 +370,8 @@ def _self_test():
     rt = 8
     ref_mc = [{"kind": "audio", "ref_audio_t": rt, MC_AUDIO_KEY: end_frame}]
     e = mm.PackedLayout.__new__(mm.PackedLayout)
-    _orig_init(e, text_len, latent_t, lh, lw, audio_t,
-               keyframes=run, refs=ref_mc, frame_count=frame_count)
+    _init_layout(e, text_len, latent_t, lh, lw, audio_t,
+                 keyframes=run, refs=ref_mc, frame_count=frame_count)
     _fixup(e, text_len, latent_t, frame_count, run, refs=ref_mc)
     _fixup_audio(e, text_len, ref_mc)
     if e.position_ids.shape != d.position_ids.shape:
@@ -387,13 +397,13 @@ def _self_test():
     refs_marked = [img1, img2, audio_marked]
 
     f = mm.PackedLayout.__new__(mm.PackedLayout)
-    _orig_init(f, text_len, latent_t, lh, lw, audio_t,
-               keyframes=run, refs=refs_plain, frame_count=frame_count)
+    _init_layout(f, text_len, latent_t, lh, lw, audio_t,
+                 keyframes=run, refs=refs_plain, frame_count=frame_count)
     _fixup(f, text_len, latent_t, frame_count, run, refs=refs_plain)
 
     g = mm.PackedLayout.__new__(mm.PackedLayout)
-    _orig_init(g, text_len, latent_t, lh, lw, audio_t,
-               keyframes=run, refs=refs_marked, frame_count=frame_count)
+    _init_layout(g, text_len, latent_t, lh, lw, audio_t,
+                 keyframes=run, refs=refs_marked, frame_count=frame_count)
     _fixup(g, text_len, latent_t, frame_count, run, refs=refs_marked)
     _fixup_audio(g, text_len, refs_marked)
 
@@ -427,14 +437,14 @@ def _self_test():
     refs_two = [{"kind": "audio", "ref_audio_t": rt2, MC_AUDIO_KEY: e}
                 for e in ends]
     h = mm.PackedLayout.__new__(mm.PackedLayout)
-    _orig_init(h, text_len, latent_t, lh, lw, audio_t,
-               keyframes=run, refs=refs_two, frame_count=frame_count)
+    _init_layout(h, text_len, latent_t, lh, lw, audio_t,
+                 keyframes=run, refs=refs_two, frame_count=frame_count)
     _fixup(h, text_len, latent_t, frame_count, run, refs=refs_two)
     _fixup_audio(h, text_len, refs_two)
 
     i_plain = mm.PackedLayout.__new__(mm.PackedLayout)
-    _orig_init(i_plain, text_len, latent_t, lh, lw, audio_t,
-               keyframes=run, refs=refs_two, frame_count=frame_count)
+    _init_layout(i_plain, text_len, latent_t, lh, lw, audio_t,
+                 keyframes=run, refs=refs_two, frame_count=frame_count)
     _fixup(i_plain, text_len, latent_t, frame_count, run, refs=refs_two)
 
     origin2 = float(text_len) + _ref_cursor_advance(refs_two)

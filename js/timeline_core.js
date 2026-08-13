@@ -109,13 +109,22 @@ export function blockRect(c, s) {
     };
 }
 
+// audio-lane position/length of a clip: audio clips use their own start/len,
+// a video's band follows the video while linked and its own audio_* fields
+// once separated
+export function bandGeom(c) {
+    const audio = c.kind === "audio";
+    const start = audio ? c.start : c.audio_link ? c.start : c.audio_start ?? c.start;
+    const len = audio ? c.len : c.audio_link ? c.len : c.audio_len ?? c.len ?? 22;
+    return { start: Number(start), len: Number(len) || 22 };
+}
+
 export function ghostRect(c, s) {
-    const start = c.audio_link ? c.start : c.audio_start ?? c.start;
-    const len = c.audio_link ? c.len : c.audio_len ?? c.len ?? 22;
+    const { start, len } = bandGeom(c);
     return {
         x: OFFSET_X + (Number(start) - 1) * s + 2,
         y: RULER_H + LANE_H + 4,
-        w: Math.max(2, (Number(len) || 22) * s - 4),
+        w: Math.max(2, len * s - 4),
         h: LANE_H - 8,
     };
 }
@@ -127,19 +136,8 @@ export function laneRange(c, lane) {
         return { s: Number(c.start), e: Number(c.start) + len };
     }
     if (c.audio_off) return { s: 0, e: 0 };
-    const s =
-        c.kind === "audio"
-            ? Number(c.start)
-            : c.audio_link
-              ? Number(c.start)
-              : Number(c.audio_start ?? c.start);
-    const len =
-        c.kind === "audio"
-            ? Number(c.len) || 22
-            : c.audio_link
-              ? Number(c.len) || 22
-              : Number(c.audio_len ?? c.len ?? 22);
-    return { s, e: s + len };
+    const { start, len } = bandGeom(c);
+    return { s: start, e: start + len };
 }
 
 // the time range the clip's sound actually plays in (the audio-lane range:
@@ -147,9 +145,8 @@ export function laneRange(c, lane) {
 // audio_off clips have no sound at all.
 export function soundRange(c) {
     if (c.audio_off) return { s: -1, e: -1 };
-    const start = c.audio_link ? c.start : c.audio_start ?? c.start;
-    const len = c.audio_link ? c.len : c.audio_len ?? c.len ?? 22;
-    return { s: Number(start), e: Number(start) + (Number(len) || 22) };
+    const { start, len } = bandGeom(c);
+    return { s: start, e: start + len };
 }
 
 // the source frame where a clip's sound content begins: a separated

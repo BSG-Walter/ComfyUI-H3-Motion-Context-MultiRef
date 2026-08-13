@@ -130,14 +130,6 @@ function openClipMenu(node, widget, clip, idx, x, y, zone, envHit) {
             },
         ]);
     }
-    items.push(
-        ["Copy clip", null],
-        ["Cut clip", null],
-        ["Duplicate", null],
-        ["Move up", null],
-        ["Move down", null],
-        ["Move to playhead", null],
-    );
     const overlay = document.createElement("div");
     overlay.style.cssText = "position:fixed;inset:0;z-index:3000";
     overlay.addEventListener("pointerdown", closeClipMenu);
@@ -181,6 +173,32 @@ function openClipMenu(node, widget, clip, idx, x, y, zone, envHit) {
     document.addEventListener("keydown", (e) => {
         if (e.key === "Escape") closeClipMenu();
     }, { once: true, capture: true });
+}
+
+function sliderZoom(nd, w, x) {
+    const minS = Math.max(0.5, Math.min(ZOOM_MIN, WIDTH / (nd._h3Span ?? SPAN)));
+    const tn = clamp((x - (w._sliderX ?? TOOL_X)) / SLIDER_W, 0, 1);
+    w._scale = Math.exp(tn * Math.log(ZOOM_MAX / minS)) * minS;
+}
+
+// number widget that doubles as an optional input slot: Python may have
+// already created it from the INT input (look it up first, and skip creation
+// when it was converted to an input)
+function ensureNumWidget(node, name, def, store) {
+    const slot = node._h3NumWidgets ?? (node._h3NumWidgets = {});
+    if (!slot[name]) slot[name] = node.widgets?.find((w) => w.name === name);
+    const isInput = node.inputs?.some((i) => i.name === name);
+    if (!slot[name] && !isInput) {
+        const w = node.addWidget("number", name, def, (v) => {
+            store(Math.max(1, Math.round(Number(v) || def)));
+            node._h3TimelineWidget?.redraw?.(node);
+        }, { min: 1, max: name === "fps" ? 240 : 100000, step: 1 });
+        slot[name] = w;
+    }
+    const w = slot[name];
+    if (w && (w.value == null || !Number.isFinite(Number(w.value)))) w.value = def;
+    if (w) w.value = Math.max(1, Math.round(Number(w.value) || def));
+    return w;
 }
 
 function setup(node) {
@@ -658,9 +676,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                     e.preventDefault();
                     if (hit.zone === "slider") {
                         this._dragSlider = true;
-                        const minS = Math.max(0.5, Math.min(ZOOM_MIN, WIDTH / (nd._h3Span ?? SPAN)));
-                        const tn = clamp((p[0] - (this._sliderX ?? TOOL_X)) / SLIDER_W, 0, 1);
-                        this._scale = Math.exp(tn * Math.log(ZOOM_MAX / minS)) * minS;
+                        sliderZoom(nd, this, p[0]);
                         this.redraw(nd);
                         return true;
                     }
@@ -805,9 +821,7 @@ this._dragPlay = true;
                     this._hover = hitTest(nd, p, this._scale, this._pan);
                     this._hoverPos = [cx, p[1]];
                     if (this._dragSlider) {
-                        const minS = Math.max(0.5, Math.min(ZOOM_MIN, WIDTH / (nd._h3Span ?? SPAN)));
-                        const tn = clamp((p[0] - (this._sliderX ?? TOOL_X)) / SLIDER_W, 0, 1);
-                        this._scale = Math.exp(tn * Math.log(ZOOM_MAX / minS)) * minS;
+                        sliderZoom(nd, this, p[0]);
                         this.redraw(nd);
                         return true;
                     }
@@ -1136,60 +1150,16 @@ this._dragPlay = true;
 
     // fps widget: Python may have already created it from the optional
     // INT input, so look it up first
-    if (!node._h3FpsWidget) {
-        node._h3FpsWidget = node.widgets?.find((w) => w.name === "fps");
-    }
-    // skip widget creation if it was already converted to an input slot
-    const fpsIsInput = node.inputs?.some((i) => i.name === "fps");
-    if (!node._h3FpsWidget && !fpsIsInput) {
-        const w = node.addWidget(
-            "number",
-            "fps",
-            24,
-            (v) => {
-                const tw = node._h3TimelineWidget;
-                if (tw) {
-                    tw._fps = Math.max(1, Math.round(Number(v) || 24));
-                    tw.redraw?.(node);
-                }
-            },
-            { min: 1, max: 240, step: 1 },
-        );
-        node._h3FpsWidget = w;
-    }
-    if (node._h3FpsWidget && (node._h3FpsWidget.value == null || !Number.isFinite(Number(node._h3FpsWidget.value)))) {
-        node._h3FpsWidget.value = 24;
-    }
-    if (node._h3FpsWidget) {
-        node._h3FpsWidget.value = Math.max(1, Math.round(Number(node._h3FpsWidget.value) || 24));
-    }
-
+    node._h3FpsWidget = ensureNumWidget(node, "fps", 24, (v) => {
+        node._h3TimelineWidget._fps = v;
+    });
     // total_frames widget: same pattern as fps
-    if (!node._h3SpanWidget) {
-        node._h3SpanWidget = node.widgets?.find((w) => w.name === "total_frames");
-    }
-    const spanIsInput = node.inputs?.some((i) => i.name === "total_frames");
-    if (!node._h3SpanWidget && !spanIsInput) {
-        const w = node.addWidget(
-            "number",
-            "total_frames",
-            SPAN,
-            (v) => {
-                node._h3Span = Math.max(1, Math.round(Number(v) || SPAN));
-                node._h3TimelineWidget?.redraw?.(node);
-            },
-            { min: 1, max: 100000, step: 1 },
-        );
-        node._h3SpanWidget = w;
-    }
-    if (node._h3SpanWidget && (node._h3SpanWidget.value == null || !Number.isFinite(Number(node._h3SpanWidget.value)))) {
-        node._h3SpanWidget.value = SPAN;
-    }
-    if (node._h3SpanWidget) {
-        node._h3Span = Math.max(1, Math.round(Number(node._h3SpanWidget.value) || SPAN));
-    } else {
-        node._h3Span = node._h3Span ?? SPAN;
-    }
+    const spanW = ensureNumWidget(node, "total_frames", SPAN, (v) => {
+        node._h3Span = v;
+    });
+    node._h3SpanWidget = spanW;
+    if (spanW) node._h3Span = Math.max(1, Math.round(Number(spanW.value) || SPAN));
+    else node._h3Span = node._h3Span ?? SPAN;
 
     const tw = node._h3TimelineWidget;
     if (tw) {

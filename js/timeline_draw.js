@@ -1,6 +1,6 @@
 // Canvas painting helpers for the H3 timeline widget.
 
-import { bandSrc, clamp, COLORS, ghostRect, WIDTH, envFlat, envLen, envPts, envStrengthAt, envX, envY, videoTokenStarts } from "./timeline_core.js";
+import { bandSrc, bandGeom, clamp, COLORS, ghostRect, WIDTH, envFlat, envLen, envPts, envStrengthAt, envX, envY, videoTokenStarts } from "./timeline_core.js";
 import { ensureMedia } from "./timeline_media.js";
 
 function paintCover(ctx, el, r) {
@@ -21,12 +21,7 @@ function paintCover(ctx, el, r) {
 export function paintWaveform(ctx, m, r, ghost, node, clip) {
     const buf = m?.buffer;
     if (!buf || !clip) return;
-    const len =
-        clip.kind === "audio"
-            ? Number(clip.len) || 22
-            : clip.audio_link
-              ? Number(clip.len) || 22
-              : Number(clip.audio_len ?? clip.len ?? 22);
+    const { len } = bandGeom(clip);
     if (len < 1) return;
     const srcStart = bandSrc(clip);
     const fps = node?._h3TimelineWidget?._fps || 24;
@@ -61,6 +56,18 @@ export function paintWaveform(ctx, m, r, ghost, node, clip) {
     }
 }
 
+// clip the block and draw a media element cover-fit inside it
+function paintThumb(ctx, el, r) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(r.x, r.y, r.w, r.h, 3);
+    ctx.clip();
+    ctx.fillStyle = "#000";
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    paintCover(ctx, el, r);
+    ctx.restore();
+}
+
 export function drawBlock(ctx, color, label, r, ghost, media, node, clip) {
     ctx.globalAlpha = ghost ? 0.35 : 0.55;
     ctx.fillStyle = color;
@@ -71,23 +78,9 @@ export function drawBlock(ctx, color, label, r, ghost, media, node, clip) {
     if (media?.kind === "audio") {
         paintWaveform(ctx, media, r, ghost, node, clip);
     } else if (!ghost && media?.kind === "image" && media.img) {
-        ctx.save();
-        ctx.beginPath();
-    ctx.roundRect(r.x, r.y, r.w, r.h, 3);
-        ctx.clip();
-        ctx.fillStyle = "#000";
-        ctx.fillRect(r.x, r.y, r.w, r.h);
-        paintCover(ctx, media.img, r);
-        ctx.restore();
+        paintThumb(ctx, media.img, r);
     } else if (!ghost && media?.kind === "video" && node?._h3Thumbs?.get(clip?.id)?.el) {
-        ctx.save();
-        ctx.beginPath();
-    ctx.roundRect(r.x, r.y, r.w, r.h, 3);
-        ctx.clip();
-        ctx.fillStyle = "#000";
-        ctx.fillRect(r.x, r.y, r.w, r.h);
-        paintCover(ctx, node._h3Thumbs.get(clip.id).el, r);
-        ctx.restore();
+        paintThumb(ctx, node._h3Thumbs.get(clip.id).el, r);
     }
     ctx.lineWidth = 1;
     ctx.strokeStyle = color;

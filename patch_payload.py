@@ -44,20 +44,6 @@ _LOG = logging.getLogger("h3_motion_context")
 
 _ORIG = {}
 
-# module-global names a foreign wrapper of the payload attributes may have
-# captured the stock functions under, on top of the layout ones
-_FOREIGN_ORIG_NAMES = _FOREIGN_ORIG_NAMES + (
-    "_orig_extra_conds",
-    "_orig_cond_audio_rows",
-    "_orig_cond_video_rows",
-    "_original_extra_conds",
-    "_original_cond_audio_rows",
-    "_original_cond_video_rows",
-    "_stock_extra_conds",
-    "_stock_cond_audio_rows",
-    "_stock_cond_video_rows",
-)
-
 
 def _mix(r, aug, seed):
     """Stock global-aug row mixing for unmarked blocks."""
@@ -238,11 +224,13 @@ def _patched_forward(self, x, timestep, context, transformer_options={},
                 and [id(r) for r in mark_a] == [id(r) for r in keep_refs])
         if not same:
             video_x = comfy.ldm.common_dit.pad_to_patch_size(x[0], self.patch_size)
+            pl_kw = {"keyframes": keep_kf, "refs": keep_refs}
+            fc = payload.get("frame_count")
+            if fc is not None and "frame_count" in getattr(mm_model.PackedLayout.__init__, "__code__", object()).co_varnames:
+                pl_kw["frame_count"] = fc
             payload["layout"] = mm_model.PackedLayout(
                 context.shape[1], video_x.shape[2], video_x.shape[3],
-                video_x.shape[4], x[1].shape[-1],
-                keyframes=keep_kf, refs=keep_refs,
-                frame_count=payload.get("frame_count"))
+                video_x.shape[4], x[1].shape[-1], **pl_kw)
             payload["_h3mc_active_keyframes"] = keep_kf
             payload["_h3mc_active_refs"] = keep_refs
     out = _ORIG["forward"](self, x, timestep, context,
@@ -308,24 +296,20 @@ def _patched_cond_video_rows(self, payload, device):
     aug = float(payload.get("visual_cond_noise_aug",
                             mm_model.VISUAL_COND_TIMESTEP))
     seed = int(payload.get("seed", 0))
-    for kf in payload.get("keyframes") or []:
-        if active_kf is not None and not any(kf is k for k in active_kf):
-            continue
-        r = mm_model.patchify_video(kf["latent"].to(torch.float32),
+    def _add_row(item):
+        r = mm_model.patchify_video(item["latent"].to(torch.float32),
                                     self.patch_size)
-        if kf.get(MC_VIDEO_STRENGTH) is None:
+        if item.get(MC_VIDEO_STRENGTH) is None:
             r = _mix(r, aug, seed)
         rows.append(r.to(device))
+
+    for kf in payload.get("keyframes") or []:
+        if active_kf is None or any(kf is k for k in active_kf):
+            _add_row(kf)
     for r in payload.get("refs") or []:
-        if "latent" not in r or r.get("kind") == "audio":
-            continue  # kind "audio" gets only a ref_audio segment in the layout
-        if active_refs is not None and not any(r is x for x in active_refs):
-            continue
-        r2 = mm_model.patchify_video(r["latent"].to(torch.float32),
-                                     self.patch_size)
-        if r.get(MC_VIDEO_STRENGTH) is None:
-            r2 = _mix(r2, aug, seed)
-        rows.append(r2.to(device))
+        if "latent" in r and r.get("kind") != "audio":
+            if active_refs is None or any(r is x for x in active_refs):
+                _add_row(r)
     return torch.cat(rows, dim=0) if rows else None
 
 

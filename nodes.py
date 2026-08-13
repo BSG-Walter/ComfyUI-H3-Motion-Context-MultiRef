@@ -38,9 +38,9 @@ import logging
 import os
 
 import av
+import bisect
 import numpy as np
 import torch
-import comfy.utils
 import folder_paths
 import node_helpers
 from comfy_extras.nodes_audio import f32_pcm
@@ -101,6 +101,15 @@ def _video_runs(n):
         runs.append(r)
         rem -= r
     return runs
+
+
+def _assert_vae_grid(steps, run, label):
+    """Refuse to run if the VAE grid doesn't match VIDEO_RUN_GRID."""
+    if _pixel_frames(steps) != run:
+        raise RuntimeError(
+            "h3_motion_context: %s encoded %d frames to %d latent steps; "
+            "the VAE grid no longer matches VIDEO_RUN_GRID. Upstream VAE "
+            "change, refusing to run." % (label, run, steps))
 
 
 def _env_curve(env, flat):
@@ -173,6 +182,40 @@ def _ensure_h3_runtime_patches():
 def _pixel_frames(latent_t):
     """Pixel frames covered by latent_t latent steps."""
     return sum(FRAME_PER_TOKEN[k % 5] for k in range(latent_t))
+
+
+def _target_metrics(latent):
+    """Pixel width/height and frame_count derived from a [B,C,T,H,W] latent."""
+    return (
+        int(latent.shape[4]) * 16,
+        int(latent.shape[3]) * 16,
+        _pixel_frames(int(latent.shape[2])),
+    )
+
+
+def _parse_slots(state_obj, label, slot_noun, max_count):
+    """Parse the positions/count/strengths UI block shared by the custom
+    Keyframes, Audio, and Video nodes. Returns (positions, count, strengths)."""
+    try:
+        state = json.loads(state_obj or "{}")
+    except Exception as exc:
+        raise ValueError(
+            "h3_motion_context: invalid H3 %s UI state" % label) from exc
+    positions = state.get("positions", [])
+    count = int(state.get("count", len(positions)))
+    strengths = state.get("strengths", [])
+    if count < 1 or count > max_count:
+        raise ValueError(
+            "h3_motion_context: %s count must be 1..%d" % (label, max_count))
+    if len(positions) < count:
+        raise ValueError(
+            "h3_motion_context: %d %s slots but only %d saved "
+            "positions" % (count, slot_noun, len(positions)))
+    if len(strengths) < count:
+        strengths = [1.0] * count
+    strengths = [min(1.0, max(0.0, float(s)))
+                 for s in strengths[:count]]
+    return positions, count, strengths
 
 
 def _step_offsets(latent_t):
@@ -312,7 +355,6 @@ def _resample_video_frames(collected_timed_frames, target_fps):
     duration = end_t - start_t
     num_target = max(1, int(round(duration * target_fps)) + 1)
 
-    import bisect
     resampled = []
     dt = 1.0 / float(target_fps)
     for i in range(num_target):
@@ -557,9 +599,7 @@ class MiniMaxH3MotionContext:
 
         video = _video_from_latent(latent)
         latent_t = int(video.shape[2])
-        width = int(video.shape[4]) * 16
-        height = int(video.shape[3]) * 16
-        frame_count = _pixel_frames(latent_t)
+        width, height, frame_count = _target_metrics(video)
 
         available = int(context_frames.shape[0])
         n = min(int(context_length), available)
@@ -600,30 +640,17 @@ class MiniMaxH3MotionContext:
                         "expected [B,C,T,H,W]. Try encode_mode=frames."
                         % (tuple(getattr(enc, "shape", ())),))
                 steps = int(enc.shape[2])
-                covered = _pixel_frames(steps)
-                if covered != run:
-                    # run was snapped to the grid above, so a mismatch here
-                    # means the VAE's downscale formula changed underneath us
-                    # and the pinned content no longer lines up with the
-                    # positions we would write. Refuse rather than render a
-                    # shifted join.
-                    raise RuntimeError(
-                        "h3_motion_context: %d frames encoded to %d latent "
-                        "steps covering %d frames; the VAE grid no longer "
-                        "matches VIDEO_RUN_GRID. Upstream VAE change, "
-                        "refusing to run."
-                        % (run, steps, covered))
+                _assert_vae_grid(steps, run, "%d frames" % run)
                 offsets.extend(
                     run_acc + o for o in _step_offsets(steps))
                 blocks.extend(enc[:, :, k:k + 1] for k in range(steps))
                 run_acc += run
-            span = n
         else:
             blocks, offsets = [], []
             for i in range(n):
                 blocks.append(vae.encode(tail[i:i + 1]))
                 offsets.append(i)
-            span = n
+        span = n
 
         if anchor_mode == "before":
             indices = [o - span for o in offsets]
@@ -1160,36 +1187,12 @@ class MiniMaxH3CustomKeyframes:
     ):
         _ensure_h3_runtime_patches()
 
-        try:
-            state = json.loads(keyframe_state or "{}")
-        except Exception as exc:
-            raise ValueError(
-                "h3_motion_context: invalid H3 Custom Keyframes UI state"
-            ) from exc
-
-        positions = state.get("positions", [])
-        count = int(state.get("count", len(positions)))
-        strengths = state.get("strengths", [])
-
-        if count < 1 or count > self.MAX_KEYFRAMES:
-            raise ValueError(
-                "h3_motion_context: Custom Keyframes count must be 1..%d"
-                % self.MAX_KEYFRAMES
-            )
-        if len(positions) < count:
-            raise ValueError(
-                "h3_motion_context: %d keyframe slots but only %d saved "
-                "positions" % (count, len(positions))
-            )
-        if len(strengths) < count:
-            strengths = [1.0] * count
-        strengths = [min(1.0, max(0.0, float(s)))
-                     for s in strengths[:count]]
+        positions, count, strengths = _parse_slots(
+            keyframe_state, "Custom Keyframes", "keyframe", self.MAX_KEYFRAMES
+        )
 
         video = _video_from_latent(latent)
-        width = int(video.shape[4]) * 16
-        height = int(video.shape[3]) * 16
-        frame_count = _pixel_frames(int(video.shape[2]))
+        width, height, frame_count = _target_metrics(video)
 
         anchors = []
         for slot in range(1, count + 1):
@@ -1412,35 +1415,11 @@ class MiniMaxH3CustomAudio:
     ):
         _ensure_h3_runtime_patches()
 
-        try:
-            state = json.loads(audio_state or "{}")
-        except Exception as exc:
-            raise ValueError(
-                "h3_motion_context: invalid H3 Custom Audio UI state"
-            ) from exc
+        positions, count, strengths = _parse_slots(
+            audio_state, "Custom Audio", "audio", self.MAX_AUDIOS
+        )
 
-        positions = state.get("positions", [])
-        count = int(state.get("count", len(positions)))
-        strengths = state.get("strengths", [])
-
-        if count < 1 or count > self.MAX_AUDIOS:
-            raise ValueError(
-                "h3_motion_context: Custom Audio count must be 1..%d"
-                % self.MAX_AUDIOS
-            )
-        if len(positions) < count:
-            raise ValueError(
-                "h3_motion_context: %d audio slots but only %d saved "
-                "positions" % (count, len(positions))
-            )
-        if len(strengths) < count:
-            strengths = [1.0] * count
-        strengths = [
-            min(1.0, max(0.0, float(s)))
-            for s in strengths[:count]
-        ]
-
-        frame_count = _pixel_frames(int(_video_from_latent(latent).shape[2]))
+        frame_count = _target_metrics(_video_from_latent(latent))[2]
 
         anchors = []
         for slot in range(1, count + 1):
@@ -1504,7 +1483,7 @@ class MiniMaxH3CustomAudio:
             else:
                 # sound starts at 0-based frame `zero_based` and covers
                 # rt 40 Hz steps = rt * 3/5 frame units of timeline
-                end_frame = float(zero_based) + rt * 3.0 / 5.0
+                end_frame = float(zero_based) + rt / FRAME_RESCALE
 
             anchors.append((end_frame, slot, z, rt, strengths[slot - 1]))
 
@@ -1609,34 +1588,12 @@ class MiniMaxH3CustomVideo:
               indexing="1-based", crop="disabled", audio_vae=None, **kwargs):
         _ensure_h3_runtime_patches()
 
-        try:
-            state = json.loads(video_state or "{}")
-        except Exception as exc:
-            raise ValueError(
-                "h3_motion_context: invalid H3 Custom Video UI state"
-            ) from exc
-
-        positions = state.get("positions", [])
-        count = int(state.get("count", len(positions)))
-        strengths = state.get("strengths", [])
-
-        if count < 1 or count > self.MAX_VIDEOS:
-            raise ValueError(
-                "h3_motion_context: Custom Video count must be 1..%d"
-                % self.MAX_VIDEOS)
-        if len(positions) < count:
-            raise ValueError(
-                "h3_motion_context: %d video slots but only %d saved "
-                "positions" % (count, len(positions)))
-        if len(strengths) < count:
-            strengths = [1.0] * count
-        strengths = [min(1.0, max(0.0, float(s)))
-                     for s in strengths[:count]]
+        positions, count, strengths = _parse_slots(
+            video_state, "Custom Video", "video", self.MAX_VIDEOS
+        )
 
         target = _video_from_latent(latent)
-        width = int(target.shape[4]) * 16
-        height = int(target.shape[3]) * 16
-        frame_count = _pixel_frames(int(target.shape[2]))
+        width, height, frame_count = _target_metrics(target)
 
         keyframes, hard = [], []
         audio_refs = []
@@ -1674,12 +1631,7 @@ class MiniMaxH3CustomVideo:
                 enc = vae.encode(_resize(
                     video[run_acc:run_acc + run], width, height, crop))
                 steps = int(enc.shape[2])
-                if _pixel_frames(steps) != run:
-                    raise RuntimeError(
-                        "h3_motion_context: video %d encoded %d frames to %d "
-                        "latent steps; the VAE grid no longer matches "
-                        "VIDEO_RUN_GRID. Upstream VAE change, refusing to run."
-                        % (slot, run, steps))
+                _assert_vae_grid(steps, run, "video %d" % slot)
                 offsets = _step_offsets(steps)
                 for k, off in enumerate(offsets):
                     keyframes.append({
@@ -1843,14 +1795,6 @@ class MiniMaxH3Timeline:
                 "h3_motion_context: clip %d audio encoded to zero latent "
                 "steps" % idx)
         pts = _env_curve(env, strength)
-        if rt < 2:
-            return [{
-                "kind": "audio",
-                "ref_audio_t": rt,
-                "audio_latent": z,
-                MC_AUDIO_KEY: float(a_start - 1 + a_len),
-                MC_AUDIO_STRENGTH: _env_strength(pts, 0.0),
-            }]
         strengths = [_env_strength(pts, a_len * k / float(rt))
                      for k in range(rt)]
         if len(set(strengths)) == 1:
@@ -1919,9 +1863,7 @@ class MiniMaxH3Timeline:
                 % self.MAX_CLIPS)
 
         target = _video_from_latent(latent)
-        width = int(target.shape[4]) * 16
-        height = int(target.shape[3]) * 16
-        frame_count = _pixel_frames(int(target.shape[2]))
+        width, height, frame_count = _target_metrics(target)
 
         keyframes, refs = [], []
         hard = []
@@ -2013,13 +1955,7 @@ class MiniMaxH3Timeline:
                     enc = vae.encode(_resize(
                         frames[run_acc:run_acc + run], width, height, crop))
                     steps = int(enc.shape[2])
-                    if _pixel_frames(steps) != run:
-                        raise RuntimeError(
-                            "h3_motion_context: video clip %d encoded %d "
-                            "frames to %d latent steps; the VAE grid no "
-                            "longer matches VIDEO_RUN_GRID. Upstream VAE "
-                            "change, refusing to run."
-                            % (idx, run, steps))
+                    _assert_vae_grid(steps, run, "video clip %d" % idx)
                     for k, off in enumerate(_step_offsets(steps)):
                         keyframes.append({
                             "resolved_frame_index": 0,
