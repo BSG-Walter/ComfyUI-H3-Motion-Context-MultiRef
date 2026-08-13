@@ -331,6 +331,22 @@ function setup(node) {
                 ctx.translate(-(this._pan ?? 0), 0);
 
                 const span = nd._h3Span ?? SPAN;
+                // VAE valid-length grid: the H3 video VAE only reproduces the
+                // grid exactly for windows of 17k+5 frames (5, 22, 39, 56,
+                // 73...) — those end on a token boundary with no virtual
+                // tail. Other lengths leave the last token held-edge padded,
+                // which cuts. The lines mark the valid end frames for a clip
+                // starting on a chunk boundary; a clip whose right edge
+                // lands on a line is clean.
+                ctx.strokeStyle = "rgba(122, 162, 247, 0.4)";
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                for (let f = 5; f <= span; f += 17) {
+                    const x = OFFSET_X + (f - 1) * s + 0.5;
+                    ctx.moveTo(x, RULER_H - 4);
+                    ctx.lineTo(x, HEIGHT);
+                }
+                ctx.stroke();
                 let tick = 1;
                 while (tick * 2 * s < 8) tick *= 2;
                 // one label per frame at max zoom-in, one every 24 frames at
