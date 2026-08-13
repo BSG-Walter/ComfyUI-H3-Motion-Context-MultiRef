@@ -99,10 +99,6 @@ def _install(cls, attr, patched, foreign_names, gone_msg, done_msg):
 
 def _patched_extra_conds(self, **kwargs):
     out = _ORIG["extra_conds"](self, **kwargs)
-    keyframes = kwargs.get("minimax_keyframes", None)
-    refs = kwargs.get("minimax_refs", None)
-    if not keyframes or not refs:
-        return out  # only one mechanism in play, stock behaviour is correct
 
     cond = out.get("minimax_payload", None)
     payload = getattr(cond, "cond", None) if cond is not None else None
@@ -110,6 +106,17 @@ def _patched_extra_conds(self, **kwargs):
         _LOG.warning("h3_motion_context: could not reach the H3 payload, "
                      "keyframe latents may have been overwritten by refs")
         return out
+
+    hard = kwargs.get("minimax_hard_video", None)
+    if hard is not None:
+        payload["minimax_hard_video"] = hard
+        _LOG.info("h3_motion_context: %d hard-injected video steps passed "
+                  "to the sampling payload", len(hard))
+
+    keyframes = kwargs.get("minimax_keyframes", None)
+    refs = kwargs.get("minimax_refs", None)
+    if not keyframes or not refs:
+        return out  # only one mechanism in play, stock behaviour is correct
 
     kf_video = [kf["latent"] for kf in keyframes if "latent" in kf]
     ref_video = [r["latent"] for r in refs if "latent" in r]
@@ -200,9 +207,6 @@ def _patched_forward(self, x, timestep, context, transformer_options={},
     weak_a = [r for r in refs
               if r.get(MC_AUDIO_STRENGTH) is not None
               and float(r[MC_AUDIO_STRENGTH]) < 1.0]
-    if not weak_v and not weak_a:
-        return _ORIG["forward"](self, x, timestep, context,
-                                transformer_options, minimax_payload, **kwargs)
     sigma_v = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
     shift_v = transformer_options.get("minimax_h3_sigma_shift_video")
     if shift_v is None:
@@ -241,8 +245,40 @@ def _patched_forward(self, x, timestep, context, transformer_options={},
                 frame_count=payload.get("frame_count"))
             payload["_h3mc_active_keyframes"] = keep_kf
             payload["_h3mc_active_refs"] = keep_refs
-    return _ORIG["forward"](self, x, timestep, context,
-                            transformer_options, minimax_payload, **kwargs)
+    out = _ORIG["forward"](self, x, timestep, context,
+                           transformer_options, minimax_payload, **kwargs)
+    _clamp_hard(out, x, timestep, payload)
+    return out
+
+
+def _clamp_hard(out, x, timestep, payload):
+    """Hard-inject pinned video steps into the sampler output.
+
+    The forward returns [-video_out, -audio_out] and the flow sampler
+    forms the denoised estimate as x - out[0] * sigma (CONST schedule), so
+    setting out[0] at a step to (video_x - lat) / sigma makes the estimate
+    exactly the pinned latent at that step, every step of the chain. Both
+    the cond and uncond CFG passes see the same clamped values, so the
+    combination keeps the pins exact and the rest of the video is sampled
+    normally. Content from a pinned step can never regenerate, no matter
+    what the model's attention would rather do.
+    """
+    hard = payload.get("minimax_hard_video")
+    if not hard or not out or out[0] is None or x[0].ndim != 5:
+        return
+    sigma = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
+    v = out[0]
+    applied = []
+    for entry in hard:
+        t = int(entry["index"])
+        if t >= v.shape[2]:
+            continue
+        lat = entry["latent"].to(device=v.device, dtype=v.dtype)
+        v[:, :, t:t + 1] = (x[0][:, :, t:t + 1] - lat) / sigma
+        applied.append(t)
+    if applied:
+        _LOG.info("h3_motion_context: clamped %d hard video steps at sigma "
+                  "%.4f: %s", len(applied), float(sigma), applied)
 
 
 def apply_forward_patch():

@@ -55,7 +55,10 @@ print("dynamic input map OK: legacy + multi-prefix + fixed-key serialization")
 # the video strength slider ---
 class FakeVAE:
     def encode(self, pix):
-        return torch.zeros(pix.shape[0], 4, 2, 2, 2)
+        # real H3 video VAE: 1 frame -> 1 step, else ceil(n/17)*5-3
+        n = pix.shape[0]
+        steps = 1 if n == 1 else (n + 16) // 17 * 5 - 3
+        return torch.zeros(pix.shape[0], 4, steps, 2, 2)
 
 
 class FakeAV:
@@ -83,6 +86,9 @@ assert kfs[3][pl.MC_KEY] == 10 and kfs[3][pl.MC_VIDEO_STRENGTH] == 1.0
 refs = cond["minimax_refs"]
 assert len(refs) == 1 and refs[0][pl.MC_AUDIO_KEY] == 5.0
 assert refs[0][pl.MC_AUDIO_STRENGTH] == 0.5
+# hard injection: video 1 starts on the 17-pixel alignment grid (frame 1),
+# video 2 at frame 10 does not, so only the first clip's steps are pinned
+assert [h["index"] for h in (cond.get("minimax_hard_video") or [])] == [0, 1]
 print("video node apply OK: 2 clips, per-clip strength, per-clip audio")
 
 

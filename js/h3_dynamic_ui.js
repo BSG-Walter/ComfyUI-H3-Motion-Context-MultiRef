@@ -48,7 +48,7 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
                 state.strengths = parsed.strengths.map((v) => {
                     const s = Number(v);
                     if (!Number.isFinite(s)) return 1;
-                    return Math.min(1, Math.max(0.05, s));
+                    return Math.min(1, Math.max(0.0, s));
                 });
             }
         } catch (_) {}
@@ -170,11 +170,11 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
             strengthLabel(i),
             initialValue,
             (value) => {
-                widget.value = Math.min(1, Math.max(0.05, Number(value)));
+                widget.value = Math.min(1, Math.max(0.0, Number(value)));
                 writeState(node);
             },
             {
-                min: 0.05,
+                min: 0.0,
                 max: 1,
                 step: 0.01,
                 precision: 2,
@@ -200,7 +200,7 @@ export function makeDynamicNodeExtension(nodeName, cfg) {
                 strengths.push(
                     Math.min(
                         1,
-                        Math.max(0.05, Number(findStrengthWidget(node, i)?.value ?? 1)),
+                        Math.max(0.0, Number(findStrengthWidget(node, i)?.value ?? 1)),
                     ),
                 );
             }

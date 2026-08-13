@@ -6,14 +6,18 @@ import {
     WIDTH,
     HEIGHT,
     MAX_CLIPS,
+    bandSrc,
     defaults,
     kindOfFile,
+    clipLen,
     laneOf,
     laneRange,
     occupiesLane,
     playHeadBoundary,
+    cloneEnv,
 } from "./timeline_core.js";
 import { pickFile, probeVideoFrames, redrawNode, uploadMedia } from "./timeline_media.js";
+import { togglePlay } from "./timeline_play.js";
 
 function clipInputs(c) {
     if (c.file) return [];
@@ -65,6 +69,75 @@ export function hideStateWidget(node) {
     widget.computeSize = () => [0, -4];
 }
 
+// wipe every clip off the timeline (thumbs too; the decoded media cache is
+// kept — the same files are likely re-imported soon)
+export function clearAll(node) {
+    if (!node._h3Clips?.length) return;
+    if (typeof window !== "undefined" && !window.confirm("Clear all timeline clips?")) return;
+    if (node._h3TimelineWidget?._playing) togglePlay(node);
+    node._h3Clips.length = 0;
+    node._h3Thumbs?.clear();
+    ensureInputs(node);
+    writeState(node);
+    fixNodeSize(node);
+}
+
+// download the timeline (clips + unit) as a JSON file
+export function exportState(node) {
+    const data = JSON.stringify(
+        {
+            clips: node._h3Clips ?? [],
+            unit: node._h3TimelineWidget?._unit ?? "f",
+        },
+        null,
+        2,
+    );
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "h3_timeline.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+}
+
+// load a timeline JSON produced by exportState (or any {clips:[...]} shape)
+export function importState(node) {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "application/json,.json";
+    input.onchange = () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            try {
+                const parsed = JSON.parse(String(reader.result));
+                if (!Array.isArray(parsed?.clips)) {
+                    throw new Error("no clips array");
+                }
+                node._h3Clips = parsed.clips.filter(
+                    (c) => c && c.kind && Number.isFinite(Number(c.start)),
+                );
+                if (node._h3TimelineWidget) {
+                    node._h3TimelineWidget._unit =
+                        parsed.unit === "s" ? "s" : "f";
+                }
+                node._h3Thumbs?.clear();
+                ensureInputs(node);
+                writeState(node);
+                fixNodeSize(node);
+            } catch (err) {
+                window.alert?.(`Import failed: ${err.message}`);
+            }
+        };
+        reader.readAsText(file);
+    };
+    input.click();
+}
+
 function widgetYOffset(node, fallback) {
     if (typeof node.getInputPos !== "function") return fallback;
     const n = node.inputs?.length || 0;
@@ -92,6 +165,12 @@ export function fixNodeSize(node) {
     if (w) {
         w.y = widgetYOffset(node, w.y);
         w._rowOf = widgetYOffset(node, w._rowOf);
+    }
+    const sb = node._h3ScrollWidget;
+    if (sb) {
+        const off = widgetYOffset(node, w?.y ?? 0) + HEIGHT;
+        sb.y = off;
+        sb._rowOf = off;
     }
 }
 
@@ -124,11 +203,12 @@ export function removeClip(node, i) {
         a.id = (node._h3Clips.at(-1)?.id ?? 0) + 1;
         a.start = Number(clip.audio_start ?? clip.start);
         a.len = Number(clip.audio_len ?? clip.len) || 22;
-        a.strength = Number(clip.strength) || 1;
+        a.strength = clip.audio_strength ?? clip.strength ?? 1;
         a.align = clip.audio_align ?? "head";
+        a.env = cloneEnv(clip.audio_env ?? clip.env);
         if (clip.file) {
             a.file = clip.file;
-            a.src_start = Number(clip.src_start) || 0;
+            a.src_start = bandSrc(clip);
         }
         node._h3Clips.push(a);
     }
@@ -168,7 +248,7 @@ export async function addClipWithMedia(node, kind) {
     const detected = kindOfFile(info);
     const useKind = detected || kind;
     let len = null;
-    if (useKind === "video") {
+    if (useKind === "video" || useKind === "audio") {
         len = await probeVideoFrames(node, info, file);
     }
     addClip(node, useKind, info, len);
@@ -178,7 +258,7 @@ function placeAndPushClip(node, newClip) {
     const lane = laneOf(newClip.kind);
     const start = playHeadBoundary(node);
     newClip.start = start;
-    const newLen = Number(newClip.len) || (newClip.kind === "image" ? 3 : 22);
+    const newLen = clipLen(newClip);
 
     const sameLane = node._h3Clips.filter((c) => c !== newClip && occupiesLane(c, lane));
     sameLane.sort((a, b) => laneRange(a, lane).s - laneRange(b, lane).s);
@@ -226,7 +306,9 @@ export async function replaceClipMedia(node, c) {
     c.file = info;
     c.src_start = 0;
     delete c.source_len;
-    if (c.kind === "video") {
+    delete c.source_end;
+    delete c.src_floor;
+    if (c.kind === "video" || c.kind === "audio") {
         const frames = await probeVideoFrames(node, info);
         if (frames && Number.isFinite(frames) && frames > 0) {
             c.source_len = frames;
@@ -236,6 +318,19 @@ export async function replaceClipMedia(node, c) {
     ensureInputs(node);
     writeState(node);
     fixNodeSize(node);
+}
+
+// envelope points of the right half of a split: content shifts by `cut`
+// frames, so points before the cut stay with the left half and the rest
+// move with the right half
+function spliceEnv(env, cut) {
+    if (!Array.isArray(env)) return env;
+    const out = [];
+    for (const p of env) {
+        const f = Number(p[0]);
+        if (f >= cut) out.push([f - cut, Number(p[1])]);
+    }
+    return out;
 }
 
 export function splitAt(node) {
@@ -251,13 +346,31 @@ export function splitAt(node) {
     if (i < 0) return;
     const c = clips[i];
     const cut = f - Number(c.start);
-    const left = { ...c, len: cut };
+    const src = Number(c.src_start) || 0;
+    // each half becomes a brand-new file of its own window: source_end caps
+    // growth at the original window's end so a half can never reclaim the
+    // part the split cut off.
+    const left = {
+        ...c,
+        len: cut,
+        env: cloneEnv(c.env),
+        audio_env: cloneEnv(c.audio_env),
+        audio_len: Math.min(Number(c.audio_len ?? c.len ?? 22) || 1, cut),
+        source_end: src + cut,
+        src_floor: src,
+    };
     const right = {
         ...c,
         start: f,
         len: (Number(c.len) || 1) - cut,
-        src_start: (Number(c.src_start) || 0) + cut,
+        src_start: src + cut,
+        src_floor: src + cut,
         id: (clips.at(-1)?.id ?? 0) + 1,
+        env: spliceEnv(c.env, cut),
+        audio_env: spliceEnv(c.audio_env, cut),
+        audio_start: (Number(c.audio_start ?? c.start) || 1) + cut,
+        audio_len: Math.max(1, (Number(c.audio_len ?? c.len ?? 22) || 1) - cut),
+        source_end: src + (Number(c.len) || 1),
     };
     clips.splice(i, 1, left, right);
     writeState(node);

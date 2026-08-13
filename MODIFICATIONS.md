@@ -26,7 +26,7 @@ Adds an optional per-audio-slot strength control on top of the core's global `au
 
 1. **`patch_layout.py`** defines the ref payload key `motion_context_audio_strength`.
 2. **`patch_payload.py`** wraps `MiniMaxH3Model._cond_audio_rows` with `_patched_cond_audio_rows` (marked rows pinned exact, unmarked stock) and the forward wrapper flips weak audio blocks out of the layout on the audio schedule (`t_a`).
-3. **`nodes.py`** parses `"strengths"` from `audio_state`, clamps each to `0.05..1.0`, and rides the value on the ref dict. `_ensure_h3_runtime_patches()` now installs the layout, extra_conds, cond-audio rows, cond-video rows and forward patches.
+3. **`nodes.py`** parses `"strengths"` from `audio_state`, clamps each to `0.0..1.0`, and rides the value on the ref dict. `_ensure_h3_runtime_patches()` now installs the layout, extra_conds, cond-audio rows, cond-video rows and forward patches.
 4. **`js/h3_custom_audio.js`** adds per-slot `audio N strength` number widgets (non-serialized, kept in `audio_state`).
 
 All three runtime patches (layout, extra_conds, cond-audio) support adoption/takeover so the fork can coexist with the upstream `ComfyUI-H3-Motion-Context` package, which otherwise double-wraps `PackedLayout.__init__` and breaks the self-test.
@@ -53,7 +53,7 @@ to the model.
 - `s = 1.0` pins the clip exactly; `s = 0.9` almost the clip; `s = 0.5`
   half pinned / half free; `s = 0.1` a light early-structure hint.
 - **`patch_layout.py`** rides `motion_context_audio_strength` /
-  `motion_context_video_strength` (clamped `0.05..1.0`) on refs/keyframes,
+  `motion_context_video_strength` (clamped `0.0..1.0`) on refs/keyframes,
   untouched by the layout patch (identical `position_ids` with or without
   the keys).
 - **`patch_payload.py`**:
@@ -146,3 +146,47 @@ The example set also includes `Advanced Motion Context - Reference Images.json`,
 The custom example family also includes `Music Video Motion Context - Reference Images + Song.json`, a 15-slot visual-only Motion Context music-video template. It uses exact original-song slices as Ref2VA audio references while keeping recursive Motion Context audio disabled for long-run lip-sync stability.
 
 Each custom example workflow now embeds its matching Director Prompt note above Clip 1 so the prompting rules travel with the workflow itself.
+
+## Hard video injection (2026-08-13)
+
+Timeline and CustomVideo clips can be pinned exactly at sampling time instead
+of only hinted via keyframes: the aligned VAE-grid window's latent is clamped
+into the diffusion trajectory at the covered steps.
+
+- **`nodes.py`** `_hard_video_steps(vae, frames, ...)` encodes the whole
+  window as one video (head held-edge padded onto the model's 17-pixel
+  chunk grid), so every latent step maps exactly onto the model's token
+  grid. The encoder's global 3-token drop only reproduces the grid for
+  windows of 1 or 17k+2..17k+5 frames; anything else is refused by a
+  structural guard (logged, not injected) rather than pinned at the wrong
+  pixel. A step is injected when its span is more than half real window
+  pixels, and the last overlapping step is always injected so the window's
+  final content frame is sent even when its token extends past the window
+  (held-edge content). The Timeline node groups contiguous video clips
+  into one window so clip seams never show held-edge content; the covered
+  steps are `{"index", "latent"}` entries in the payload key
+  `minimax_hard_video` (written with `append=True`).
+- **`patch_payload.py`** `_patched_extra_conds` copies the
+  `minimax_hard_video` conditioning key into the `minimax_payload` dict
+  (comfy's stock `extra_conds` does not know the key, so without the copy
+  the steps were listed but never clamped). The existing forward wrapper
+  clamps `out[0]` at each pinned step to `(video_x - lat) / sigma`. The
+  flow sampler's CONST schedule forms the denoised estimate as
+  `x - out[0]*sigma`, so the estimate equals the pinned latent exactly;
+  cond and uncond passes see the same value, so pins can never regenerate.
+  Non-covered frames sample normally.
+- Constraint: a window whose first frame is off the 17-pixel boundary is
+  not injected at all (head-padded tokens have no real coverage and the
+  mid-chunk tokens cannot be recovered exactly by any standalone encode).
+
+## Strength envelope matches the token grid (2026-08-13)
+
+The editor now shows exactly what the model applies for video clips. The
+node samples a video block's strength once per latent token, and tokens are
+built from greedy VAE-grid runs (39, 22, 5, 1 frames; within a run the
+1,4,4,4,4 pattern gives offsets 0,1,5,9,13 + 17k). Envelope points on video
+blocks now snap to those token-start frames when added (double-click,
+right-click menu) or dragged, and the curve draws as a stepped per-token
+line instead of a smooth polyline — no more editing points the sampler
+never reads. Image clips and audio bands keep their true linear behavior
+(fine-grained tokens).

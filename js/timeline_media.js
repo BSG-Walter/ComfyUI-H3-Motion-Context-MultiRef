@@ -24,26 +24,6 @@ export function pickFile() {
     });
 }
 
-export function computePeaks(buf) {
-    const data = buf.getChannelData(0);
-    const n = 128;
-    const peaks = [];
-    const step = Math.max(1, Math.floor(data.length / n));
-    for (let i = 0; i < n; i++) {
-        const s = i * step;
-        const e = Math.min(data.length, s + step);
-        let mn = 1;
-        let mx = -1;
-        for (let j = s; j < e; j++) {
-            const v = data[j];
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
-        }
-        peaks.push((mn + mx) / 2, Math.max(0.02, mx - mn));
-    }
-    return peaks; // [mid, amp] pairs
-}
-
 export function redrawNode(node) {
     const w = node._h3TimelineWidget;
     if (w) w.redraw?.(node);
@@ -76,7 +56,6 @@ function decodeAudio(node, m) {
         })
         .then((decoded) => {
             m.buffer = decoded;
-            m.peaks = computePeaks(decoded);
             m.loaded = true;
             redrawNode(node);
         })
@@ -144,9 +123,13 @@ function thumbEl(node, c, m) {
     return t;
 }
 
-// source length in frames for any file-backed clip (video metadata or the
-// decoded audio buffer), Infinity while unknown so loading is non-blocking.
+// source length in frames for any file-backed clip: `source_end` (set by
+// split: an absolute source frame the clip's content may not pass, turning
+// each half into its own file) first, then video metadata or the decoded
+// audio buffer, Infinity while unknown so loading is non-blocking.
 export function sourceFrames(node, c) {
+    const end = Number(c?.source_end);
+    if (end > 0 && isFinite(end)) return end;
     const saved = Number(c?.source_len);
     if (saved > 0 && isFinite(saved)) return saved;
     const m = ensureMedia(node, c);

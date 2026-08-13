@@ -85,6 +85,64 @@ AUDIO_HZ = 40.0
 VIDEO_RUN_GRID = (39, 22, 5, 1)
 
 
+def _video_runs(n):
+    """Split n pixel frames into consecutive VAE-grid runs (greedy).
+
+    The video VAE only distinguishes run lengths on VIDEO_RUN_GRID; off-grid
+    lengths silently shift coverage to the head and drop the tail, so a
+    single encode would end before the clip does. Encoding the clip as
+    consecutive grid runs keeps every frame (one VAE call per run). Safe
+    because the encoder is causal: each run's latents depend only on its
+    own frames.
+    """
+    runs, rem = [], n
+    while rem > 0:
+        r = next(g for g in VIDEO_RUN_GRID if g <= rem)
+        runs.append(r)
+        rem -= r
+    return runs
+
+
+def _env_curve(env, flat):
+    """Normalize a clip's strength envelope to sorted [(frame, strength)].
+
+    Frames are content-relative (0 = first frame of the clip's window),
+    strengths clamped to [0.0, 1.0]. A clip without points collapses to a
+    flat curve at `flat`, and a leading implicit frame-0 point pins the
+    value before the first explicit point.
+    """
+    pts = []
+    for p in env or []:
+        try:
+            f = float(p[0])
+            s = float(p[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        pts.append((max(0.0, f), min(1.0, max(0.0, s))))
+    if not pts:
+        return [(0.0, 1.0 if flat is None
+                 else min(1.0, max(0.0, float(flat))))]
+    pts.sort(key=lambda t: t[0])
+    if pts[0][0] > 0.0:
+        pts.insert(0, (0.0, pts[0][1]))
+    return pts
+
+
+def _env_strength(pts, frame):
+    """Linear-interpolated strength at a content frame; end-clamped."""
+    if len(pts) == 1 or frame <= pts[0][0]:
+        return pts[0][1]
+    last = pts[-1]
+    if frame >= last[0]:
+        return last[1]
+    for (f0, s0), (f1, s1) in zip(pts, pts[1:]):
+        if f0 <= frame <= f1:
+            if f1 <= f0:
+                return s1
+            return s0 + (s1 - s0) * (frame - f0) / (f1 - f0)
+    return last[1]
+
+
 def _ensure_h3_runtime_patches():
     """Install the H3 patches on first execution of a node that needs them."""
     if not _apply_layout_patch():
@@ -123,6 +181,63 @@ def _step_offsets(latent_t):
     for k in range(latent_t):
         out.append(acc)
         acc += FRAME_PER_TOKEN[k % 5]
+    return out
+
+
+def _step_boundaries(frame_count):
+    """Cumulative pixel-grid: the pixel frame each latent step starts at."""
+    out, acc = [], 0
+    while acc < frame_count:
+        out.append(acc)
+        acc += FRAME_PER_TOKEN[len(out) % 5]
+    return out
+
+
+def _hard_video_steps(vae, frames, zero, want, width, height, crop,
+                      frame_count):
+    """VAE steps of a clip window for hard injection at sampling time
+    (patch_payload clamps the sampler output at those steps to this content,
+    so the generated video keeps the window's frames exactly instead of
+    merely hinting at them).
+
+    The whole window is encoded as one video, head held-edge padded onto the
+    model's 17-pixel chunk grid, so every latent step maps exactly onto the
+    model's token grid (the VAE's chunking is causal and 17-aligned). The
+    encoder's global 3-token drop only reproduces the grid for windows of
+    1 or 17k+2..17k+5 frames; anything else is refused (structural guard,
+    logged) rather than pinned at the wrong pixel. A step is injected when
+    its span is more than half real window pixels, and the last overlapping
+    step is always injected so the window's final content frame is sent even
+    when its token extends past the window (held-edge content).
+    """
+    hi = min(frame_count, zero + want)
+    if hi <= zero:
+        return []
+    pre = zero % 17
+    A = zero - pre
+    n_in = hi - A
+    head = frames[:1].expand(pre, *frames.shape[1:]) if pre else frames[:0]
+    win = torch.cat([head, frames[:hi - zero]], dim=0)
+    enc = vae.encode(_resize(win, width, height, crop))
+    steps = int(enc.shape[2])
+    if steps < 1 or _pixel_frames(steps - 1) >= n_in or \
+            _pixel_frames(steps) < n_in:
+        _LOG.warning(
+            "h3_motion_context: hard window of %d frames encodes off the "
+            "VAE grid (%d steps, %d pixels); not injected", n_in, steps,
+            _pixel_frames(steps) if steps else 0)
+        return []
+    B = _step_boundaries(frame_count)
+    t0 = B.index(A)  # a 17-multiple is always a grid boundary, t0 % 5 == 0
+    out = []
+    for k in range(steps):
+        a = A + _step_offsets(steps)[k]
+        b = a + FRAME_PER_TOKEN[(t0 + k) % 5]
+        real = min(hi, b) - max(zero, a)
+        if real <= 0:
+            continue
+        if real * 2 > b - a or k == steps - 1:
+            out.append({"index": t0 + k, "latent": enc[:, :, k:k + 1]})
     return out
 
 
@@ -179,17 +294,61 @@ def _load_image_file(media):
     return torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0)[None]
 
 
-def _load_media_file(media):
+def _resample_video_frames(collected_timed_frames, target_fps):
+    """Resample a list of (timestamp_seconds, frame_tensor) to target_fps."""
+    if not collected_timed_frames:
+        return None
+    if target_fps is None or target_fps <= 0:
+        return torch.stack([item[1] for item in collected_timed_frames])
+
+    times = [item[0] for item in collected_timed_frames]
+    frames = [item[1] for item in collected_timed_frames]
+
+    if len(frames) == 1 or times[-1] <= times[0]:
+        return torch.stack(frames)
+
+    start_t = times[0]
+    end_t = times[-1]
+    duration = end_t - start_t
+    num_target = max(1, int(round(duration * target_fps)) + 1)
+
+    import bisect
+    resampled = []
+    dt = 1.0 / float(target_fps)
+    for i in range(num_target):
+        target_t = start_t + i * dt
+        if target_t > end_t + dt * 0.5:
+            break
+        pos = bisect.bisect_left(times, target_t)
+        if pos == 0:
+            best_idx = 0
+        elif pos >= len(times):
+            best_idx = len(times) - 1
+        else:
+            d_prev = abs(target_t - times[pos - 1])
+            d_next = abs(target_t - times[pos])
+            best_idx = pos - 1 if d_prev <= d_next else pos
+        resampled.append(frames[best_idx])
+
+    return torch.stack(resampled)
+
+
+def _load_media_file(media, fps=None):
     """Decode an uploaded audio/video file with PyAV.
 
     Returns {"frames": [B,H,W,C]|None, "audio": AUDIO dict|None}, decoding
     whatever streams the file actually has. A single demux pass feeds both
     decoders: PyAV's decode() discards packets of non-requested streams, so
     decoding one stream to EOF (or re-demuxing after EOF) drops the other.
+    When `fps` is supplied, video frames are resampled to that target frame rate.
     """
     frames, audio = None, None
     with av.open(_media_ref_path(media)) as af:
         streams = {s.type: s for s in af.streams}
+        vstream = streams.get("video")
+        vtimebase = float(vstream.time_base) if vstream and vstream.time_base is not None else None
+        vrate = float(vstream.average_rate) if vstream and vstream.average_rate else 24.0
+
         collected, chunks = [], []
         for packet in af.demux():
             stype = packet.stream.type if packet.stream is not None else None
@@ -198,8 +357,12 @@ def _load_media_file(media):
             if stype == "video":
                 for frame in packet.decode():
                     arr = frame.to_ndarray(format="rgb24")
-                    collected.append(torch.from_numpy(
-                        np.asarray(arr, dtype=np.float32) / 255.0))
+                    if frame.pts is not None and vtimebase is not None:
+                        t_sec = float(frame.pts * vtimebase)
+                    else:
+                        t_sec = float(len(collected) / vrate)
+                    collected.append((t_sec, torch.from_numpy(
+                        np.asarray(arr, dtype=np.float32) / 255.0)))
             elif stype == "audio":
                 n_channels = streams["audio"].channels
                 for frame in packet.decode():
@@ -208,7 +371,11 @@ def _load_media_file(media):
                         buf = buf.view(-1, n_channels).t()
                     chunks.append(buf)
         if collected:
-            frames = torch.stack(collected)
+            collected.sort(key=lambda item: item[0])
+            if fps is not None and fps > 0:
+                frames = _resample_video_frames(collected, fps)
+            else:
+                frames = torch.stack([item[1] for item in collected])
         if chunks:
             astream = streams["audio"]
             audio = {
@@ -403,17 +570,15 @@ class MiniMaxH3MotionContext:
                          available, n)
 
         if encode_mode == "video":
-            # snap down to the VAE grid BEFORE slicing, so the frames encoded
-            # are exactly the frames the latent steps will cover (see
-            # VIDEO_RUN_GRID). Slicing the last n and letting the VAE keep the
-            # first `covered` of them would pin a run ending before the clip
-            # does, and the join would jump by the difference.
-            run = next(g for g in VIDEO_RUN_GRID if g <= n)
-            if run != n:
-                _LOG.warning(
-                    "h3_motion_context: %d frames is off the VAE grid; pinning "
-                    "the last %d instead (usable runs: 1, 5, 22, 39)", n, run)
-            n = run
+            # split into VAE-grid runs BEFORE slicing: off-grid lengths make
+            # the VAE cover only the head of the input and drop the rest, so
+            # the run would end before the window does and the join would
+            # jump by the remainder (see VIDEO_RUN_GRID).
+            runs = _video_runs(n)
+            if len(runs) > 1:
+                _LOG.info(
+                    "h3_motion_context: %d context frames split into %d grid "
+                    "runs: %s", n, len(runs), runs)
 
         if n >= frame_count:
             raise ValueError(
@@ -425,28 +590,34 @@ class MiniMaxH3MotionContext:
         tail = _resize(context_frames[available - n:], width, height, crop)
 
         if encode_mode == "video":
-            # one call; the VAE reads the batch axis as time and compresses
-            enc = vae.encode(tail)
-            if getattr(enc, "ndim", 0) != 5:
-                raise ValueError(
-                    "h3_motion_context: video-mode encode returned shape %s, "
-                    "expected [B,C,T,H,W]. Try encode_mode=frames."
-                    % (tuple(getattr(enc, "shape", ())),))
-            steps = int(enc.shape[2])
-            offsets = _step_offsets(steps)
-            covered = _pixel_frames(steps)
-            if covered != n:
-                # n was snapped to the grid above, so a mismatch here means
-                # the VAE's downscale formula changed underneath us and the
-                # pinned content no longer lines up with the positions we
-                # would write. Refuse rather than render a shifted join.
-                raise RuntimeError(
-                    "h3_motion_context: %d frames encoded to %d latent steps "
-                    "covering %d frames; the VAE grid no longer matches "
-                    "VIDEO_RUN_GRID. Upstream VAE change, refusing to run."
-                    % (n, steps, covered))
-            blocks = [enc[:, :, k:k + 1] for k in range(steps)]
-            span = covered
+            # one call per grid run; the VAE reads the batch axis as time
+            blocks, offsets, run_acc = [], [], 0
+            for run in runs:
+                enc = vae.encode(tail[run_acc:run_acc + run])
+                if getattr(enc, "ndim", 0) != 5:
+                    raise ValueError(
+                        "h3_motion_context: video-mode encode returned shape %s, "
+                        "expected [B,C,T,H,W]. Try encode_mode=frames."
+                        % (tuple(getattr(enc, "shape", ())),))
+                steps = int(enc.shape[2])
+                covered = _pixel_frames(steps)
+                if covered != run:
+                    # run was snapped to the grid above, so a mismatch here
+                    # means the VAE's downscale formula changed underneath us
+                    # and the pinned content no longer lines up with the
+                    # positions we would write. Refuse rather than render a
+                    # shifted join.
+                    raise RuntimeError(
+                        "h3_motion_context: %d frames encoded to %d latent "
+                        "steps covering %d frames; the VAE grid no longer "
+                        "matches VIDEO_RUN_GRID. Upstream VAE change, "
+                        "refusing to run."
+                        % (run, steps, covered))
+                offsets.extend(
+                    run_acc + o for o in _step_offsets(steps))
+                blocks.extend(enc[:, :, k:k + 1] for k in range(steps))
+                run_acc += run
+            span = n
         else:
             blocks, offsets = [], []
             for i in range(n):
@@ -898,7 +1069,7 @@ class _DynamicInputs(dict):
 class MiniMaxH3CustomKeyframes:
     """Attach still-image H3 keyframes at arbitrary timeline positions.
 
-    Each slot has a strength ("keyframe N strength") between 0.05 and 1.0
+    Each slot has a strength ("keyframe N strength") between 0.0 and 1.0
     that sets how much of the run the image stays pinned: the rows are
     pinned EXACT (clean, under the canonical 0.999 claim) while the video
     schedule's progress stays below the strength, then the block's tokens
@@ -1012,7 +1183,7 @@ class MiniMaxH3CustomKeyframes:
             )
         if len(strengths) < count:
             strengths = [1.0] * count
-        strengths = [min(1.0, max(0.05, float(s)))
+        strengths = [min(1.0, max(0.0, float(s)))
                      for s in strengths[:count]]
 
         video = _video_from_latent(latent)
@@ -1143,7 +1314,7 @@ class MiniMaxH3CustomAudio:
     align=start: the audio block STARTS at the chosen frame. Sound from that
                 instant on is pinned, the model leads into it.
 
-    Each slot has a strength ("audio N strength") between 0.05 and 1.0 that
+    Each slot has a strength ("audio N strength") between 0.0 and 1.0 that
     sets how much of the clip stays pinned: the rows are pinned EXACT (clean,
     no noise) while the audio schedule's progress stays below the strength,
     then the block's tokens are dropped from the layout and the model's own
@@ -1265,7 +1436,7 @@ class MiniMaxH3CustomAudio:
         if len(strengths) < count:
             strengths = [1.0] * count
         strengths = [
-            min(1.0, max(0.05, float(s)))
+            min(1.0, max(0.0, float(s)))
             for s in strengths[:count]
         ]
 
@@ -1379,7 +1550,7 @@ class MiniMaxH3CustomVideo:
     windowed to that clip's duration (a longer track is cut from its start)
     and end-aligned with the clip's last frame.
 
-    Each slot has a strength ("video N strength") between 0.05 and 1.0 that
+    Each slot has a strength ("video N strength") between 0.0 and 1.0 that
     sets how much of the clip stays pinned: the clip is pinned EXACT (clean
     rows under the canonical 0.999 claim) for the first `strength`-fraction
     of the run, then its tokens are dropped from the layout and the model's
@@ -1459,7 +1630,7 @@ class MiniMaxH3CustomVideo:
                 "positions" % (count, len(positions)))
         if len(strengths) < count:
             strengths = [1.0] * count
-        strengths = [min(1.0, max(0.05, float(s)))
+        strengths = [min(1.0, max(0.0, float(s)))
                      for s in strengths[:count]]
 
         target = _video_from_latent(latent)
@@ -1467,7 +1638,7 @@ class MiniMaxH3CustomVideo:
         height = int(target.shape[3]) * 16
         frame_count = _pixel_frames(int(target.shape[2]))
 
-        keyframes = []
+        keyframes, hard = [], []
         audio_refs = []
         infos = []
         for slot in range(1, count + 1):
@@ -1485,37 +1656,42 @@ class MiniMaxH3CustomVideo:
                     "[B,H,W,C]" % slot)
 
             n = int(video.shape[0])
-            run = next(g for g in VIDEO_RUN_GRID if g <= n)
-            if run != n:
-                _LOG.warning(
-                    "h3_motion_context: video %d has %d frames, off the VAE "
-                    "grid; pinning the first %d (usable runs: 1, 5, 22, 39)",
-                    slot, n, run)
+            runs = _video_runs(n)
+            if len(runs) > 1:
+                _LOG.info(
+                    "h3_motion_context: video %d split into %d grid runs: %s",
+                    slot, len(runs), runs)
 
-            if zero_based < 0 or zero_based + run > frame_count:
+            if zero_based < 0 or zero_based + n > frame_count:
                 raise ValueError(
                     "h3_motion_context: video %d does not fit: %d frames "
                     "starting at position %d in a %d frame clip"
-                    % (slot, run, raw_position, frame_count))
-
-            enc = vae.encode(_resize(video[:run], width, height, crop))
-            steps = int(enc.shape[2])
-            if _pixel_frames(steps) != run:
-                raise RuntimeError(
-                    "h3_motion_context: video %d encoded %d frames to %d "
-                    "latent steps; the VAE grid no longer matches "
-                    "VIDEO_RUN_GRID. Upstream VAE change, refusing to run."
-                    % (slot, run, steps))
+                    % (slot, n, raw_position, frame_count))
 
             strength = strengths[slot - 1]
-            offsets = _step_offsets(steps)
-            for k, off in enumerate(offsets):
-                keyframes.append({
-                    "resolved_frame_index": 0,
-                    MC_KEY: zero_based + off,
-                    MC_VIDEO_STRENGTH: strength,
-                    "latent": enc[:, :, k:k + 1],
-                })
+            run_acc = 0
+            for run in runs:
+                enc = vae.encode(_resize(
+                    video[run_acc:run_acc + run], width, height, crop))
+                steps = int(enc.shape[2])
+                if _pixel_frames(steps) != run:
+                    raise RuntimeError(
+                        "h3_motion_context: video %d encoded %d frames to %d "
+                        "latent steps; the VAE grid no longer matches "
+                        "VIDEO_RUN_GRID. Upstream VAE change, refusing to run."
+                        % (slot, run, steps))
+                offsets = _step_offsets(steps)
+                for k, off in enumerate(offsets):
+                    keyframes.append({
+                        "resolved_frame_index": 0,
+                        MC_KEY: zero_based + run_acc + off,
+                        MC_VIDEO_STRENGTH: strength,
+                        "latent": enc[:, :, k:k + 1],
+                    })
+                run_acc += run
+
+            hard.extend(_hard_video_steps(
+                vae, video, zero_based, n, width, height, crop, frame_count))
 
             audio_info = "off"
             audio = kwargs.get("video_audio_%d" % slot)
@@ -1525,33 +1701,36 @@ class MiniMaxH3CustomVideo:
                         "h3_motion_context: video %d has an audio track but "
                         "no audio_vae. Wire the H3 audio VAE." % slot)
                 audio_latent, ref_audio_t = _encode_audio_window(
-                    audio_vae, audio, run / float(FPS), tail=False)
+                    audio_vae, audio, n / float(FPS), tail=False)
                 # end-aligned with this video's last frame: the block ends
-                # at 1-based frame zero_based + run
+                # at 1-based frame zero_based + n
                 audio_refs.append({
                     "kind": "audio",
                     "ref_audio_t": ref_audio_t,
                     "audio_latent": audio_latent,
-                    MC_AUDIO_KEY: float(zero_based + run),
+                    MC_AUDIO_KEY: float(zero_based + n),
                     MC_AUDIO_STRENGTH: strength,
                 })
                 audio_info = "%d latent steps" % ref_audio_t
 
-            infos.append((slot, zero_based, zero_based + run - 1, run,
+            infos.append((slot, zero_based, zero_based + n - 1, n,
                           audio_info))
 
         out = node_helpers.conditioning_set_values(conditioning, {
             "minimax_keyframes": keyframes,
             "minimax_frame_count": frame_count,
         })
+        if hard:
+            out = node_helpers.conditioning_set_values(
+                out, {"minimax_hard_video": hard}, append=True)
         if audio_refs:
             out = node_helpers.conditioning_set_values(
                 out, {"minimax_refs": audio_refs}, append=True)
 
         _LOG.info(
-            "h3_motion_context: Custom Video pinned %d clips (%d cond blocks "
-            "total) in a %d-frame clip: %s",
-            count, len(keyframes), frame_count,
+            "h3_motion_context: Custom Video pinned %d clips (%d cond blocks, "
+            "%d hard-injected steps) in a %d-frame clip: %s",
+            count, len(keyframes), len(hard), frame_count,
             ", ".join("video %d = %d frames at %d..%d, audio %s"
                       % (slot, run, start, end, ai)
                       for slot, start, end, run, ai in infos),
@@ -1577,7 +1756,11 @@ class MiniMaxH3Timeline:
     fit the target clip. Audio windows are contextual: out-of-range starts
     are parked at the last frame with a warning, never raised. Per-clip
     strength rides MC_VIDEO_STRENGTH / MC_AUDIO_STRENGTH exactly like the
-    per-type custom nodes.
+    per-type custom nodes. An optional per-clip strength envelope
+    (`env: [[content_frame, strength], ...]`, frames relative to the clip
+    window) overrides the flat strength frame by frame: video keyframes
+    sample it per latent step, audio windows are split into one ref per
+    segment at its breakpoints.
     """
 
     MAX_CLIPS = 32
@@ -1617,7 +1800,7 @@ class MiniMaxH3Timeline:
                                "trimming. When connected, drives the node; "
                                "otherwise the UI widget sets it."}),
                 total_frames=("INT", {
-                    "default": 240, "min": 1, "max": 100000, "step": 10,
+                    "default": 240, "min": 1, "max": 100000, "step": 1,
                     "tooltip": "Override the total frame count (ruler length). "
                                "When connected, drives the node; otherwise "
                                "the UI widget sets it."}),
@@ -1634,8 +1817,16 @@ class MiniMaxH3Timeline:
 
     @staticmethod
     def _audio_ref(audio_vae, audio, idx, strength, a_start, a_len, align,
-                   fps=FPS):
-        """Build one timeline audio ref ending at frame a_start + a_len."""
+                   fps=FPS, env=None):
+        """Build the audio refs for one clip window.
+
+        Like video keyframes, a strength envelope is sampled per latent step
+        (linear interpolation between points), giving one back-to-back ref
+        per step with that step's own strength. A flat envelope (no points
+        or a constant curve) still yields the single stock ref so the common
+        case costs nothing. Returns a list so callers can `extend`
+        unconditionally.
+        """
         if audio_vae is None:
             raise ValueError(
                 "h3_motion_context: clip %d has audio but no audio_vae. "
@@ -1651,13 +1842,36 @@ class MiniMaxH3Timeline:
             raise ValueError(
                 "h3_motion_context: clip %d audio encoded to zero latent "
                 "steps" % idx)
-        return {
-            "kind": "audio",
-            "ref_audio_t": rt,
-            "audio_latent": z,
-            MC_AUDIO_KEY: float(a_start - 1 + a_len),
-            MC_AUDIO_STRENGTH: strength,
-        }
+        pts = _env_curve(env, strength)
+        if rt < 2:
+            return [{
+                "kind": "audio",
+                "ref_audio_t": rt,
+                "audio_latent": z,
+                MC_AUDIO_KEY: float(a_start - 1 + a_len),
+                MC_AUDIO_STRENGTH: _env_strength(pts, 0.0),
+            }]
+        strengths = [_env_strength(pts, a_len * k / float(rt))
+                     for k in range(rt)]
+        if len(set(strengths)) == 1:
+            return [{
+                "kind": "audio",
+                "ref_audio_t": rt,
+                "audio_latent": z,
+                MC_AUDIO_KEY: float(a_start - 1 + a_len),
+                MC_AUDIO_STRENGTH: strengths[0],
+            }]
+        refs = []
+        for k in range(rt):
+            f1 = a_len * (k + 1) / float(rt)
+            refs.append({
+                "kind": "audio",
+                "ref_audio_t": 1,
+                "audio_latent": z[:, :, :, k:k + 1],
+                MC_AUDIO_KEY: float(a_start - 1 + f1),
+                MC_AUDIO_STRENGTH: strengths[k],
+            })
+        return refs
 
     @staticmethod
     def _fit_audio(start, length, frame_count, idx):
@@ -1710,6 +1924,8 @@ class MiniMaxH3Timeline:
         frame_count = _pixel_frames(int(target.shape[2]))
 
         keyframes, refs = [], []
+        hard = []
+        video_blocks = []
         infos = []
         for idx, clip in enumerate(clips, 1):
             slot = int(clip.get("id") or idx)
@@ -1723,7 +1939,9 @@ class MiniMaxH3Timeline:
                 raise ValueError(
                     "h3_motion_context: timeline clip %d start %d is below 1"
                     % (idx, start))
-            strength = min(1.0, max(0.05, float(clip.get("strength") or 1.0)))
+            sv = clip.get("strength")
+            strength = min(1.0, max(0.0, float(
+                sv if sv is not None else 1.0)))
             zero = start - 1
 
             if kind == "video":
@@ -1732,18 +1950,35 @@ class MiniMaxH3Timeline:
                 src_start = max(0, int(clip.get("src_start") or 0))
                 fmedia = clip.get("file")
                 if fmedia:
-                    data = _load_media_file(fmedia)
+                    data = _load_media_file(fmedia, fps=fps)
                     frames = data["frames"]
                     if frames is None:
                         raise ValueError(
                             "h3_motion_context: video clip %d file %r has no "
                             "video stream"
                             % (idx, fmedia.get("name")))
+                    if src_start >= int(frames.shape[0]):
+                        _LOG.warning(
+                            "h3_motion_context: video clip %d src_start %d "
+                            "past the %d frame file; holding the last frame",
+                            idx, src_start, int(frames.shape[0]))
+                        src_start = max(0, int(frames.shape[0]) - 1)
                     frames = frames[src_start:]
                     if audio is None and not clip.get("audio_off") \
                             and data["audio"] is not None:
                         audio = _slice_audio(
                             data["audio"], src_start / float(fps))
+                elif frames is not None and src_start > 0:
+                    if src_start >= int(frames.shape[0]):
+                        _LOG.warning(
+                            "h3_motion_context: video clip %d src_start %d "
+                            "past the %d frame input; holding the last frame",
+                            idx, src_start, int(frames.shape[0]))
+                        src_start = max(0, int(frames.shape[0]) - 1)
+                    frames = frames[src_start:]
+                    if audio is not None and not clip.get("audio_off"):
+                        audio = _slice_audio(
+                            audio, src_start / float(fps))
                 if frames is None:
                     raise ValueError(
                         "h3_motion_context: video clip %d has no frames "
@@ -1754,74 +1989,110 @@ class MiniMaxH3Timeline:
                         "frames [B,H,W,C]" % idx)
                 want = min(max(1, int(clip.get("len") or 22)),
                            int(frames.shape[0]))
-                run = next(g for g in VIDEO_RUN_GRID if g <= want)
-                if run != want:
-                    _LOG.warning(
-                        "h3_motion_context: video clip %d wants %d frames, "
-                        "off the VAE grid; pinning the first %d (usable "
-                        "runs: 1, 5, 22, 39)", idx, want, run)
-                if zero + run > frame_count:
-                    if run > frame_count:
+                runs = _video_runs(want)
+                if len(runs) > 1:
+                    _LOG.info(
+                        "h3_motion_context: video clip %d split into %d grid "
+                        "runs: %s", idx, len(runs), runs)
+                if zero + want > frame_count:
+                    if want >= frame_count:
                         _LOG.warning(
                             "h3_motion_context: video clip %d needs %d "
                             "frames, more than the %d frame clip; skipped",
-                            idx, run, frame_count)
+                            idx, want, frame_count)
                         continue
                     _LOG.warning(
                         "h3_motion_context: video clip %d at frame %d does "
                         "not fit in the %d frame clip; parked at frame %d",
-                        idx, start, frame_count, frame_count - run + 1)
-                    zero = frame_count - run
+                        idx, start, frame_count, frame_count - want + 1)
+                    zero = frame_count - want
                     start = zero + 1
-                enc = vae.encode(_resize(frames[:run], width, height, crop))
-                steps = int(enc.shape[2])
-                if _pixel_frames(steps) != run:
-                    raise RuntimeError(
-                        "h3_motion_context: video clip %d encoded %d frames "
-                        "to %d latent steps; the VAE grid no longer matches "
-                        "VIDEO_RUN_GRID. Upstream VAE change, refusing to run."
-                        % (idx, run, steps))
-                for k, off in enumerate(_step_offsets(steps)):
-                    keyframes.append({
-                        "resolved_frame_index": 0,
-                        MC_KEY: zero + off,
-                        MC_VIDEO_STRENGTH: strength,
-                        "latent": enc[:, :, k:k + 1],
-                    })
+                vpts = _env_curve(clip.get("env"), strength)
+                run_acc = 0
+                for run in runs:
+                    enc = vae.encode(_resize(
+                        frames[run_acc:run_acc + run], width, height, crop))
+                    steps = int(enc.shape[2])
+                    if _pixel_frames(steps) != run:
+                        raise RuntimeError(
+                            "h3_motion_context: video clip %d encoded %d "
+                            "frames to %d latent steps; the VAE grid no "
+                            "longer matches VIDEO_RUN_GRID. Upstream VAE "
+                            "change, refusing to run."
+                            % (idx, run, steps))
+                    for k, off in enumerate(_step_offsets(steps)):
+                        keyframes.append({
+                            "resolved_frame_index": 0,
+                            MC_KEY: zero + run_acc + off,
+                            MC_VIDEO_STRENGTH: _env_strength(
+                                vpts, run_acc + off),
+                            "latent": enc[:, :, k:k + 1],
+                        })
+                    run_acc += run
+
+                video_blocks.append((zero, want, frames[:want]))
 
                 # audio is the input or the file-derived fallback above;
                 # re-reading the kwarg here would drop the file's track
                 if audio is not None and not clip.get("audio_off"):
                     if clip.get("audio_link", True):
-                        a_start, a_len, align = start, run, "head"
+                        a_start, a_len, align = start, want, "head"
                     else:
                         a_start, a_len = self._fit_audio(
                             clip.get("audio_start") or start,
-                            clip.get("audio_len") or run,
+                            clip.get("audio_len") or want,
                             frame_count, idx)
                         align = clip.get("audio_align", "head")
-                    refs.append(self._audio_ref(
-                        audio_vae, audio, idx, strength,
-                        a_start, a_len, align, fps=fps))
+                        # an unlinked band froze its own slice of the file at
+                        # unlink time (audio_src_start); slice at that offset,
+                        # not the video's current src_start, so trims to the
+                        # video no longer move the band's sound.
+                        asrc = clip.get("audio_src_start")
+                        if fmedia and asrc is not None:
+                            audio = _slice_audio(
+                                data["audio"], float(asrc) / float(fps))
+                    ast = clip.get("audio_strength")
+                    aenv = clip.get("audio_env")
+                    if aenv is None:
+                        aenv = clip.get("env")
+                    refs.extend(self._audio_ref(
+                        audio_vae, audio, idx,
+                        float(ast if ast is not None else strength),
+                        a_start, a_len, align, fps=fps,
+                        env=aenv))
                     link = "linked" if clip.get("audio_link", True) else \
                         "unlinked"
                     infos.append(
-                        "clip %d: video %d..%d + audio %d..%d (%s)"
-                        % (idx, zero + 1, zero + run, a_start,
+                        "clip %d: video %d..%d (src_start=%d) + audio %d..%d (%s)"
+                        % (idx, zero + 1, zero + want, src_start, a_start,
                            a_start + a_len - 1, link))
                 else:
                     infos.append(
-                        "clip %d: video %d..%d, silent"
-                        % (idx, zero + 1, zero + run))
+                        "clip %d: video %d..%d (src_start=%d), silent"
+                        % (idx, zero + 1, zero + want, src_start))
 
             elif kind == "image":
-                if zero >= frame_count:
-                    _LOG.warning(
-                        "h3_motion_context: image clip %d at frame %d is "
-                        "beyond the %d frame clip; parked at the last frame",
-                        idx, start, frame_count)
-                    zero = frame_count - 1
-                    start = frame_count
+                want = max(1, int(clip.get("len") or 1))
+                steps = 1
+                while _pixel_frames(steps) < want:
+                    steps += 1
+                cover = _pixel_frames(steps)
+                if zero >= frame_count or zero + cover > frame_count:
+                    if cover >= frame_count:
+                        _LOG.warning(
+                            "h3_motion_context: image clip %d stretched to %d "
+                            "frames; holding it over the whole %d frame clip",
+                            idx, want, frame_count)
+                        zero = 0
+                    else:
+                        _LOG.warning(
+                            "h3_motion_context: image clip %d at frame %d "
+                            "does not fit with %d frames in the %d frame "
+                            "clip; parked at frame %d",
+                            idx, start, cover, frame_count,
+                            frame_count - cover + 1)
+                        zero = frame_count - cover
+                    start = zero + 1
                 image = kwargs.get("image_%d" % slot)
                 fmedia = clip.get("file")
                 if fmedia:
@@ -1842,13 +2113,22 @@ class MiniMaxH3Timeline:
                         "h3_motion_context: image clip %d encoded to %s; "
                         "expected one H3 still latent [B,C,1,H,W]"
                         % (idx, tuple(getattr(encoded, "shape", ()))))
-                keyframes.append({
-                    "resolved_frame_index": 0,
-                    MC_KEY: zero,
-                    MC_VIDEO_STRENGTH: strength,
-                    "latent": encoded,
-                })
-                infos.append("clip %d: image at frame %d" % (idx, start))
+                if cover != want:
+                    _LOG.warning(
+                        "h3_motion_context: image clip %d stretched to %d "
+                        "frames, off the latent grid; holding it over %d "
+                        "frames", idx, want, cover)
+                enc = encoded.repeat(1, 1, steps, 1, 1)
+                vpts = _env_curve(clip.get("env"), strength)
+                for k, off in enumerate(_step_offsets(steps)):
+                    keyframes.append({
+                        "resolved_frame_index": 0,
+                        MC_KEY: zero + off,
+                        MC_VIDEO_STRENGTH: _env_strength(vpts, off),
+                        "latent": enc[:, :, k:k + 1],
+                    })
+                infos.append("clip %d: image at frame %d, held %d frames"
+                             % (idx, start, cover))
 
             else:  # audio
                 if audio_vae is None:
@@ -1858,6 +2138,7 @@ class MiniMaxH3Timeline:
                 a_start, a_len = self._fit_audio(
                     start, clip.get("len") or 22, frame_count, idx)
                 audio = kwargs.get("audio_%d" % slot)
+                src_start = max(0, int(clip.get("src_start") or 0))
                 fmedia = clip.get("file")
                 if fmedia:
                     data = _load_media_file(fmedia)
@@ -1869,16 +2150,42 @@ class MiniMaxH3Timeline:
                             % (idx, fmedia.get("name")))
                     audio = _slice_audio(
                         audio,
-                        max(0, int(clip.get("src_start") or 0)) / float(fps))
+                        src_start / float(fps))
+                elif audio is not None and src_start > 0:
+                    audio = _slice_audio(
+                        audio,
+                        src_start / float(fps))
                 if audio is None:
                     raise ValueError(
                         "h3_motion_context: audio clip %d has no clip "
                         "connected" % idx)
-                refs.append(self._audio_ref(
+                refs.extend(self._audio_ref(
                     audio_vae, audio, idx, strength,
-                    a_start, a_len, clip.get("align", "head"), fps=fps))
+                    a_start, a_len, clip.get("align", "head"), fps=fps,
+                    env=clip.get("env")))
                 infos.append("clip %d: audio %d..%d"
                              % (idx, a_start, a_start + a_len - 1))
+
+        # hard-inject each maximal run of contiguous video content as one
+        # window: the encode is chunk-aligned and exact only when the whole
+        # block is encoded together, so clip seams never show held-edge
+        # content (a lone clip re-encodes its own window per call)
+        video_blocks.sort(key=lambda b: b[0])
+        group, group_end = [], None
+        for zero, want, frames in video_blocks:
+            if group and zero != group_end:
+                hard.extend(_hard_video_steps(
+                    vae, torch.cat([g[2] for g in group], dim=0),
+                    group[0][0], sum(g[1] for g in group), width, height,
+                    crop, frame_count))
+                group = []
+            group.append((zero, want, frames))
+            group_end = zero + want
+        if group:
+            hard.extend(_hard_video_steps(
+                vae, torch.cat([g[2] for g in group], dim=0),
+                group[0][0], sum(g[1] for g in group), width, height, crop,
+                frame_count))
 
         keyframes.sort(key=lambda kf: kf[MC_KEY])
         out = node_helpers.conditioning_set_values(conditioning, {
@@ -1888,11 +2195,15 @@ class MiniMaxH3Timeline:
         if refs:
             out = node_helpers.conditioning_set_values(
                 out, {"minimax_refs": refs}, append=True)
+        if hard:
+            out = node_helpers.conditioning_set_values(
+                out, {"minimax_hard_video": hard}, append=True)
 
         _LOG.info(
             "h3_motion_context: Timeline pinned %d cond blocks + %d audio "
-            "refs in a %d-frame clip: %s",
-            len(keyframes), len(refs), frame_count, "; ".join(infos))
+            "refs, %d hard-injected steps, in a %d-frame clip: %s",
+            len(keyframes), len(refs), len(hard), frame_count,
+            "; ".join(infos))
         return (out,)
 
 

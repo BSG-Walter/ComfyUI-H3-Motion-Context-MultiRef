@@ -32,8 +32,9 @@ n, pl = pkg.nodes, pkg.patch_layout
 
 class FakeVideoVAE:
     def encode(self, pix):
-        # real H3 video VAE: 1 frame -> 1 still step, 5 frames -> 2 steps
-        steps = 1 if pix.shape[0] == 1 else 2
+        # real H3 video VAE: 1 frame -> 1 step, else ceil(n/17)*5-3
+        n = pix.shape[0]
+        steps = 1 if n == 1 else (n + 16) // 17 * 5 - 3
         return torch.zeros(pix.shape[0], 4, steps, 2, 2)
 
 
@@ -125,6 +126,39 @@ assert torch.allclose(w1[0], head(src0, want1))
 print("mixed timeline OK: image + linked video + audio clip")
 
 
+# --- the video's audio band has its own strength and envelope ---
+avb = AudioVAE()
+state = '{"clips":[{"id":1,"kind":"video","start":10,"len":22,' \
+        '"audio_link":true,"strength":0.9,' \
+        '"audio_strength":0.3,"audio_env":[[0,0.2],[10,1.0]]}]}'
+cond = run(state, avb, vae=FakeVideoVAE(),
+           video_1=torch.rand(5, 12, 12, 3), video_audio_1=audio())
+assert all(kf[pl.MC_VIDEO_STRENGTH] == 0.9
+           for kf in cond["minimax_keyframes"])  # video untouched
+refs = cond["minimax_refs"]
+assert len(refs) == 12, len(refs)  # band env has points -> per-step refs
+assert all(r["ref_audio_t"] == 1 for r in refs)
+assert refs[0][pl.MC_AUDIO_STRENGTH] == 0.2, \
+    refs[0][pl.MC_AUDIO_STRENGTH]
+assert abs(refs[11][pl.MC_AUDIO_STRENGTH] - 17 / 30.0) < 1e-9
+print("video audio band OK: own strength + envelope, video untouched")
+
+
+# --- strength 0 is allowed: prompt-only from the start ---
+cond = run('{"clips":[{"id":1,"kind":"image","start":1,' \
+           '"len":22,"strength":0,"env":[[0,0]]}]}',
+           AudioVAE(), vae=FakeVideoVAE(),
+           image_1=torch.rand(1, 12, 12, 3))
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 7
+assert all(kf[pl.MC_VIDEO_STRENGTH] == 0.0 for kf in kfs)
+cond = run('{"clips":[{"id":1,"kind":"audio","start":1,"len":5,' \
+           '"strength":0}]}', AudioVAE(), vae=FakeVideoVAE(),
+           audio_1=audio())
+assert cond["minimax_refs"][0][pl.MC_AUDIO_STRENGTH] == 0.0
+print("zero strength OK: flat and envelope at 0")
+
+
 # --- unlinked video audio: independent position/length, tail window ---
 av2 = AudioVAE()
 state = '{"clips":[' \
@@ -169,6 +203,53 @@ assert len(cond["minimax_refs"]) == 2
 print("timeline stable clip ids OK")
 
 
+# --- strength envelope: per-frame video strengths + per-step audio ---
+av5 = AudioVAE()
+state = '{"clips":[' \
+        '{"id":1,"kind":"video","start":10,"len":22,"audio_link":true,' \
+        '"env":[[0,0.2],[10,1.0]],"strength":0.7},' \
+        '{"id":2,"kind":"audio","start":60,"len":22,' \
+        '"env":[[0,1.0],[11,0.5],[21,0.2]]}]}'
+cond = run(state, av5, vae=FakeVideoVAE(),
+           video_1=torch.rand(5, 12, 12, 3), video_audio_1=audio(),
+           audio_2=audio())
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 2, len(kfs)
+s0, s1 = kfs[0][pl.MC_VIDEO_STRENGTH], kfs[1][pl.MC_VIDEO_STRENGTH]
+assert s0 == 0.2, s0  # step 0 at pixel offset 0
+assert abs(s1 - 0.28) < 1e-9, s1  # step 1 at offset 1, ramping 0.2 -> 1.0 over 10 frames
+refs = cond["minimax_refs"]
+# both audio windows have varying envelopes, so every ref is one latent
+# step with its own linearly interpolated strength (like video keyframes)
+assert len(refs) == 24, len(refs)
+assert all(r["ref_audio_t"] == 1 for r in refs), \
+    [r["ref_audio_t"] for r in refs]
+va, seg = refs[:12], refs[12:]
+assert va[0][pl.MC_AUDIO_STRENGTH] == 0.2
+assert abs(va[11][pl.MC_AUDIO_STRENGTH] - 17 / 30.0) < 1e-9
+assert va[11][pl.MC_AUDIO_KEY] == 14.0, va[11][pl.MC_AUDIO_KEY]
+assert len([r[pl.MC_AUDIO_STRENGTH] for r in seg][:6]) == 6 and \
+    all(abs(a - b) < 1e-9 for a, b in
+        zip([r[pl.MC_AUDIO_STRENGTH] for r in seg][:6],
+            [1.0, 11 / 12.0, 5 / 6.0, 3 / 4.0, 2 / 3.0, 7 / 12.0])), \
+    [r[pl.MC_AUDIO_STRENGTH] for r in seg][:6]
+assert abs(seg[6][pl.MC_AUDIO_STRENGTH] - 0.5) < 1e-9  # exactly on the point
+assert abs(seg[11][pl.MC_AUDIO_STRENGTH] - 0.225) < 1e-9
+assert abs(seg[0][pl.MC_AUDIO_KEY] - (59 + 22 / 12.0)) < 1e-9
+assert seg[-1][pl.MC_AUDIO_KEY] == 81.0, seg[-1][pl.MC_AUDIO_KEY]
+# the window was encoded once, then sliced: exactly 2 encode calls total
+assert len(av5.windows) == 2, len(av5.windows)
+# a single-point envelope flattens the clip at that strength
+av6 = AudioVAE()
+state = '{"clips":[{"id":1,"kind":"video","start":4,"len":22,' \
+        '"env":[[7,0.3]]}]}'
+cond = run(state, av6, vae=FakeVideoVAE(),
+           video_1=torch.rand(5, 12, 12, 3))
+assert all(kf[pl.MC_VIDEO_STRENGTH] == 0.3
+           for kf in cond["minimax_keyframes"])
+print("strength envelope OK: per-frame video strengths + per-step audio")
+
+
 # --- out-of-range audio clamps with a warning, never raises ---
 av4 = AudioVAE()
 state = '{"clips":[{"id":1,"kind":"audio","start":200,"len":22}]}'
@@ -207,6 +288,42 @@ cond = run('{"clips":[{"id":1,"kind":"image","start":90}]}',
 assert len(cond["minimax_keyframes"]) == 1
 assert cond["minimax_keyframes"][0][pl.MC_KEY] == 84  # parked at last frame
 print("out-of-range image clamp OK")
+
+
+# --- stretched image: still broadcast + per-step envelope strengths ---
+state = '{"clips":[{"id":1,"kind":"image","start":10,"len":22,' \
+        '"env":[[0,0.2],[10,1.0]],"strength":0.7}]}'
+cond = run(state, AudioVAE(), vae=FakeVideoVAE(),
+           image_1=torch.rand(1, 12, 12, 3))
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 7, len(kfs)  # 22 frames -> 7 latent steps (1,4,4,4,4,1,4)
+assert [kf[pl.MC_KEY] for kf in kfs] == [9, 10, 14, 18, 22, 26, 27], \
+    [kf[pl.MC_KEY] for kf in kfs]
+ss = [kf[pl.MC_VIDEO_STRENGTH] for kf in kfs]
+assert ss[0] == 0.2 and abs(ss[1] - 0.28) < 1e-9 and ss[-1] == 1.0, ss
+print("stretched image OK: broadcast still + envelope strengths")
+
+
+# --- off-grid stretch covers a bit more; out-of-range parks the hold ---
+cond = run('{"clips":[{"id":1,"kind":"image","start":1,"len":6}]}',
+           AudioVAE(), vae=FakeVideoVAE(),
+           image_1=torch.rand(1, 12, 12, 3))
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 3, len(kfs)  # 6 frames -> 3 steps covering 9
+assert [kf[pl.MC_KEY] for kf in kfs] == [0, 1, 5]
+cond = run('{"clips":[{"id":1,"kind":"image","start":80,"len":22}]}',
+           AudioVAE(), vae=FakeVideoVAE(),
+           image_1=torch.rand(1, 12, 12, 3))
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 7, len(kfs)
+assert kfs[0][pl.MC_KEY] == 63, kfs[0][pl.MC_KEY]  # parked: 85 - 22
+cond = run('{"clips":[{"id":1,"kind":"image","start":1,"len":200}]}',
+           AudioVAE(), vae=FakeVideoVAE(),
+           image_1=torch.rand(1, 12, 12, 3))
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 59, len(kfs)  # 200 frames -> 59 steps
+assert kfs[0][pl.MC_KEY] == 0  # holds the whole clip, parked at frame 1
+print("off-grid/parked stretched image OK")
 
 
 # --- structural violations still raise ---
@@ -295,6 +412,18 @@ assert kfs[0][pl.MC_KEY] == 9 and kfs[1][pl.MC_KEY] == 10
 assert (cond.get("minimax_refs") or []) == []  # mp4 has no audio -> silent
 print("uploaded video file clip OK: src_start window, silent track")
 
+# src_start past the end of the source (trimmed beyond the file): clamps to
+# the last frame instead of crashing on an empty slice
+avv2 = AudioVAE()
+state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 10,
+                               "len": 5, "src_start": 99,
+                               "file": vid_media}]})
+cond = run(state, avv2, vae=FakeVideoVAE())
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 1, len(kfs)
+assert kfs[0][pl.MC_KEY] == 9, kfs[0][pl.MC_KEY]
+print("video file clip OK: src_start past the end holds the last frame")
+
 # video file WITH an audio track: the file's own sound becomes a ref with
 # no audio input connected
 import subprocess as _sp
@@ -328,6 +457,31 @@ assert len(refs) == 1, refs
 assert refs[0][pl.MC_AUDIO_KEY] == 44.0, refs[0][pl.MC_AUDIO_KEY]
 print("unlinked file band OK: separated audio injects at its own position")
 
+# unlinked band with a frozen source window: the band slices the file at
+# audio_src_start, never at the video's current src_start, so trimming the
+# video no longer moves the band's sound
+avb = AudioVAE()
+state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 10,
+                               "len": 5, "src_start": 32,
+                               "audio_link": False,
+                               "audio_start": 40, "audio_len": 5,
+                               "audio_src_start": 24,
+                               "file": avmp4}]})
+cond = run(state, avb, vae=FakeVideoVAE())
+refs = cond["minimax_refs"]
+assert len(refs) == 1, refs
+assert refs[0][pl.MC_AUDIO_KEY] == 44.0, refs[0][pl.MC_AUDIO_KEY]
+# the band's window must come from the file sliced at audio_src_start (24
+# frames = 1.0 s), never at the video's src_start (32 frames = 1.33 s)
+raw = n._load_media_file(avmp4)["audio"]
+want = int(round(5 / 24.0 * 16000))
+expect = head(n._slice_audio(raw, 24 / 24.0)["waveform"], want)
+wrong = head(n._slice_audio(raw, 32 / 24.0)["waveform"], want)
+w = avb.windows[0]
+assert torch.allclose(w[0], expect), "band not sliced at audio_src_start"
+assert not torch.allclose(w[0], wrong), "band followed the video's src_start"
+print("unlinked band OK: frozen audio_src_start slices its own file window")
+
 # audio_off also suppresses the file's own sound
 avo2 = AudioVAE()
 state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 4,
@@ -337,6 +491,44 @@ cond = run(state, avo2, vae=FakeVideoVAE())
 assert len(cond["minimax_keyframes"]) == 2
 assert (cond.get("minimax_refs") or []) == []
 print("audio_off file video OK: file sound suppressed")
+
+# off-grid video lengths split into consecutive grid runs: 36 = 22+5+5+1+
+# 1+1+1, every frame 0..35 covered, no silent tail-drop
+avs = AudioVAE()
+state = json.dumps({"clips": [{"id": 1, "kind": "video", "start": 1,
+                               "len": 36, "audio_link": False}]})
+cond = run(state, avs, vae=FakeVideoVAE(),
+           video_1=torch.rand(36, 12, 12, 3))
+kfs = cond["minimax_keyframes"]
+assert len(kfs) == 15, len(kfs)  # 7 + 2 + 2 + 1 + 1 + 1 + 1 steps
+assert sorted(kf[pl.MC_KEY] for kf in kfs) == \
+    [0, 1, 5, 9, 13, 17, 18, 22, 23, 27, 28, 32, 33, 34, 35]
+assert all(kf[pl.MC_VIDEO_STRENGTH] == 1.0 for kf in kfs)
+# the same clip is hard-injected: the whole 36-frame window is chunk-aligned
+# (36 = 17*2+2), so every token of it pins exactly, pixels 0..35, and the
+# last token (span [35,39)) is kept even though it is mostly held-edge so
+# the clip's final frame is sent
+hard = cond.get("minimax_hard_video") or []
+assert [h["index"] for h in hard] == list(range(12)), \
+    [h["index"] for h in hard]
+print("video grid split OK: 36 frames -> runs 22+5+5+1+1+1+1, "
+      "full coverage")
+
+# two contiguous video clips (1..19 and 20..36) are hard-injected as ONE
+# block: a single chunk-aligned window encodes to 12 exact tokens covering
+# both clips, with no held-edge seam at the clip boundary
+avt = AudioVAE()
+state = json.dumps({"clips": [
+    {"id": 1, "kind": "video", "start": 1, "len": 19, "audio_link": False},
+    {"id": 2, "kind": "video", "start": 20, "len": 17, "audio_link": False},
+]})
+cond = run(state, avt, vae=FakeVideoVAE(),
+           video_1=torch.rand(19, 12, 12, 3),
+           video_2=torch.rand(17, 12, 12, 3))
+hard = cond.get("minimax_hard_video") or []
+assert [h["index"] for h in hard] == list(range(12)), \
+    [h["index"] for h in hard]
+print("contiguous clips OK: 19+17 frames injected as one 12-token block")
 
 # audio file clip with src_start: 2 s wav, drop 1 s, window the rest
 ava = AudioVAE()
