@@ -21,7 +21,7 @@ export const PAD = 4;
 export const WIDTH = 840;
 export const HEIGHT = RULER_H + 2 * LANE_H + PAD;
 export const SB_H = 16; // horizontal scrollbar height under the timeline
-export const TOOL_X = WIDTH - 460; // first toolbar button x (measured widths, so slack)
+export const TOOL_X = WIDTH - 540; // first toolbar button x (measured widths, so slack)
 export const SLIDER_W = 74; // zoom slider track width
 
 export const COLORS = {

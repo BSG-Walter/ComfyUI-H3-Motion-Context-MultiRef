@@ -59,6 +59,69 @@ export function writeState(node) {
     app.canvas?.setDirtyCanvas?.(true, true);
 }
 
+const MAX_HISTORY = 50;
+
+function snapshotState(node) {
+    return JSON.stringify({
+        clips: node._h3Clips || [],
+        unit: node._h3TimelineWidget?._unit ?? "f",
+    });
+}
+
+export function recordHistory(node) {
+    if (!node) return;
+    node._h3Undo ??= [];
+    node._h3Redo ??= [];
+    const snap = snapshotState(node);
+    if (node._h3Undo.length && node._h3Undo[node._h3Undo.length - 1] === snap) return;
+    node._h3Undo.push(snap);
+    if (node._h3Undo.length > MAX_HISTORY) node._h3Undo.shift();
+    node._h3Redo.length = 0;
+}
+
+export function undo(node) {
+    if (!node) return false;
+    node._h3Undo ??= [];
+    node._h3Redo ??= [];
+    if (!node._h3Undo.length) return false;
+    const currentSnap = snapshotState(node);
+    let targetSnap = node._h3Undo.pop();
+    if (targetSnap === currentSnap && node._h3Undo.length) {
+        targetSnap = node._h3Undo.pop();
+    }
+    if (targetSnap === currentSnap) return false;
+    node._h3Redo.push(currentSnap);
+    restoreSnapshot(node, targetSnap);
+    return true;
+}
+
+export function redo(node) {
+    if (!node) return false;
+    node._h3Undo ??= [];
+    node._h3Redo ??= [];
+    if (!node._h3Redo.length) return false;
+    const currentSnap = snapshotState(node);
+    const nextSnap = node._h3Redo.pop();
+    node._h3Undo.push(currentSnap);
+    restoreSnapshot(node, nextSnap);
+    return true;
+}
+
+function restoreSnapshot(node, snap) {
+    try {
+        const parsed = JSON.parse(snap);
+        node._h3Clips = Array.isArray(parsed.clips) ? parsed.clips : [];
+        if (node._h3TimelineWidget && parsed.unit) {
+            node._h3TimelineWidget._unit = parsed.unit;
+        }
+        node._h3Selected?.clear();
+        ensureInputs(node);
+        writeState(node);
+        fixNodeSize(node);
+        node._h3TimelineWidget?.redraw?.(node);
+    } catch (_) {}
+}
+
 export function hideStateWidget(node) {
     const widget = stateWidget(node);
     if (!widget || widget._h3Hidden) return;
@@ -74,6 +137,7 @@ export function hideStateWidget(node) {
 export function clearAll(node) {
     if (!node._h3Clips?.length) return;
     if (typeof window !== "undefined" && !window.confirm("Clear all timeline clips?")) return;
+    recordHistory(node);
     if (node._h3TimelineWidget?._playing) togglePlay(node);
     node._h3Clips.length = 0;
     node._h3Thumbs?.clear();
@@ -119,6 +183,7 @@ export function importState(node) {
                 if (!Array.isArray(parsed?.clips)) {
                     throw new Error("no clips array");
                 }
+                recordHistory(node);
                 node._h3Clips = parsed.clips.filter(
                     (c) => c && c.kind && Number.isFinite(Number(c.start)),
                 );
@@ -196,6 +261,7 @@ export function ensureInputs(node) {
 }
 
 export function removeClip(node, i) {
+    recordHistory(node);
     const [clip] = node._h3Clips.splice(i, 1);
     if (clip) node._h3Selected?.delete(clip.id);
     // a separated (unlinked) audio band outlives its video: promote the band
@@ -232,6 +298,7 @@ export function removeSelectedClips(node) {
     if (!node._h3Selected?.size || !node._h3Clips?.length) return;
     const toRemove = node._h3Clips.filter((c) => node._h3Selected.has(c.id));
     if (!toRemove.length) return;
+    recordHistory(node);
     for (const clip of toRemove) {
         const idx = node._h3Clips.indexOf(clip);
         if (idx >= 0) node._h3Clips.splice(idx, 1);
@@ -317,6 +384,7 @@ function findNextFreeBase(existingClips, clipsToPlace, startFrom) {
 
 export function pasteClips(node, targetFrame = null) {
     if (!_clipboard.length) return false;
+    recordHistory(node);
     const minOrig = Math.min(..._clipboard.map((c) => Number(c.start) || 1));
     const startFrom = targetFrame != null ? targetFrame : playHeadBoundary(node);
 
@@ -368,6 +436,7 @@ export function pasteClips(node, targetFrame = null) {
 // silent and stops being drawn/colliding, the video block stays.
 export function removeClipAudio(node, c) {
     if (c?.kind !== "video") return;
+    recordHistory(node);
     c.audio_off = true;
     writeState(node);
     fixNodeSize(node);
@@ -419,6 +488,7 @@ function placeAndPushClip(node, newClip, startFrom = null) {
 
 export function addClip(node, kind, info, lenOverride, startFrom = null) {
     if (!node._h3Clips || node._h3Clips.length >= MAX_CLIPS) return;
+    recordHistory(node);
     const c = defaults[kind]();
     c.id = (node._h3Clips.at(-1)?.id ?? 0) + 1;
     if (info) {
@@ -440,6 +510,7 @@ export async function replaceClipMedia(node, c) {
     const file = await pickFile();
     if (!file) return;
     const info = await uploadMedia(file);
+    recordHistory(node);
     const kind = kindOfFile(info);
     if (kind) c.kind = kind;
     c.file = info;
@@ -483,6 +554,7 @@ export function splitAt(node) {
             f < Number(c.start) + (Number(c.len) || 1),
     );
     if (i < 0) return;
+    recordHistory(node);
     const c = clips[i];
     const cut = f - Number(c.start);
     const src = Number(c.src_start) || 0;

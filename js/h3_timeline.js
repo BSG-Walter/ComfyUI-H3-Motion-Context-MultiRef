@@ -64,6 +64,9 @@ import {
     copySelectedClips,
     hasClipboard,
     pasteClips,
+    recordHistory,
+    undo,
+    redo,
 } from "./timeline_state.js";
 import { drawBlock, drawGhost, drawEnvelope } from "./timeline_draw.js";
 import { togglePlay, syncPreview, previewClip } from "./timeline_play.js";
@@ -178,6 +181,7 @@ function openClipMenu(node, widget, clip, idx, x, y, zone, envHit) {
             items.push([
                 "Remove strength point",
                 () => {
+                    recordHistory(node);
                     const env = envField(clip, envHit.ghost);
                     const i = Array.isArray(env) ? env.indexOf(envHit.pt) : -1;
                     if (i >= 0) env.splice(i, 1);
@@ -190,6 +194,7 @@ function openClipMenu(node, widget, clip, idx, x, y, zone, envHit) {
             items.push([
                 "Add strength point",
                 () => {
+                    recordHistory(node);
                     const s = widget._scale;
                     const r = envHit.ghost ? ghostRect(clip, s) : blockRect(clip, s);
                     const env = envNormalize(clip, envHit.ghost);
@@ -454,7 +459,11 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                 ctx.textAlign = "center";
                 ctx.textBaseline = "middle";
                 const snapOn = this._snapEnabled ?? true;
+                const hasUndo = (nd._h3Undo?.length ?? 0) > 0;
+                const hasRedo = (nd._h3Redo?.length ?? 0) > 0;
                 const defs = [
+                    ["↶ Undo", "undo"],
+                    ["↷ Redo", "redo"],
                     ["✂ Split", "split"],
                     ["🧲 Snap", "snap"],
                     [this._playing ? "⏹ Stop" : "▶ Play", "play"],
@@ -469,18 +478,22 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                 let bx = TOOL_X;
                 const btnY = 3;
                 for (const [label, zone] of defs) {
-                    const w = Math.max(BTN_W, ctx.measureText(label).width + 10);
+                    const w = Math.max(BTN_W, ctx.measureText(label).width + 8);
+                    const disabled = (zone === "undo" && !hasUndo) || (zone === "redo" && !hasRedo);
                     ctx.beginPath();
                     ctx.roundRect(bx + 0.5, btnY, w, BTN_H, 3);
                     ctx.fillStyle =
-                        zone === "snap" && snapOn
-                            ? "#3a5a80"
-                            : zone === "play" && this._playing
+                        disabled
+                            ? "#222"
+                            : zone === "snap" && snapOn
                               ? "#3a5a80"
-                              : "#333";
+                              : zone === "play" && this._playing
+                                ? "#3a5a80"
+                                : "#333";
                     ctx.fill();
+                    ctx.strokeStyle = disabled ? "#444" : "#888";
                     ctx.stroke();
-                    ctx.fillStyle = "#ddd";
+                    ctx.fillStyle = disabled ? "#666" : "#ddd";
                     ctx.fillText(label, bx + w / 2, btnY + BTN_H / 2 + 0.5);
                     this._btns.push({ zone, x: bx, w });
                     bx += w + 3;
@@ -749,9 +762,17 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                             nd._h3Selected.add(hit.c.id);
                             this.redraw(nd);
                         }
-                    } else if (!isCtrl && nd._h3Selected.size && !["slider", "in", "out", "unit", "snap", "play", "split", "clear", "export", "import"].includes(hit.zone)) {
+                    } else if (!isCtrl && nd._h3Selected.size && !["slider", "in", "out", "unit", "snap", "play", "split", "clear", "export", "import", "undo", "redo"].includes(hit.zone)) {
                         nd._h3Selected.clear();
                         this.redraw(nd);
+                    }
+                    if (hit.zone === "undo") {
+                        undo(nd);
+                        return true;
+                    }
+                    if (hit.zone === "redo") {
+                        redo(nd);
+                        return true;
                     }
                     if (hit.zone === "slider") {
                         this._dragSlider = true;
@@ -817,6 +838,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                         // it or the block/line to add one, drag a point, or drag
                         // the flat line to set the flat level when no points
                         // exist
+                        recordHistory(nd);
                         const s = this._scale;
                         const c = hit.c;
                         const ghost = !!(hit.ghost || hit.zone === "audio" || hit.zone === "trimAL" || hit.zone === "trimAR");
@@ -854,6 +876,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                         return true;
                     }
                     if (hit.zone === "link") {
+                        recordHistory(nd);
                         // unlinking freezes the ghost at its current spot so
                         // later edits to the video no longer move it; the
                         // band's strength/env are frozen as copies too, so
@@ -876,6 +899,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                         hit.c.audio_link = !hit.c.audio_link;
                         writeState(nd);
                     } else if (hit.c) {
+                        recordHistory(nd);
                         const isMulti = (nd._h3Selected?.size ?? 0) > 1 && nd._h3Selected.has(hit.c.id);
                         const selectedClips = isMulti
                             ? nd._h3Clips.filter((clip) => nd._h3Selected.has(clip.id))

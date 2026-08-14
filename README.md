@@ -17,6 +17,7 @@ This is **ComfyUI-H3-Motion-Context-Timeline**, a fork of [ComfyUI-H3-Motion-Con
 The **H3 Timeline Editor** node (`MiniMaxH3Timeline`) replaces the per-clip Custom Keyframes / Custom Audio / Custom Video nodes with a visual canvas where you arrange everything at once.
 
 - **Canvas timeline** (840px wide) with two lanes (video above, audio below), a frame ruler, zoom controls and a playhead.
+- **Undo & Redo buttons** — dedicated `↶ Undo` and `↷ Redo` toolbar buttons to safely step backward and forward through edits (clip moves, trims, deletions, paste, envelope tweaks) without interfering with ComfyUI's global graph undo.
 - **Multi-selection & Group drag** — select multiple clips with `Ctrl`/`Cmd` + click and drag them together across the timeline while preserving their relative spacing.
 - **Copy & Paste** — copy and paste selected clips using standard shortcuts (`Ctrl+C` / `Ctrl+V`) or the context menu. Pasting scans occupied lanes and automatically places clips in the next available free space without overlapping.
 - **Context menus** — right-click on any clip or empty space in the video/audio lanes to quickly insert media (`+ Insert Image`, `+ Insert Video`, `+ Insert Audio`), paste clips, replace media, edit envelope points, or delete.
