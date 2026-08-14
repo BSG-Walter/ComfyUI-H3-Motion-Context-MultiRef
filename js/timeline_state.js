@@ -77,6 +77,7 @@ export function clearAll(node) {
     if (node._h3TimelineWidget?._playing) togglePlay(node);
     node._h3Clips.length = 0;
     node._h3Thumbs?.clear();
+    node._h3Selected?.clear();
     ensureInputs(node);
     writeState(node);
     fixNodeSize(node);
@@ -126,6 +127,7 @@ export function importState(node) {
                         parsed.unit === "s" ? "s" : "f";
                 }
                 node._h3Thumbs?.clear();
+                node._h3Selected?.clear();
                 ensureInputs(node);
                 writeState(node);
                 fixNodeSize(node);
@@ -195,6 +197,7 @@ export function ensureInputs(node) {
 
 export function removeClip(node, i) {
     const [clip] = node._h3Clips.splice(i, 1);
+    if (clip) node._h3Selected?.delete(clip.id);
     // a separated (unlinked) audio band outlives its video: promote the band
     // to its own audio clip before deleting the video block, so deleting the
     // video never kills the detached audio.
@@ -225,6 +228,142 @@ export function removeClip(node, i) {
     fixNodeSize(node);
 }
 
+export function removeSelectedClips(node) {
+    if (!node._h3Selected?.size || !node._h3Clips?.length) return;
+    const toRemove = node._h3Clips.filter((c) => node._h3Selected.has(c.id));
+    if (!toRemove.length) return;
+    for (const clip of toRemove) {
+        const idx = node._h3Clips.indexOf(clip);
+        if (idx >= 0) node._h3Clips.splice(idx, 1);
+        node._h3Thumbs?.delete(clip.id);
+        for (const [name] of clipInputs(clip)) {
+            const slot = node.inputs?.findIndex((inp) => inp.name === name);
+            if (slot >= 0) {
+                if (node.inputs[slot].link != null) node.disconnectInput(slot);
+                node.removeInput(slot);
+            }
+        }
+    }
+    node._h3Selected.clear();
+    ensureInputs(node);
+    writeState(node);
+    fixNodeSize(node);
+}
+
+let _clipboard = [];
+
+export function copySelectedClips(node, targetClip = null) {
+    let clipsToCopy = [];
+    if (node._h3Selected?.size) {
+        clipsToCopy = node._h3Clips.filter((c) => node._h3Selected.has(c.id));
+    }
+    if (!clipsToCopy.length && targetClip) {
+        clipsToCopy = [targetClip];
+    }
+    if (!clipsToCopy.length) return false;
+    _clipboard = clipsToCopy.map((c) => ({
+        ...JSON.parse(JSON.stringify(c)),
+        env: cloneEnv(c.env),
+        audio_env: cloneEnv(c.audio_env),
+    }));
+    return true;
+}
+
+export function hasClipboard() {
+    return _clipboard.length > 0;
+}
+
+function isClipsRangeFree(existingClips, clipsToPlace, baseStart) {
+    for (const c of clipsToPlace) {
+        const cStart = baseStart + c.offset;
+        const cLen = c.len;
+        const lanes =
+            c.kind === "video" && c.audio_link && !c.audio_off
+                ? [0, 1]
+                : [laneOf(c.kind)];
+        for (const L of lanes) {
+            for (const o of existingClips) {
+                if (!occupiesLane(o, L)) continue;
+                const r = laneRange(o, L);
+                if (cStart < r.e && cStart + cLen > r.s) {
+                    return { free: false, nextBase: r.e - c.offset };
+                }
+            }
+        }
+        if (c.kind === "video" && !c.audio_link && !c.audio_off && c.audio_len != null) {
+            const aStart = baseStart + c.audio_offset;
+            const aLen = c.audio_len;
+            for (const o of existingClips) {
+                if (!occupiesLane(o, 1)) continue;
+                const r = laneRange(o, 1);
+                if (aStart < r.e && aStart + aLen > r.s) {
+                    return { free: false, nextBase: r.e - c.audio_offset };
+                }
+            }
+        }
+    }
+    return { free: true, base: baseStart };
+}
+
+function findNextFreeBase(existingClips, clipsToPlace, startFrom) {
+    let base = Math.max(1, startFrom);
+    for (let guard = 0; guard < 2000; guard++) {
+        const res = isClipsRangeFree(existingClips, clipsToPlace, base);
+        if (res.free) return base;
+        base = Math.max(base + 1, res.nextBase);
+    }
+    return base;
+}
+
+export function pasteClips(node, targetFrame = null) {
+    if (!_clipboard.length) return false;
+    const minOrig = Math.min(..._clipboard.map((c) => Number(c.start) || 1));
+    const startFrom = targetFrame != null ? targetFrame : playHeadBoundary(node);
+
+    const clipsToPlace = _clipboard.map((c) => {
+        const offset = (Number(c.start) || 1) - minOrig;
+        const len = clipLen(c);
+        const aOffset = (Number(c.audio_start) || Number(c.start) || 1) - minOrig;
+        const aLen = Number(c.audio_len ?? c.len) || 22;
+        return {
+            kind: c.kind,
+            audio_link: c.audio_link,
+            audio_off: c.audio_off,
+            offset,
+            len,
+            audio_offset: aOffset,
+            audio_len: aLen,
+            raw: c,
+        };
+    });
+
+    const baseF = findNextFreeBase(node._h3Clips, clipsToPlace, startFrom);
+    let nextId = (node._h3Clips.reduce((max, c) => Math.max(max, Number(c.id) || 0), 0) || 0) + 1;
+    const newSelected = new Set();
+
+    for (const item of clipsToPlace) {
+        const c = item.raw;
+        const newStart = baseF + item.offset;
+        const cloned = {
+            ...JSON.parse(JSON.stringify(c)),
+            id: nextId++,
+            start: newStart,
+            env: cloneEnv(c.env),
+            audio_env: cloneEnv(c.audio_env),
+        };
+        if (cloned.audio_start != null) {
+            cloned.audio_start = baseF + item.audio_offset;
+        }
+        node._h3Clips.push(cloned);
+        newSelected.add(cloned.id);
+    }
+    node._h3Selected = newSelected;
+    ensureInputs(node);
+    writeState(node);
+    fixNodeSize(node);
+    return true;
+}
+
 // delete only the separated audio band of a video clip: the band goes
 // silent and stops being drawn/colliding, the video block stays.
 export function removeClipAudio(node, c) {
@@ -234,7 +373,7 @@ export function removeClipAudio(node, c) {
     fixNodeSize(node);
 }
 
-export async function addClipWithMedia(node, kind) {
+export async function addClipWithMedia(node, kind, startFrom = null) {
     if (!node._h3Clips || node._h3Clips.length >= MAX_CLIPS) return;
     const file = await pickFile();
     if (!file) return;
@@ -251,12 +390,12 @@ export async function addClipWithMedia(node, kind) {
     if (useKind === "video" || useKind === "audio") {
         len = await probeVideoFrames(node, info, file);
     }
-    addClip(node, useKind, info, len);
+    addClip(node, useKind, info, len, startFrom);
 }
 
-function placeAndPushClip(node, newClip) {
+function placeAndPushClip(node, newClip, startFrom = null) {
     const lane = laneOf(newClip.kind);
-    const start = playHeadBoundary(node);
+    const start = startFrom != null ? Math.max(1, startFrom) : playHeadBoundary(node);
     newClip.start = start;
     const newLen = clipLen(newClip);
 
@@ -278,7 +417,7 @@ function placeAndPushClip(node, newClip) {
     }
 }
 
-export function addClip(node, kind, info, lenOverride) {
+export function addClip(node, kind, info, lenOverride, startFrom = null) {
     if (!node._h3Clips || node._h3Clips.length >= MAX_CLIPS) return;
     const c = defaults[kind]();
     c.id = (node._h3Clips.at(-1)?.id ?? 0) + 1;
@@ -291,7 +430,7 @@ export function addClip(node, kind, info, lenOverride) {
         c.len = lenOverride;
     }
     node._h3Clips.push(c);
-    placeAndPushClip(node, c);
+    placeAndPushClip(node, c, startFrom);
     ensureInputs(node);
     writeState(node);
     fixNodeSize(node);

@@ -53,6 +53,7 @@ import {
     ensureInputs,
     fixNodeSize,
     removeClip,
+    removeSelectedClips,
     removeClipAudio,
     replaceClipMedia,
     addClipWithMedia,
@@ -60,6 +61,9 @@ import {
     clearAll,
     exportState,
     importState,
+    copySelectedClips,
+    hasClipboard,
+    pasteClips,
 } from "./timeline_state.js";
 import { drawBlock, drawGhost, drawEnvelope } from "./timeline_draw.js";
 import { togglePlay, syncPreview, previewClip } from "./timeline_play.js";
@@ -78,58 +82,8 @@ function closeClipMenu() {
     _menuOverlay = null;
 }
 
-function openClipMenu(node, widget, clip, idx, x, y, zone, envHit) {
-    closeClipMenu();
-    widget._menuAt = Date.now();
-    // right-clicking the separated audio band of a video clip targets the
-    // band only: the only destructive option is deleting that band. Deleting
-    // the clip is reached from the video block itself.
-    const onGhost =
-        clip.kind === "video" &&
-        !clip.audio_off &&
-        ["audio", "trimAL", "trimAR", "link"].includes(zone);
-    const items = [];
-    if (onGhost) {
-        items.push(["Delete audio track", () => removeClipAudio(node, clip)]);
-    } else {
-        items.push(["Delete clip", () => removeClip(node, idx)]);
-        items.push(["Replace clip\u2026", () => replaceClipMedia(node, clip)]);
-    }
-    if (envHit?.pt) {
-        // right-clicked an envelope point: offer to remove it
-        items.push([
-            "Remove strength point",
-            () => {
-                const env = envField(clip, envHit.ghost);
-                const i = Array.isArray(env) ? env.indexOf(envHit.pt) : -1;
-                if (i >= 0) env.splice(i, 1);
-                writeState(node);
-                widget.redraw(node);
-            },
-        ]);
-    } else if (envHit) {
-        // right-clicked the envelope line: offer to add a point there
-        items.push([
-            "Add strength point",
-            () => {
-                const s = widget._scale;
-                const r = envHit.ghost ? ghostRect(clip, s) : blockRect(clip, s);
-                const env = envNormalize(clip, envHit.ghost);
-                const len = envLen(clip, envHit.ghost);
-                const rawF = clamp(Math.round((envHit.p[0] - r.x) / s), 0, len);
-                const pt = [
-                    clip.kind === "video" && !envHit.ghost
-                        ? tokenSnap(rawF, len)
-                        : rawF,
-                    envStrengthAtY(r, envHit.p[1]),
-                ];
-                env.push(pt);
-                env.sort((a, b) => a[0] - b[0]);
-                writeState(node);
-                widget.redraw(node);
-            },
-        ]);
-    }
+function createContextMenu(items, x, y) {
+    if (!items.length) return;
     const overlay = document.createElement("div");
     overlay.style.cssText = "position:fixed;inset:0;z-index:3000";
     overlay.addEventListener("pointerdown", closeClipMenu);
@@ -173,6 +127,95 @@ function openClipMenu(node, widget, clip, idx, x, y, zone, envHit) {
     document.addEventListener("keydown", (e) => {
         if (e.key === "Escape") closeClipMenu();
     }, { once: true, capture: true });
+}
+
+function openEmptyMenu(node, widget, lane, frame, x, y) {
+    closeClipMenu();
+    widget._menuAt = Date.now();
+    const items = [];
+    if (lane === 0) {
+        items.push(["+ Insert Image", () => addClipWithMedia(node, "image", frame)]);
+        items.push(["+ Insert Video", () => addClipWithMedia(node, "video", frame)]);
+    } else {
+        items.push(["+ Insert Audio", () => addClipWithMedia(node, "audio", frame)]);
+    }
+    if (hasClipboard()) {
+        items.push(["Paste clips (Ctrl+V)", () => {
+            pasteClips(node, frame);
+            widget.redraw(node);
+        }]);
+    }
+    createContextMenu(items, x, y);
+}
+
+function openClipMenu(node, widget, clip, idx, x, y, zone, envHit) {
+    closeClipMenu();
+    widget._menuAt = Date.now();
+    const items = [];
+    const selCount = node._h3Selected?.size ?? 0;
+    const isMulti = selCount > 1 && node._h3Selected?.has(clip.id);
+
+    if (isMulti) {
+        items.push([`Delete selected clips (${selCount})`, () => removeSelectedClips(node)]);
+        items.push([`Copy selected clips (${selCount}) (Ctrl+C)`, () => copySelectedClips(node)]);
+    } else {
+        // right-clicking the separated audio band of a video clip targets the
+        // band only: the only destructive option is deleting that band. Deleting
+        // the clip is reached from the video block itself.
+        const onGhost =
+            clip.kind === "video" &&
+            !clip.audio_off &&
+            ["audio", "trimAL", "trimAR", "link"].includes(zone);
+        if (onGhost) {
+            items.push(["Delete audio track", () => removeClipAudio(node, clip)]);
+        } else {
+            items.push(["Delete clip", () => removeClip(node, idx)]);
+            items.push(["Copy clip (Ctrl+C)", () => copySelectedClips(node, clip)]);
+            items.push(["Replace clip\u2026", () => replaceClipMedia(node, clip)]);
+        }
+        if (envHit?.pt) {
+            // right-clicked an envelope point: offer to remove it
+            items.push([
+                "Remove strength point",
+                () => {
+                    const env = envField(clip, envHit.ghost);
+                    const i = Array.isArray(env) ? env.indexOf(envHit.pt) : -1;
+                    if (i >= 0) env.splice(i, 1);
+                    writeState(node);
+                    widget.redraw(node);
+                },
+            ]);
+        } else if (envHit) {
+            // right-clicked the envelope line: offer to add a point there
+            items.push([
+                "Add strength point",
+                () => {
+                    const s = widget._scale;
+                    const r = envHit.ghost ? ghostRect(clip, s) : blockRect(clip, s);
+                    const env = envNormalize(clip, envHit.ghost);
+                    const len = envLen(clip, envHit.ghost);
+                    const rawF = clamp(Math.round((envHit.p[0] - r.x) / s), 0, len);
+                    const pt = [
+                        clip.kind === "video" && !envHit.ghost
+                            ? tokenSnap(rawF, len)
+                            : rawF,
+                        envStrengthAtY(r, envHit.p[1]),
+                    ];
+                    env.push(pt);
+                    env.sort((a, b) => a[0] - b[0]);
+                    writeState(node);
+                    widget.redraw(node);
+                },
+            ]);
+        }
+    }
+    if (hasClipboard()) {
+        items.push(["Paste clips (Ctrl+V)", () => {
+            pasteClips(node);
+            widget.redraw(node);
+        }]);
+    }
+    createContextMenu(items, x, y);
 }
 
 function sliderZoom(nd, w, x) {
@@ -476,16 +519,17 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                           : null;
                 for (const c of clips) {
                     const media = c.file ? ensureMedia(nd, c) : null;
-                    if (c.kind === "video") drawGhost(ctx, c, s, nd);
+                    const selected = !!nd._h3Selected?.has(c.id);
+                    if (c.kind === "video") drawGhost(ctx, c, s, nd, selected);
                     if (c.kind === "image") {
-                        drawBlock(ctx, COLORS.image, `img ${c.id}`, blockRect(c, s), false, media, nd, c);
+                        drawBlock(ctx, COLORS.image, `img ${c.id}`, blockRect(c, s), false, media, nd, c, selected);
                         drawEnvelope(ctx, blockRect(c, s), c, s, false, envPlayX);
                     } else if (c.kind === "video") {
                         if (!c.audio_off) drawEnvelope(ctx, ghostRect(c, s), c, s, true, envPlayX);
-                        drawBlock(ctx, COLORS.video, `video ${c.id}`, blockRect(c, s), false, media, nd, c);
+                        drawBlock(ctx, COLORS.video, `video ${c.id}`, blockRect(c, s), false, media, nd, c, selected);
                         drawEnvelope(ctx, blockRect(c, s), c, s, false, envPlayX);
                     } else {
-                        drawBlock(ctx, COLORS.audio, `audio ${c.id}`, blockRect(c, s), false, media, nd, c);
+                        drawBlock(ctx, COLORS.audio, `audio ${c.id}`, blockRect(c, s), false, media, nd, c, selected);
                         drawEnvelope(ctx, blockRect(c, s), c, s, false, envPlayX);
                     }
                 }
@@ -648,16 +692,26 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                 const cx = pos[0] + (this._pan ?? 0);
                 const type = e.type || "";
                 if (type.endsWith("down") && e.button === 2) {
-                    // right click opens the clip menu; on the strength
-                    // envelope it carries an add/remove point entry
+                    // right click opens the clip menu or empty space context menu
                     const hit = hitTest(nd, p, this._scale, this._pan);
-                    if (!hit?.c) return false;
                     e.preventDefault();
-                    const idx = nd._h3Clips?.indexOf(hit.c) ?? -1;
-                    if (idx >= 0) {
-                        const ghost = !!(hit.ghost || hit.zone === "audio" || hit.zone === "trimAL" || hit.zone === "trimAR");
-                        const envHit = { ghost, p: [cx, p[1]], pt: hit.pt };
-                        openClipMenu(nd, this, hit.c, idx, e.clientX ?? pos[0], e.clientY ?? pos[1], hit.zone, envHit);
+                    if (hit?.c) {
+                        nd._h3Selected ??= new Set();
+                        if (!nd._h3Selected.has(hit.c.id)) {
+                            nd._h3Selected.clear();
+                            nd._h3Selected.add(hit.c.id);
+                            this.redraw(nd);
+                        }
+                        const idx = nd._h3Clips?.indexOf(hit.c) ?? -1;
+                        if (idx >= 0) {
+                            const ghost = !!(hit.ghost || hit.zone === "audio" || hit.zone === "trimAL" || hit.zone === "trimAR");
+                            const envHit = { ghost, p: [cx, p[1]], pt: hit.pt };
+                            openClipMenu(nd, this, hit.c, idx, e.clientX ?? pos[0], e.clientY ?? pos[1], hit.zone, envHit);
+                        }
+                    } else if (p[1] >= RULER_H) {
+                        const lane = p[1] >= RULER_H + LANE_H ? 1 : 0;
+                        const frame = Math.max(1, Math.round((cx - OFFSET_X) / this._scale + 1));
+                        openEmptyMenu(nd, this, lane, frame, e.clientX ?? pos[0], e.clientY ?? pos[1]);
                     }
                     return true;
                 }
@@ -671,8 +725,34 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                     this._lastDownPos = p;
                     this._dragged = false;
                     const hit = hitTest(nd, p, this._scale, this._pan);
-                    if (!hit) return false;
+                    this._clickHit = hit;
+
+                    nd._h3Selected ??= new Set();
+                    const isCtrl = !!(e.ctrlKey || e.metaKey);
+
+                    if (!hit) {
+                        if (!isCtrl && nd._h3Selected.size) {
+                            nd._h3Selected.clear();
+                            this.redraw(nd);
+                        }
+                        return false;
+                    }
                     e.preventDefault();
+
+                    if (hit.c) {
+                        if (isCtrl) {
+                            if (nd._h3Selected.has(hit.c.id)) nd._h3Selected.delete(hit.c.id);
+                            else nd._h3Selected.add(hit.c.id);
+                            this.redraw(nd);
+                        } else if (!nd._h3Selected.has(hit.c.id)) {
+                            nd._h3Selected.clear();
+                            nd._h3Selected.add(hit.c.id);
+                            this.redraw(nd);
+                        }
+                    } else if (!isCtrl && nd._h3Selected.size && !["slider", "in", "out", "unit", "snap", "play", "split", "clear", "export", "import"].includes(hit.zone)) {
+                        nd._h3Selected.clear();
+                        this.redraw(nd);
+                    }
                     if (hit.zone === "slider") {
                         this._dragSlider = true;
                         sliderZoom(nd, this, p[0]);
@@ -796,6 +876,10 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                         hit.c.audio_link = !hit.c.audio_link;
                         writeState(nd);
                     } else if (hit.c) {
+                        const isMulti = (nd._h3Selected?.size ?? 0) > 1 && nd._h3Selected.has(hit.c.id);
+                        const selectedClips = isMulti
+                            ? nd._h3Clips.filter((clip) => nd._h3Selected.has(clip.id))
+                            : [hit.c];
                         const audioEdit =
                             hit.c.kind === "video" &&
                             !hit.c.audio_link &&
@@ -803,6 +887,24 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                         this._drag = {
                             ...hit,
                             grab: p[0],
+                            isMulti,
+                            targets: selectedClips.map((clip) => {
+                                const aEdit =
+                                    clip.kind === "video" &&
+                                    !clip.audio_link &&
+                                    (hit.zone === "audio" || hit.zone === "trimAL" || hit.zone === "trimAR");
+                                return {
+                                    clip,
+                                    audioEdit: aEdit,
+                                    startAt: Number(
+                                        aEdit ? clip.audio_start ?? clip.start : clip.start,
+                                    ),
+                                    lenAt: Number(
+                                        aEdit ? clip.audio_len ?? clip.len ?? 22 : clip.len ?? 22,
+                                    ),
+                                    srcAt: Number(clip.src_start) || 0,
+                                };
+                            }),
                             startAt: Number(
                                 audioEdit ? hit.c.audio_start ?? hit.c.start : hit.c.start,
                             ),
@@ -875,21 +977,32 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                             d.zone === "audio" || d.zone === "trimAL" || d.zone === "trimAR";
                         const lane = audioEdit ? 1 : laneOf(d.c.kind);
                         if (d.zone === "move" || d.zone === "audio") {
-                            const len = audioEdit
-                                ? (d.c.audio_len ?? d.c.len ?? 22)
-                                : clipLen(d.c);
-                            const s2 = resolveMove(
-                                nd,
-                                d.c,
-                                lane,
-                                Math.max(1, d.startAt + step),
-                                len,
-                                d.grab / s + 1,
-                                s,
-                            );
-                            if (d.zone === "audio") d.c.audio_start = s2;
-                            else d.c.start = s2;
-                            this._frame = s2;
+                            if (d.isMulti && d.targets?.length > 1) {
+                                const minStart = Math.min(...d.targets.map((t) => t.startAt));
+                                const actualStep = Math.max(1 - minStart, step);
+                                for (const t of d.targets) {
+                                    const targetPos = t.startAt + actualStep;
+                                    if (t.audioEdit) t.clip.audio_start = targetPos;
+                                    else t.clip.start = targetPos;
+                                }
+                                this._frame = Math.max(1, d.startAt + actualStep);
+                            } else {
+                                const len = audioEdit
+                                    ? (d.c.audio_len ?? d.c.len ?? 22)
+                                    : clipLen(d.c);
+                                const s2 = resolveMove(
+                                    nd,
+                                    d.c,
+                                    lane,
+                                    Math.max(1, d.startAt + step),
+                                    len,
+                                    d.grab / s + 1,
+                                    s,
+                                );
+                                if (d.zone === "audio") d.c.audio_start = s2;
+                                else d.c.start = s2;
+                                this._frame = s2;
+                            }
                         } else if (d.zone === "trimR" || d.zone === "trimAR") {
                             const lanes =
                                 lane === 0 && d.c.kind === "video" && d.c.audio_link && !d.c.audio_off
@@ -1133,7 +1246,20 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
             if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
             if (!node._h3TimelineWidget || !node._h3Clips || !node._h3Hovered) return;
             const k = e.key?.toLowerCase();
-            if (k === "s") {
+            if ((e.ctrlKey || e.metaKey) && k === "c") {
+                if (copySelectedClips(node)) e.preventDefault();
+            } else if ((e.ctrlKey || e.metaKey) && k === "v") {
+                if (pasteClips(node)) {
+                    e.preventDefault();
+                    node._h3TimelineWidget.redraw?.(node);
+                }
+            } else if (k === "delete" || k === "backspace") {
+                if (node._h3Selected?.size) {
+                    e.preventDefault();
+                    removeSelectedClips(node);
+                    node._h3TimelineWidget.redraw?.(node);
+                }
+            } else if (k === "s") {
                 e.preventDefault();
                 splitAt(node);
             } else if (k === " ") {

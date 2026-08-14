@@ -68,7 +68,7 @@ function paintThumb(ctx, el, r) {
     ctx.restore();
 }
 
-export function drawBlock(ctx, color, label, r, ghost, media, node, clip) {
+export function drawBlock(ctx, color, label, r, ghost, media, node, clip, selected) {
     ctx.globalAlpha = ghost ? 0.35 : 0.55;
     ctx.fillStyle = color;
     ctx.beginPath();
@@ -82,20 +82,33 @@ export function drawBlock(ctx, color, label, r, ghost, media, node, clip) {
     } else if (!ghost && media?.kind === "video" && node?._h3Thumbs?.get(clip?.id)?.el) {
         paintThumb(ctx, node._h3Thumbs.get(clip.id).el, r);
     }
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = color;
-    ctx.stroke();
+    if (selected) {
+        ctx.save();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#ffffff";
+        ctx.strokeRect(r.x, r.y, r.w, r.h);
+        ctx.strokeStyle = "#ffe066";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.roundRect(r.x - 1, r.y - 1, r.w + 2, r.h + 2, 4);
+        ctx.stroke();
+        ctx.restore();
+    } else {
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = color;
+        ctx.stroke();
+    }
     ctx.fillStyle = "#fff";
-    ctx.font = "9px sans-serif";
+    ctx.font = selected ? "bold 9px sans-serif" : "9px sans-serif";
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     ctx.fillText(label, r.x + (ghost ? 22 : 4), r.y + r.h / 2);
 }
 
-export function drawGhost(ctx, c, s, node) {
+export function drawGhost(ctx, c, s, node, selected) {
     if (c.audio_off) return; // the separated audio band was deleted
     const g = ghostRect(c, s);
-    drawBlock(ctx, COLORS.audio, `♪ ${c.id}`, g, true, null, node);
+    drawBlock(ctx, COLORS.audio, `♪ ${c.id}`, g, true, null, node, c, selected);
     const m = c.file ? ensureMedia(node, c) : null;
     if (m?.buffer) paintWaveform(ctx, m, g, true, node, c);
     const bx = g.x + 8;
@@ -104,8 +117,8 @@ export function drawGhost(ctx, c, s, node) {
     ctx.beginPath();
     ctx.arc(bx, by, 8, 0, Math.PI * 2);
     ctx.fill();
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = COLORS.audio;
+    ctx.lineWidth = selected ? 2 : 1;
+    ctx.strokeStyle = selected ? "#ffe066" : COLORS.audio;
     ctx.stroke();
     ctx.fillStyle = "#fff";
     ctx.font = "9px sans-serif";
