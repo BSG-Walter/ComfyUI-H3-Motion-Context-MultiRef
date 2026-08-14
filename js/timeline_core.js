@@ -101,11 +101,10 @@ export function occupiesLane(c, lane) {
 
 export function blockRect(c, s) {
     const len = clipLen(c);
-    const minW = len === 1 ? 8 : 4;
     return {
-        x: OFFSET_X + (Number(c.start) - 1) * s + 2,
+        x: OFFSET_X + (Number(c.start) - 1) * s + 1,
         y: RULER_H + laneOf(c.kind) * LANE_H + 4,
-        w: Math.max(minW, len * s - 4),
+        w: Math.max(2, len * s - 2),
         h: LANE_H - 8,
     };
 }
@@ -122,11 +121,10 @@ export function bandGeom(c) {
 
 export function ghostRect(c, s) {
     const { start, len } = bandGeom(c);
-    const minW = len === 1 ? 8 : 4;
     return {
-        x: OFFSET_X + (Number(start) - 1) * s + 2,
+        x: OFFSET_X + (Number(start) - 1) * s + 1,
         y: RULER_H + LANE_H + 4,
-        w: Math.max(minW, len * s - 4),
+        w: Math.max(2, len * s - 2),
         h: LANE_H - 8,
     };
 }
@@ -508,11 +506,16 @@ export function hitTest(node, p, s, pan = 0) {
         if (ez) return { i, c, ...ez };
         if (c.kind === "video" && !c.audio_off) {
             const g = ghostRect(c, s);
+            const aLen = Number(c.audio_link ? c.len : c.audio_len ?? c.len ?? 22) || 1;
             const padX = g.w < 16 ? 6 : 4;
             if (inRect(q, g, padX, 4)) {
                 // edge trims win over the link toggle so the ghost's
                 // borders stay grabbable; the toggle keeps the middle.
                 if (!c.audio_link) {
+                    if (aLen === 1) {
+                        if (q[0] > g.x + g.w + 1) return { i, c, zone: "trimAR" };
+                        return { i, c, zone: "audio" };
+                    }
                     const ez = edgeZone(q, g);
                     if (ez === "trimL") return { i, c, zone: "trimAL" };
                     if (ez === "trimR") return { i, c, zone: "trimAR" };
@@ -527,8 +530,13 @@ export function hitTest(node, p, s, pan = 0) {
             }
         }
         const r = blockRect(c, s);
+        const len = clipLen(c);
         const padX = r.w < 16 ? 6 : 2;
         if (inRect(q, r, padX, 2)) {
+            if (len === 1) {
+                if (q[0] > r.x + r.w + 1) return { i, c, zone: "trimR" };
+                return { i, c, zone: "move" };
+            }
             return { i, c, zone: edgeZone(q, r) || "move" };
         }
     }

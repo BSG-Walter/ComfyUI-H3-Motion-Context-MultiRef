@@ -73,6 +73,44 @@ import { togglePlay, syncPreview, previewClip } from "./timeline_play.js";
 
 const NODE_NAME = "MiniMaxH3Timeline";
 
+// --- cursor management -----------------------------------------------------
+
+function updateCanvasCursor(e, widget, hit) {
+    const cv = e?.target?.tagName === "CANVAS" ? e.target : app?.canvas?.canvas;
+    if (!cv) return;
+    let cursor = "";
+    if (widget?._drag) {
+        const z = widget._drag.zone;
+        if (z === "trimL" || z === "trimR" || z === "trimAL" || z === "trimAR") {
+            cursor = "ew-resize";
+        } else if (z === "move" || z === "audio") {
+            cursor = "grabbing";
+        }
+    } else if (widget?._dragEnv || widget?._dragFlat) {
+        cursor = "ns-resize";
+    } else if (widget?._dragSlider) {
+        cursor = "ew-resize";
+    } else if (widget?._dragPlay) {
+        cursor = "col-resize";
+    } else if (hit) {
+        const z = hit.zone;
+        if (z === "trimL" || z === "trimR" || z === "trimAL" || z === "trimAR") {
+            cursor = "ew-resize";
+        } else if (z === "move" || z === "audio") {
+            cursor = "grab";
+        } else if (z === "envpt" || z === "envln") {
+            cursor = "ns-resize";
+        } else if (z === "slider") {
+            cursor = "ew-resize";
+        } else if (["snap", "play", "split", "clear", "export", "import", "undo", "redo", "unit", "in", "out", "link"].includes(z)) {
+            cursor = "pointer";
+        } else if (z === "ruler") {
+            cursor = "col-resize";
+        }
+    }
+    cv.style.cursor = cursor;
+}
+
 // --- clip context menu ------------------------------------------------------
 
 let _menu = null;
@@ -302,6 +340,32 @@ function setup(node) {
             _bindMenu(canvas, nd) {
                 if (!canvas || this._boundCtxs?.has(canvas)) return;
                 (this._boundCtxs ??= new Set()).add(canvas);
+                canvas.addEventListener("pointerleave", () => {
+                    try { canvas.style.cursor = ""; } catch (_) {}
+                });
+                canvas.addEventListener("pointermove", (e) => {
+                    if (!nd) return;
+                    const isGraph = canvas === app?.canvas?.canvas;
+                    let px, py;
+                    if (isGraph) {
+                        try {
+                            app.canvas.adjustMouseEvent?.(e);
+                        } catch (_) {}
+                        const n = this._node ?? nd;
+                        px = (e.canvasX ?? e.offsetX) - (n.pos?.[0] ?? 0);
+                        py = (e.canvasY ?? e.offsetY) - (n.pos?.[1] ?? 0) - (this._yOff ?? 1);
+                    } else {
+                        px = e.offsetX;
+                        py = e.offsetY - (this._yOff ?? 1);
+                    }
+                    if (px >= 0 && px <= WIDTH && py >= 0 && py <= HEIGHT + 20) {
+                        const hit = hitTest(nd, [px, py], this._scale, this._pan);
+                        updateCanvasCursor(e, this, hit);
+                    } else if (this._wasHovering) {
+                        this._wasHovering = false;
+                        canvas.style.cursor = "";
+                    }
+                }, { passive: true });
                 canvas.addEventListener("contextmenu", (e) => {
                     // the mouse() right-down path already opened the menu
                     if (Date.now() - (this._menuAt || 0) < 600) return;
@@ -739,6 +803,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                     this._dragged = false;
                     const hit = hitTest(nd, p, this._scale, this._pan);
                     this._clickHit = hit;
+                    updateCanvasCursor(e, this, hit);
 
                     nd._h3Selected ??= new Set();
                     const isCtrl = !!(e.ctrlKey || e.metaKey);
@@ -946,6 +1011,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                     nd._h3Hovered = true;
                     this._hover = hitTest(nd, p, this._scale, this._pan);
                     this._hoverPos = [cx, p[1]];
+                    updateCanvasCursor(e, this, this._hover);
                     if (this._drag || this._dragEnv || this._dragFlat || this._dragPlay || this._dragSlider) {
                         if (this._lastDownPos && Math.hypot(p[0] - this._lastDownPos[0], p[1] - this._lastDownPos[1]) > 8) {
                             this._dragged = true;
@@ -1145,6 +1211,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                     this._dragEnv = null;
                     this._dragFlat = null;
                     this._frame = null;
+                    updateCanvasCursor(e, this, null);
                     this.redraw(nd);
                     return true;
                 }
@@ -1318,6 +1385,25 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
         } catch (_) {}
         tw._unit = unit;
     }
+
+    const origMouseMove = node.onMouseMove;
+    node.onMouseMove = function (e, pos) {
+        origMouseMove?.apply(this, arguments);
+        if (!this._h3TimelineWidget) return;
+        const w = this._h3TimelineWidget;
+        const p = [pos[0], pos[1] - (w._yOff ?? 1)];
+        if (p[0] >= 0 && p[0] <= WIDTH && p[1] >= 0 && p[1] <= HEIGHT + 20) {
+            const hit = hitTest(this, p, w._scale, w._pan);
+            updateCanvasCursor(e, w, hit);
+        }
+    };
+    const origMouseLeave = node.onMouseLeave;
+    node.onMouseLeave = function () {
+        origMouseLeave?.apply(this, arguments);
+        try {
+            if (app?.canvas?.canvas) app.canvas.canvas.style.cursor = "";
+        } catch (_) {}
+    };
 
     writeState(node);
     fixNodeSize(node);
