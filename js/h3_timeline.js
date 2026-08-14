@@ -601,6 +601,9 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                 ctx.fillText("audio", 2, RULER_H + LANE_H + 14);
 
                 ctx.save();
+                ctx.beginPath();
+                ctx.rect(0, RULER_H, WIDTH, H - RULER_H);
+                ctx.clip();
                 ctx.translate(-(this._pan ?? 0), 0);
 
                 const envPlayX =

@@ -137,7 +137,7 @@ function envChip(ctx, x, y, text) {
     const font = "8px sans-serif";
     ctx.font = font;
     const tw = ctx.measureText(text).width + 8;
-    const cx = clamp(x - tw, 0, WIDTH - tw);
+    const cx = x - tw;
     ctx.fillStyle = "rgba(0,0,0,0.65)";
     ctx.beginPath();
     ctx.roundRect(cx, y - 6, tw, 11, 3);
@@ -213,7 +213,11 @@ export function drawEnvelope(ctx, r, c, s, ghost, playX) {
         ctx.arc(playX, y, ghost ? 3 : 4, 0, Math.PI * 2);
         ctx.fillStyle = "#ffd166";
         ctx.fill();
-        envChip(ctx, playX + 6, y, v.toFixed(2));
+        const str = v.toFixed(2);
+        ctx.font = "8px sans-serif";
+        const tw = ctx.measureText(str).width + 8;
+        const chipRight = playX + tw + 4 <= r.x + r.w ? playX + tw + 4 : playX - 4;
+        envChip(ctx, chipRight, y, str);
     }
     const endV = pts.length ? pts[pts.length - 1][1] : flat;
     if (r.w > 40) envChip(ctx, r.x + r.w - 2, envY(r, endV), endV.toFixed(2));
