@@ -59,7 +59,7 @@ Clone the repository into your ComfyUI `custom_nodes` directory:
 
 ```bash
 cd /path/to/ComfyUI/custom_nodes
-git clone https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef.git
+git clone https://github.com/BSG-Walter/ComfyUI-H3-Motion-Context-Timeline.git
 ```
 
 Then restart ComfyUI and hard-refresh the browser.
