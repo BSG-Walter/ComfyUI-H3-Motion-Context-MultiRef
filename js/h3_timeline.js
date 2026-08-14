@@ -30,6 +30,7 @@ import {
     blockRect,
     ghostRect,
     resolveMove,
+    resolveMultiMove,
     probeSnap,
     splitSnap,
     hitTest,
@@ -189,12 +190,26 @@ function openEmptyMenu(node, widget, lane, frame, x, y) {
     createContextMenu(items, x, y);
 }
 
+function selKey(hit) {
+    if (!hit?.c) return null;
+    const isGhostAudio =
+        hit.c.kind === "video" &&
+        !hit.c.audio_link &&
+        (hit.ghost || ["audio", "trimAL", "trimAR", "link"].includes(hit.zone));
+    return isGhostAudio ? `a_${hit.c.id}` : hit.c.id;
+}
+
 function openClipMenu(node, widget, clip, idx, x, y, zone, envHit) {
     closeClipMenu();
     widget._menuAt = Date.now();
     const items = [];
     const selCount = node._h3Selected?.size ?? 0;
-    const isMulti = selCount > 1 && node._h3Selected?.has(clip.id);
+    const isGhostAudio =
+        clip.kind === "video" &&
+        !clip.audio_link &&
+        ["audio", "trimAL", "trimAR", "link"].includes(zone);
+    const k = isGhostAudio ? `a_${clip.id}` : clip.id;
+    const isMulti = selCount > 1 && node._h3Selected?.has(k);
 
     if (isMulti) {
         items.push([`Delete selected clips (${selCount})`, () => removeSelectedClips(node)]);
@@ -586,6 +601,9 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                 ctx.fillText("audio", 2, RULER_H + LANE_H + 14);
 
                 ctx.save();
+                ctx.beginPath();
+                ctx.rect(0, RULER_H, WIDTH, H - RULER_H);
+                ctx.clip();
                 ctx.translate(-(this._pan ?? 0), 0);
 
                 const envPlayX =
@@ -596,17 +614,18 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                           : null;
                 for (const c of clips) {
                     const media = c.file ? ensureMedia(nd, c) : null;
-                    const selected = !!nd._h3Selected?.has(c.id);
-                    if (c.kind === "video") drawGhost(ctx, c, s, nd, selected);
+                    const videoSelected = !!nd._h3Selected?.has(c.id);
+                    const audioGhostSelected = !!(c.audio_link ? nd._h3Selected?.has(c.id) : nd._h3Selected?.has(`a_${c.id}`));
+                    if (c.kind === "video") drawGhost(ctx, c, s, nd, audioGhostSelected);
                     if (c.kind === "image") {
-                        drawBlock(ctx, COLORS.image, `img ${c.id}`, blockRect(c, s), false, media, nd, c, selected);
+                        drawBlock(ctx, COLORS.image, `img ${c.id}`, blockRect(c, s), false, media, nd, c, videoSelected);
                         drawEnvelope(ctx, blockRect(c, s), c, s, false, envPlayX);
                     } else if (c.kind === "video") {
                         if (!c.audio_off) drawEnvelope(ctx, ghostRect(c, s), c, s, true, envPlayX);
-                        drawBlock(ctx, COLORS.video, `video ${c.id}`, blockRect(c, s), false, media, nd, c, selected);
+                        drawBlock(ctx, COLORS.video, `video ${c.id}`, blockRect(c, s), false, media, nd, c, videoSelected);
                         drawEnvelope(ctx, blockRect(c, s), c, s, false, envPlayX);
                     } else {
-                        drawBlock(ctx, COLORS.audio, `audio ${c.id}`, blockRect(c, s), false, media, nd, c, selected);
+                        drawBlock(ctx, COLORS.audio, `audio ${c.id}`, blockRect(c, s), false, media, nd, c, videoSelected);
                         drawEnvelope(ctx, blockRect(c, s), c, s, false, envPlayX);
                     }
                 }
@@ -773,10 +792,11 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                     const hit = hitTest(nd, p, this._scale, this._pan);
                     e.preventDefault();
                     if (hit?.c) {
+                        const k = selKey(hit);
                         nd._h3Selected ??= new Set();
-                        if (!nd._h3Selected.has(hit.c.id)) {
+                        if (!nd._h3Selected.has(k)) {
                             nd._h3Selected.clear();
-                            nd._h3Selected.add(hit.c.id);
+                            nd._h3Selected.add(k);
                             this.redraw(nd);
                         }
                         const idx = nd._h3Clips?.indexOf(hit.c) ?? -1;
@@ -818,13 +838,14 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                     e.preventDefault();
 
                     if (hit.c) {
+                        const k = selKey(hit);
                         if (isCtrl) {
-                            if (nd._h3Selected.has(hit.c.id)) nd._h3Selected.delete(hit.c.id);
-                            else nd._h3Selected.add(hit.c.id);
+                            if (nd._h3Selected.has(k)) nd._h3Selected.delete(k);
+                            else nd._h3Selected.add(k);
                             this.redraw(nd);
-                        } else if (!nd._h3Selected.has(hit.c.id)) {
+                        } else if (!nd._h3Selected.has(k)) {
                             nd._h3Selected.clear();
-                            nd._h3Selected.add(hit.c.id);
+                            nd._h3Selected.add(k);
                             this.redraw(nd);
                         }
                     } else if (!isCtrl && nd._h3Selected.size && !["slider", "in", "out", "unit", "snap", "play", "split", "clear", "export", "import", "undo", "redo"].includes(hit.zone)) {
@@ -960,15 +981,60 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                             delete hit.c.audio_start;
                             delete hit.c.audio_len;
                             delete hit.c.audio_src_start;
+                            if (nd._h3Selected?.has(`a_${hit.c.id}`)) {
+                                nd._h3Selected.delete(`a_${hit.c.id}`);
+                                nd._h3Selected.add(hit.c.id);
+                            }
                         }
                         hit.c.audio_link = !hit.c.audio_link;
                         writeState(nd);
                     } else if (hit.c) {
                         recordHistory(nd);
-                        const isMulti = (nd._h3Selected?.size ?? 0) > 1 && nd._h3Selected.has(hit.c.id);
-                        const selectedClips = isMulti
-                            ? nd._h3Clips.filter((clip) => nd._h3Selected.has(clip.id))
-                            : [hit.c];
+                        const k = selKey(hit);
+                        const isMulti = (nd._h3Selected?.size ?? 0) > 1 && nd._h3Selected.has(k);
+                        const targets = [];
+                        if (isMulti) {
+                            for (const itemKey of nd._h3Selected) {
+                                if (typeof itemKey === "string" && itemKey.startsWith("a_")) {
+                                    const id = Number(itemKey.slice(2));
+                                    const clip = nd._h3Clips.find((c) => c.id === id);
+                                    if (clip && clip.kind === "video" && !clip.audio_link) {
+                                        targets.push({
+                                            clip,
+                                            audioEdit: true,
+                                            startAt: Number(clip.audio_start ?? clip.start),
+                                            lenAt: Number(clip.audio_len ?? clip.len ?? 22),
+                                            srcAt: Number(clip.audio_src_start ?? clip.src_start) || 0,
+                                        });
+                                    }
+                                } else {
+                                    const id = Number(itemKey);
+                                    const clip = nd._h3Clips.find((c) => c.id === id);
+                                    if (clip) {
+                                        targets.push({
+                                            clip,
+                                            audioEdit: false,
+                                            startAt: Number(clip.start),
+                                            lenAt: Number(clip.len ?? (clip.kind === "image" ? 3 : 22)),
+                                            srcAt: Number(clip.src_start) || 0,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        if (!targets.length) {
+                            const aEdit =
+                                hit.c.kind === "video" &&
+                                !hit.c.audio_link &&
+                                (hit.zone === "audio" || hit.zone === "trimAL" || hit.zone === "trimAR");
+                            targets.push({
+                                clip: hit.c,
+                                audioEdit: aEdit,
+                                startAt: Number(aEdit ? hit.c.audio_start ?? hit.c.start : hit.c.start),
+                                lenAt: Number(aEdit ? hit.c.audio_len ?? hit.c.len ?? 22 : hit.c.len ?? 22),
+                                srcAt: Number(hit.c.src_start) || 0,
+                            });
+                        }
                         const audioEdit =
                             hit.c.kind === "video" &&
                             !hit.c.audio_link &&
@@ -977,23 +1043,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                             ...hit,
                             grab: p[0],
                             isMulti,
-                            targets: selectedClips.map((clip) => {
-                                const aEdit =
-                                    clip.kind === "video" &&
-                                    !clip.audio_link &&
-                                    (hit.zone === "audio" || hit.zone === "trimAL" || hit.zone === "trimAR");
-                                return {
-                                    clip,
-                                    audioEdit: aEdit,
-                                    startAt: Number(
-                                        aEdit ? clip.audio_start ?? clip.start : clip.start,
-                                    ),
-                                    lenAt: Number(
-                                        aEdit ? clip.audio_len ?? clip.len ?? 22 : clip.len ?? 22,
-                                    ),
-                                    srcAt: Number(clip.src_start) || 0,
-                                };
-                            }),
+                            targets,
                             startAt: Number(
                                 audioEdit ? hit.c.audio_start ?? hit.c.start : hit.c.start,
                             ),
@@ -1067,32 +1117,13 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                             d.zone === "audio" || d.zone === "trimAL" || d.zone === "trimAR";
                         const lane = audioEdit ? 1 : laneOf(d.c.kind);
                         if (d.zone === "move" || d.zone === "audio") {
-                            if (d.isMulti && d.targets?.length > 1) {
-                                const minStart = Math.min(...d.targets.map((t) => t.startAt));
-                                const actualStep = Math.max(1 - minStart, step);
-                                for (const t of d.targets) {
-                                    const targetPos = t.startAt + actualStep;
-                                    if (t.audioEdit) t.clip.audio_start = targetPos;
-                                    else t.clip.start = targetPos;
-                                }
-                                this._frame = Math.max(1, d.startAt + actualStep);
-                            } else {
-                                const len = audioEdit
-                                    ? (d.c.audio_len ?? d.c.len ?? 22)
-                                    : clipLen(d.c);
-                                const s2 = resolveMove(
-                                    nd,
-                                    d.c,
-                                    lane,
-                                    Math.max(1, d.startAt + step),
-                                    len,
-                                    d.grab / s + 1,
-                                    s,
-                                );
-                                if (d.zone === "audio") d.c.audio_start = s2;
-                                else d.c.start = s2;
-                                this._frame = s2;
+                            const actualStep = resolveMultiMove(nd, d.targets, step, s);
+                            for (const t of d.targets) {
+                                const targetPos = t.startAt + actualStep;
+                                if (t.audioEdit) t.clip.audio_start = targetPos;
+                                else t.clip.start = targetPos;
                             }
+                            this._frame = Math.max(1, d.startAt + actualStep);
                         } else if (d.zone === "trimR" || d.zone === "trimAR") {
                             const lanes =
                                 lane === 0 && d.c.kind === "video" && d.c.audio_link && !d.c.audio_off
