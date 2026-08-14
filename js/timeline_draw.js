@@ -1,12 +1,13 @@
 // Canvas painting helpers for the H3 timeline widget.
 
 import { bandSrc, bandGeom, clamp, COLORS, ghostRect, WIDTH, envFlat, envLen, envPts, envStrengthAt, envX, envY, videoTokenStarts } from "./timeline_core.js";
-import { ensureMedia } from "./timeline_media.js";
+import { ensureMedia, getClipGifFrame } from "./timeline_media.js";
 
 function paintCover(ctx, el, r) {
-    if (!el || (!el.videoWidth && !el.naturalWidth)) return;
-    const w = el.videoWidth || el.naturalWidth;
-    const h = el.videoHeight || el.naturalHeight;
+    if (!el) return;
+    const w = el.videoWidth || el.naturalWidth || el.width;
+    const h = el.videoHeight || el.naturalHeight || el.height;
+    if (!w || !h) return;
     const s = Math.min(r.w / w, r.h / h);
     const dw = w * s;
     const dh = h * s;
@@ -79,8 +80,11 @@ export function drawBlock(ctx, color, label, r, ghost, media, node, clip, select
         paintWaveform(ctx, media, r, ghost, node, clip);
     } else if (!ghost && media?.kind === "image" && media.img) {
         paintThumb(ctx, media.img, r);
-    } else if (!ghost && media?.kind === "video" && node?._h3Thumbs?.get(clip?.id)?.el) {
-        paintThumb(ctx, node._h3Thumbs.get(clip.id).el, r);
+    } else if (!ghost && media?.kind === "video") {
+        const el = media.isGif
+            ? getClipGifFrame(node, clip, media)
+            : node?._h3Thumbs?.get(clip?.id)?.el;
+        if (el) paintThumb(ctx, el, r);
     }
     if (selected) {
         ctx.save();

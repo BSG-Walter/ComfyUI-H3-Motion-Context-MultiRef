@@ -62,6 +62,65 @@ function decodeAudio(node, m) {
         .catch(() => {});
 }
 
+export async function decodeGifFrames(url) {
+    if (typeof ImageDecoder !== "undefined") {
+        try {
+            const resp = await fetch(url);
+            const buf = await resp.arrayBuffer();
+            const decoder = new ImageDecoder({ data: buf, type: "image/gif" });
+            await decoder.tracks.ready;
+            const track = decoder.tracks.selectedTrack;
+            const count = track.frameCount;
+            const frames = [];
+            let totalDur = 0;
+            for (let i = 0; i < count; i++) {
+                const res = await decoder.decode({ frameIndex: i });
+                const dur = (res.image.duration || 100000) / 1000000;
+                const bmp = await createImageBitmap(res.image);
+                frames.push({ img: bmp, timestamp: totalDur, duration: dur });
+                totalDur += dur;
+                res.image.close();
+            }
+            return { frames, duration: totalDur || frames.length * 0.1, count };
+        } catch (e) {
+            console.warn("h3 timeline: ImageDecoder failed for gif", e);
+        }
+    }
+    return null;
+}
+
+export function gifFrameAtTime(m, target) {
+    if (!m?.frames?.length) return null;
+    if (m.frames.length === 1) return m.frames[0].img;
+    const total = m.duration || m.frames.length * 0.1;
+    if (total <= 0) return m.frames[0].img;
+    const t = Math.max(0, target) % total;
+    let acc = 0;
+    for (const f of m.frames) {
+        acc += f.duration;
+        if (t <= acc) return f.img;
+    }
+    return m.frames[m.frames.length - 1].img;
+}
+
+export function getClipGifFrame(node, clip, media) {
+    if (!media?.isGif || !media?.frames?.length) return null;
+    const w = node?._h3TimelineWidget;
+    const fps = w?._fps || 24;
+    const play = w?._play;
+    const frame = w?._frame;
+    const f = play != null ? play : frame != null ? frame - 1 : null;
+    let target = (Number(clip.src_start) || 0) / fps;
+    if (f != null) {
+        const s = Number(clip.start) - 1;
+        const len = Number(clip.len) || 22;
+        if (f >= s && f < s + len) {
+            target = (f - s + (Number(clip.src_start) || 0)) / fps;
+        }
+    }
+    return gifFrameAtTime(media, Math.max(0, target));
+}
+
 function loadMedia(node, _c, m) {
     if (m.kind === "image") {
         const img = new Image();
@@ -79,12 +138,17 @@ function loadMedia(node, _c, m) {
         return decodeAudio(node, m);
     }
     if (m.kind === "video") {
-        // thumbnails come from the per-clip <video> elements (seeked on
-        // demand in paint). The audio track is decoded into a WebAudio
-        // buffer so it can be played back via startSound, the same path
-        // used by audio clips — this sidesteps the browser autoplay-with-
-        // sound restriction that blocks .play() on a detached <video> once
-        // the user gesture has expired.
+        if ((m.url || "").toLowerCase().includes(".gif") || (_c?.file?.name || "").toLowerCase().endsWith(".gif")) {
+            m.isGif = true;
+            return decodeGifFrames(m.url).then((res) => {
+                if (res) {
+                    m.frames = res.frames;
+                    m.duration = res.duration;
+                    m.loaded = true;
+                    redrawNode(node);
+                }
+            });
+        }
         decodeAudio(node, m);
         return Promise.resolve();
     }
@@ -142,6 +206,21 @@ export function sourceFrames(node, c) {
 }
 
 export function thumbSeek(node, c, m, target) {
+    if (m?.isGif) {
+        let t = node._h3Thumbs.get(c.id);
+        if (!t) {
+            t = {
+                isGif: true,
+                t: -1,
+                currentFrame: null,
+            };
+            node._h3Thumbs.set(c.id, t);
+        }
+        t.isGif = true;
+        t.t = target;
+        t.currentFrame = gifFrameAtTime(m, target);
+        return t;
+    }
     const t = thumbEl(node, c, m);
     if (t.url === m.url && Math.abs(t.t - target) < 1 / 24) return t;
     t.url = m.url;
@@ -157,9 +236,16 @@ export function thumbSeek(node, c, m, target) {
 
 // read the duration of an uploaded video so new clips default to the full
 // source length. Resolves to null if the duration can't be probed quickly.
-export function probeVideoFrames(node, info) {
+export async function probeVideoFrames(node, info) {
+    const url = mediaURL(info);
+    if ((info?.name || "").toLowerCase().endsWith(".gif")) {
+        const data = await decodeGifFrames(url);
+        if (data) {
+            const fps = node._h3TimelineWidget?._fps || 24;
+            return Math.max(1, Math.round(data.duration * fps));
+        }
+    }
     return new Promise((resolve) => {
-        const url = mediaURL(info);
         const v = document.createElement("video");
         v.preload = "metadata";
         v.muted = true;

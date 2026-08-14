@@ -494,6 +494,9 @@ export function addClip(node, kind, info, lenOverride, startFrom = null) {
     if (info) {
         c.file = info;
         c.src_start = 0;
+        if ((info.name || "").toLowerCase().endsWith(".gif")) {
+            c.audio_off = true;
+        }
     }
     if (lenOverride && Number.isFinite(lenOverride) && lenOverride > 0) {
         c.source_len = lenOverride;
@@ -518,6 +521,9 @@ export async function replaceClipMedia(node, c) {
     delete c.source_len;
     delete c.source_end;
     delete c.src_floor;
+    if ((info.name || "").toLowerCase().endsWith(".gif")) {
+        c.audio_off = true;
+    }
     if (c.kind === "video" || c.kind === "audio") {
         const frames = await probeVideoFrames(node, info);
         if (frames && Number.isFinite(frames) && frames > 0) {

@@ -48,8 +48,8 @@ export const defaults = {
 
 // --- uploaded media helpers ------------------------------------------------
 
-const IMAGE_EXT = ["png", "jpg", "jpeg", "webp", "bmp", "gif"];
-const VIDEO_EXT = ["mp4", "mov", "webm", "mkv", "m4v", "avi"];
+const IMAGE_EXT = ["png", "jpg", "jpeg", "webp", "bmp"];
+const VIDEO_EXT = ["mp4", "mov", "webm", "mkv", "m4v", "avi", "gif"];
 const AUDIO_EXT = ["mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma"];
 
 export function kindOfFile(m) {

@@ -38,8 +38,10 @@ export function stopPlay(node) {
     stopSound(node);
     for (const [, t] of (node._h3Thumbs ?? []).entries()) {
         try {
-            t.el.pause();
-            t.el.muted = true;
+            if (t?.el) {
+                t.el.pause();
+                t.el.muted = true;
+            }
         } catch (_) {}
     }
 }
@@ -99,8 +101,10 @@ export function syncPreview(node) {
             vc.file;
         try {
             if (!active) {
-                t.el.pause();
-                t.el.muted = true;
+                if (t?.el) {
+                    t.el.pause();
+                    t.el.muted = true;
+                }
                 continue;
             }
             // the active clip's element PLAYS muted (visuals) while the
@@ -111,6 +115,11 @@ export function syncPreview(node) {
             const m = ensureMedia(node, vc);
             if (m?.kind !== "video") continue;
             const off = (play - (Number(vc.start) - 1) + (Number(vc.src_start) || 0)) / fps;
+            if (m.isGif) {
+                t.currentFrame = gifFrameAtTime(m, Math.max(0, off));
+                continue;
+            }
+            if (!t?.el) continue;
             if (t.el.paused) {
                 t.el.muted = true;
                 t.el.currentTime = Math.max(0, off);

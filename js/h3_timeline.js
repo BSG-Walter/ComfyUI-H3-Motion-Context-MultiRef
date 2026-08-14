@@ -636,7 +636,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                     if (c.kind !== "video" || !c.file) continue;
                     const key = mediaKey(c.file);
                     const m = nd._h3Media?.get(key);
-                    if (m?.kind !== "video") continue;
+                    if (m?.kind !== "video" || m?.isGif) continue;
                     if (c === playClip && playing) continue;
                     let target;
                     if (c === playClip) {

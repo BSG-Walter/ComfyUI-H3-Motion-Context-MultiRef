@@ -44,7 +44,7 @@ import folder_paths
 import node_helpers
 from comfy_extras.nodes_audio import f32_pcm
 from comfy_extras.nodes_minimax_h3 import _resize
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageSequence
 from safetensors.torch import load_file as _st_load, save_file as _st_save
 
 from .patch_layout import (
@@ -358,45 +358,68 @@ def _load_media_file(media, fps=None):
     When `fps` is supplied, video frames are resampled to that target frame rate.
     """
     frames, audio = None, None
-    with av.open(_media_ref_path(media)) as af:
-        streams = {s.type: s for s in af.streams}
-        vstream = streams.get("video")
-        vtimebase = float(vstream.time_base) if vstream and vstream.time_base is not None else None
-        vrate = float(vstream.average_rate) if vstream and vstream.average_rate else 24.0
+    mpath = _media_ref_path(media)
+    try:
+        with av.open(mpath) as af:
+            streams = {s.type: s for s in af.streams}
+            vstream = streams.get("video")
+            vtimebase = float(vstream.time_base) if vstream and vstream.time_base is not None else None
+            vrate = float(vstream.average_rate) if vstream and vstream.average_rate else 24.0
 
-        collected, chunks = [], []
-        for packet in af.demux():
-            stype = packet.stream.type if packet.stream is not None else None
-            if stype not in streams:
-                continue
-            if stype == "video":
-                for frame in packet.decode():
-                    arr = frame.to_ndarray(format="rgb24")
-                    if frame.pts is not None and vtimebase is not None:
-                        t_sec = float(frame.pts * vtimebase)
+            collected, chunks = [], []
+            for packet in af.demux():
+                stype = packet.stream.type if packet.stream is not None else None
+                if stype not in streams:
+                    continue
+                if stype == "video":
+                    for frame in packet.decode():
+                        arr = frame.to_ndarray(format="rgb24")
+                        if frame.pts is not None and vtimebase is not None:
+                            t_sec = float(frame.pts * vtimebase)
+                        else:
+                            t_sec = float(len(collected) / vrate)
+                        collected.append((t_sec, torch.from_numpy(
+                            np.asarray(arr, dtype=np.float32) / 255.0)))
+                elif stype == "audio":
+                    n_channels = streams["audio"].channels
+                    for frame in packet.decode():
+                        buf = torch.from_numpy(frame.to_ndarray())
+                        if buf.shape[0] != n_channels:
+                            buf = buf.view(-1, n_channels).t()
+                        chunks.append(buf)
+            if collected:
+                collected.sort(key=lambda item: item[0])
+                if fps is not None and fps > 0:
+                    frames = _resample_video_frames(collected, fps)
+                else:
+                    frames = torch.stack([item[1] for item in collected])
+            if chunks:
+                astream = streams["audio"]
+                audio = {
+                    "waveform": f32_pcm(torch.cat(chunks, dim=1)).unsqueeze(0),
+                    "sample_rate": int(astream.codec_context.sample_rate),
+                }
+    except Exception as e:
+        _LOG.warning("h3_motion_context: PyAV decode failed for %s: %s", mpath, e)
+
+    if frames is None and mpath.lower().endswith(".gif"):
+        try:
+            with Image.open(mpath) as img:
+                collected = []
+                t_sec = 0.0
+                for f in ImageSequence.Iterator(img):
+                    dur = float(f.info.get("duration") or 100) / 1000.0
+                    arr = np.asarray(f.convert("RGB"), dtype=np.float32) / 255.0
+                    collected.append((t_sec, torch.from_numpy(arr)))
+                    t_sec += dur
+                if collected:
+                    if fps is not None and fps > 0:
+                        frames = _resample_video_frames(collected, fps)
                     else:
-                        t_sec = float(len(collected) / vrate)
-                    collected.append((t_sec, torch.from_numpy(
-                        np.asarray(arr, dtype=np.float32) / 255.0)))
-            elif stype == "audio":
-                n_channels = streams["audio"].channels
-                for frame in packet.decode():
-                    buf = torch.from_numpy(frame.to_ndarray())
-                    if buf.shape[0] != n_channels:
-                        buf = buf.view(-1, n_channels).t()
-                    chunks.append(buf)
-        if collected:
-            collected.sort(key=lambda item: item[0])
-            if fps is not None and fps > 0:
-                frames = _resample_video_frames(collected, fps)
-            else:
-                frames = torch.stack([item[1] for item in collected])
-        if chunks:
-            astream = streams["audio"]
-            audio = {
-                "waveform": f32_pcm(torch.cat(chunks, dim=1)).unsqueeze(0),
-                "sample_rate": int(astream.codec_context.sample_rate),
-            }
+                        frames = torch.stack([item[1] for item in collected])
+        except Exception as e:
+            _LOG.warning("h3_motion_context: PIL GIF fallback failed for %s: %s", mpath, e)
+
     return {"frames": frames, "audio": audio}
 
 
