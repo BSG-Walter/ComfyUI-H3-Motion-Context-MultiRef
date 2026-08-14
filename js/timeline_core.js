@@ -101,10 +101,11 @@ export function occupiesLane(c, lane) {
 
 export function blockRect(c, s) {
     const len = clipLen(c);
+    const minW = len === 1 ? 8 : 4;
     return {
         x: OFFSET_X + (Number(c.start) - 1) * s + 2,
         y: RULER_H + laneOf(c.kind) * LANE_H + 4,
-        w: Math.max(2, len * s - 4),
+        w: Math.max(minW, len * s - 4),
         h: LANE_H - 8,
     };
 }
@@ -121,10 +122,11 @@ export function bandGeom(c) {
 
 export function ghostRect(c, s) {
     const { start, len } = bandGeom(c);
+    const minW = len === 1 ? 8 : 4;
     return {
         x: OFFSET_X + (Number(start) - 1) * s + 2,
         y: RULER_H + LANE_H + 4,
-        w: Math.max(2, len * s - 4),
+        w: Math.max(minW, len * s - 4),
         h: LANE_H - 8,
     };
 }
@@ -258,18 +260,28 @@ export function resolveMove(node, c, lane, s, len, grab, px) {
     return Math.max(1, s);
 }
 
-export function inRect(p, r, pad = 0) {
+export function inRect(p, r, padX = 0, padY = 0) {
+    const px = typeof padX === "number" ? padX : 0;
+    const py = typeof padY === "number" ? padY : px;
     return (
-        p[0] >= r.x - pad &&
-        p[0] <= r.x + r.w + pad &&
-        p[1] >= r.y - pad &&
-        p[1] <= r.y + r.h + pad
+        p[0] >= r.x - px &&
+        p[0] <= r.x + r.w + px &&
+        p[1] >= r.y - py &&
+        p[1] <= r.y + r.h + py
     );
 }
 
 export function edgeZone(p, r) {
-    if (p[0] < r.x + 5) return "trimL";
-    if (p[0] > r.x + r.w - 5) return "trimR";
+    // If the clip is too narrow (e.g. 1 frame on zoom out, or width < 18px),
+    // do not trigger trim handles inside the body so the user can easily grab and move it.
+    if (r.w < 18) {
+        if (p[0] < r.x - 2) return "trimL";
+        if (p[0] > r.x + r.w + 2) return "trimR";
+        return null;
+    }
+    const trimMargin = Math.min(6, Math.max(3, Math.floor(r.w * 0.25)));
+    if (p[0] < r.x + trimMargin) return "trimL";
+    if (p[0] > r.x + r.w - trimMargin) return "trimR";
     return null;
 }
 
@@ -455,6 +467,7 @@ export function envZone(c, p, s) {
         rects.push([blockRect(c, s), false]);
     }
     for (const [r, ghost] of rects) {
+        if (r.w < 16) continue; // let narrow blocks be grabbed/dragged freely
         if (p[0] < r.x || p[0] > r.x + r.w || p[1] < r.y || p[1] > r.y + r.h) continue;
         if (ghost) {
             const bx = r.x + 8;
@@ -495,7 +508,8 @@ export function hitTest(node, p, s, pan = 0) {
         if (ez) return { i, c, ...ez };
         if (c.kind === "video" && !c.audio_off) {
             const g = ghostRect(c, s);
-            if (inRect(q, g, 4)) {
+            const padX = g.w < 16 ? 6 : 4;
+            if (inRect(q, g, padX, 4)) {
                 // edge trims win over the link toggle so the ghost's
                 // borders stay grabbable; the toggle keeps the middle.
                 if (!c.audio_link) {
@@ -505,7 +519,7 @@ export function hitTest(node, p, s, pan = 0) {
                 }
                 const bx = g.x + 8;
                 const by = g.y + g.h / 2;
-                if (Math.hypot(q[0] - bx, q[1] - by) < 9) {
+                if (g.w >= 20 && Math.hypot(q[0] - bx, q[1] - by) < 9) {
                     return { i, c, zone: "link" };
                 }
                 if (!c.audio_link) return { i, c, zone: "audio" };
@@ -513,7 +527,8 @@ export function hitTest(node, p, s, pan = 0) {
             }
         }
         const r = blockRect(c, s);
-        if (inRect(q, r, 2)) {
+        const padX = r.w < 16 ? 6 : 2;
+        if (inRect(q, r, padX, 2)) {
             return { i, c, zone: edgeZone(q, r) || "move" };
         }
     }
