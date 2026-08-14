@@ -21,7 +21,7 @@ export const PAD = 4;
 export const WIDTH = 840;
 export const HEIGHT = RULER_H + 2 * LANE_H + PAD;
 export const SB_H = 16; // horizontal scrollbar height under the timeline
-export const TOOL_X = WIDTH - 460; // first toolbar button x (measured widths, so slack)
+export const TOOL_X = WIDTH - 540; // first toolbar button x (measured widths, so slack)
 export const SLIDER_W = 74; // zoom slider track width
 
 export const COLORS = {
@@ -102,20 +102,29 @@ export function occupiesLane(c, lane) {
 export function blockRect(c, s) {
     const len = clipLen(c);
     return {
-        x: OFFSET_X + (Number(c.start) - 1) * s + 2,
+        x: OFFSET_X + (Number(c.start) - 1) * s + 1,
         y: RULER_H + laneOf(c.kind) * LANE_H + 4,
-        w: Math.max(2, len * s - 4),
+        w: Math.max(2, len * s - 2),
         h: LANE_H - 8,
     };
 }
 
+// audio-lane position/length of a clip: audio clips use their own start/len,
+// a video's band follows the video while linked and its own audio_* fields
+// once separated
+export function bandGeom(c) {
+    const audio = c.kind === "audio";
+    const start = audio ? c.start : c.audio_link ? c.start : c.audio_start ?? c.start;
+    const len = audio ? c.len : c.audio_link ? c.len : c.audio_len ?? c.len ?? 22;
+    return { start: Number(start), len: Number(len) || 22 };
+}
+
 export function ghostRect(c, s) {
-    const start = c.audio_link ? c.start : c.audio_start ?? c.start;
-    const len = c.audio_link ? c.len : c.audio_len ?? c.len ?? 22;
+    const { start, len } = bandGeom(c);
     return {
-        x: OFFSET_X + (Number(start) - 1) * s + 2,
+        x: OFFSET_X + (Number(start) - 1) * s + 1,
         y: RULER_H + LANE_H + 4,
-        w: Math.max(2, (Number(len) || 22) * s - 4),
+        w: Math.max(2, len * s - 2),
         h: LANE_H - 8,
     };
 }
@@ -127,19 +136,8 @@ export function laneRange(c, lane) {
         return { s: Number(c.start), e: Number(c.start) + len };
     }
     if (c.audio_off) return { s: 0, e: 0 };
-    const s =
-        c.kind === "audio"
-            ? Number(c.start)
-            : c.audio_link
-              ? Number(c.start)
-              : Number(c.audio_start ?? c.start);
-    const len =
-        c.kind === "audio"
-            ? Number(c.len) || 22
-            : c.audio_link
-              ? Number(c.len) || 22
-              : Number(c.audio_len ?? c.len ?? 22);
-    return { s, e: s + len };
+    const { start, len } = bandGeom(c);
+    return { s: start, e: start + len };
 }
 
 // the time range the clip's sound actually plays in (the audio-lane range:
@@ -147,9 +145,8 @@ export function laneRange(c, lane) {
 // audio_off clips have no sound at all.
 export function soundRange(c) {
     if (c.audio_off) return { s: -1, e: -1 };
-    const start = c.audio_link ? c.start : c.audio_start ?? c.start;
-    const len = c.audio_link ? c.len : c.audio_len ?? c.len ?? 22;
-    return { s: Number(start), e: Number(start) + (Number(len) || 22) };
+    const { start, len } = bandGeom(c);
+    return { s: start, e: start + len };
 }
 
 // the source frame where a clip's sound content begins: a separated
@@ -261,23 +258,37 @@ export function resolveMove(node, c, lane, s, len, grab, px) {
     return Math.max(1, s);
 }
 
-export function inRect(p, r, pad = 0) {
+export function inRect(p, r, padX = 0, padY = 0) {
+    const px = typeof padX === "number" ? padX : 0;
+    const py = typeof padY === "number" ? padY : px;
     return (
-        p[0] >= r.x - pad &&
-        p[0] <= r.x + r.w + pad &&
-        p[1] >= r.y - pad &&
-        p[1] <= r.y + r.h + pad
+        p[0] >= r.x - px &&
+        p[0] <= r.x + r.w + px &&
+        p[1] >= r.y - py &&
+        p[1] <= r.y + r.h + py
     );
 }
 
 export function edgeZone(p, r) {
-    if (p[0] < r.x + 5) return "trimL";
-    if (p[0] > r.x + r.w - 5) return "trimR";
+    // If the clip is too narrow (e.g. 1 frame on zoom out, or width < 18px),
+    // do not trigger trim handles inside the body so the user can easily grab and move it.
+    if (r.w < 18) {
+        if (p[0] < r.x - 2) return "trimL";
+        if (p[0] > r.x + r.w + 2) return "trimR";
+        return null;
+    }
+    const trimMargin = Math.min(6, Math.max(3, Math.floor(r.w * 0.25)));
+    if (p[0] < r.x + trimMargin) return "trimL";
+    if (p[0] > r.x + r.w - trimMargin) return "trimR";
     return null;
 }
 
 export function btnZone(node, p) {
     if (p[1] > RULER_H) return null;
+    // toolbar (buttons + slider) only spans the top strip; the ruler-number
+    // band below it (drawn at RULER_H - 15) must stay ruler hits even when
+    // its x overlaps a button
+    if (p[1] > RULER_H - 16) return "ruler";
     const w = node._h3TimelineWidget;
     const btns = Array.isArray(w?._btns) ? w._btns : [];
     const s = w?._sliderX;
@@ -454,6 +465,7 @@ export function envZone(c, p, s) {
         rects.push([blockRect(c, s), false]);
     }
     for (const [r, ghost] of rects) {
+        if (r.w < 16) continue; // let narrow blocks be grabbed/dragged freely
         if (p[0] < r.x || p[0] > r.x + r.w || p[1] < r.y || p[1] > r.y + r.h) continue;
         if (ghost) {
             const bx = r.x + 8;
@@ -494,17 +506,23 @@ export function hitTest(node, p, s, pan = 0) {
         if (ez) return { i, c, ...ez };
         if (c.kind === "video" && !c.audio_off) {
             const g = ghostRect(c, s);
-            if (inRect(q, g, 4)) {
+            const aLen = Number(c.audio_link ? c.len : c.audio_len ?? c.len ?? 22) || 1;
+            const padX = g.w < 16 ? 6 : 4;
+            if (inRect(q, g, padX, 4)) {
                 // edge trims win over the link toggle so the ghost's
                 // borders stay grabbable; the toggle keeps the middle.
                 if (!c.audio_link) {
+                    if (aLen === 1) {
+                        if (q[0] > g.x + g.w + 1) return { i, c, zone: "trimAR" };
+                        return { i, c, zone: "audio" };
+                    }
                     const ez = edgeZone(q, g);
                     if (ez === "trimL") return { i, c, zone: "trimAL" };
                     if (ez === "trimR") return { i, c, zone: "trimAR" };
                 }
                 const bx = g.x + 8;
                 const by = g.y + g.h / 2;
-                if (Math.hypot(q[0] - bx, q[1] - by) < 9) {
+                if (g.w >= 20 && Math.hypot(q[0] - bx, q[1] - by) < 9) {
                     return { i, c, zone: "link" };
                 }
                 if (!c.audio_link) return { i, c, zone: "audio" };
@@ -512,7 +530,13 @@ export function hitTest(node, p, s, pan = 0) {
             }
         }
         const r = blockRect(c, s);
-        if (inRect(q, r, 2)) {
+        const len = clipLen(c);
+        const padX = r.w < 16 ? 6 : 2;
+        if (inRect(q, r, padX, 2)) {
+            if (len === 1) {
+                if (q[0] > r.x + r.w + 1) return { i, c, zone: "trimR" };
+                return { i, c, zone: "move" };
+            }
             return { i, c, zone: edgeZone(q, r) || "move" };
         }
     }

@@ -11,11 +11,6 @@ app.registerExtension(
         slotLabel: (i) => `video ${i}`,
         positionLabel: (i) => `video ${i} position`,
         strengthLabel: (i) => `video ${i} strength`,
-        strengthTooltip:
-            "How much of the clip the model may re-render: 1.0 pins it " +
-            "exactly; 0.9 almost the clip, minor reshaping; 0.5 half clip " +
-            "half model; 0.1 a light hint. The zone stays clean at any " +
-            "strength.",
         extraInputs: [
             {
                 prefix: "video_audio_",

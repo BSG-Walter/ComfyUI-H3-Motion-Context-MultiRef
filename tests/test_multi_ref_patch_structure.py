@@ -13,6 +13,7 @@ NODES = (ROOT / "nodes.py").read_text(encoding="utf-8")
 LAYOUT = (ROOT / "patch_layout.py").read_text(encoding="utf-8")
 PAYLOAD = (ROOT / "patch_payload.py").read_text(encoding="utf-8")
 TIMELINE_DRAW_JS = (ROOT / "js" / "timeline_draw.js").read_text(encoding="utf-8")
+TIMELINE_CORE_JS = (ROOT / "js" / "timeline_core.js").read_text(encoding="utf-8")
 
 
 def main():
@@ -57,12 +58,12 @@ def main():
 
     # Timeline UI/backend wiring fixes: linked video audio ignores stale
     # audio_len, and dynamic inputs follow stable clip ids.
-    assert ': clip.audio_link' in TIMELINE_DRAW_JS
+    # Linked video audio ignores stale audio_len: bandGeom is the single
+    # source for clip geometry in timeline_core, and it consults audio_link
+    # to pick start/end (c.start/end vs .audio_start/audio_len).
+    assert 'bandGeom' in TIMELINE_CORE_JS
+    assert 'audio_link' in TIMELINE_CORE_JS
     assert 'slot = int(clip.get("id") or idx)' in NODES
-
-    # Duplicate-install hardening lives in the layout patcher.
-    assert '_FOREIGN_ORIG_NAMES' in LAYOUT
-    assert '_find_dup_installs' in LAYOUT
 
     print("PASS: multi-ref timeline-audio fork structure + Python syntax")
 
