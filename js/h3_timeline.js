@@ -30,6 +30,7 @@ import {
     blockRect,
     ghostRect,
     resolveMove,
+    resolveMultiMove,
     probeSnap,
     splitSnap,
     hitTest,
@@ -1113,32 +1114,13 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                             d.zone === "audio" || d.zone === "trimAL" || d.zone === "trimAR";
                         const lane = audioEdit ? 1 : laneOf(d.c.kind);
                         if (d.zone === "move" || d.zone === "audio") {
-                            if (d.isMulti && d.targets?.length > 1) {
-                                const minStart = Math.min(...d.targets.map((t) => t.startAt));
-                                const actualStep = Math.max(1 - minStart, step);
-                                for (const t of d.targets) {
-                                    const targetPos = t.startAt + actualStep;
-                                    if (t.audioEdit) t.clip.audio_start = targetPos;
-                                    else t.clip.start = targetPos;
-                                }
-                                this._frame = Math.max(1, d.startAt + actualStep);
-                            } else {
-                                const len = audioEdit
-                                    ? (d.c.audio_len ?? d.c.len ?? 22)
-                                    : clipLen(d.c);
-                                const s2 = resolveMove(
-                                    nd,
-                                    d.c,
-                                    lane,
-                                    Math.max(1, d.startAt + step),
-                                    len,
-                                    d.grab / s + 1,
-                                    s,
-                                );
-                                if (d.zone === "audio") d.c.audio_start = s2;
-                                else d.c.start = s2;
-                                this._frame = s2;
+                            const actualStep = resolveMultiMove(nd, d.targets, step, s);
+                            for (const t of d.targets) {
+                                const targetPos = t.startAt + actualStep;
+                                if (t.audioEdit) t.clip.audio_start = targetPos;
+                                else t.clip.start = targetPos;
                             }
+                            this._frame = Math.max(1, d.startAt + actualStep);
                         } else if (d.zone === "trimR" || d.zone === "trimAR") {
                             const lanes =
                                 lane === 0 && d.c.kind === "video" && d.c.audio_link && !d.c.audio_off

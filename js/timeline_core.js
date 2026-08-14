@@ -258,6 +258,99 @@ export function resolveMove(node, c, lane, s, len, grab, px) {
     return Math.max(1, s);
 }
 
+export function resolveMultiMove(node, targets, desiredStep, scale) {
+    if (!targets || !targets.length) return 0;
+    const minStart = Math.min(...targets.map((t) => t.startAt));
+    const span = node._h3Span ?? SPAN;
+
+    const obstaclesByLane = { 0: [], 1: [] };
+    const targetVideoClips = new Set(targets.filter((t) => !t.audioEdit).map((t) => t.clip));
+    const targetAudioTracks = new Set(
+        targets.map((t) => (t.audioEdit ? `a_${t.clip.id}` : t.clip.id)),
+    );
+
+    for (const c of node._h3Clips) {
+        if (occupiesLane(c, 0)) {
+            if (!targetVideoClips.has(c)) {
+                obstaclesByLane[0].push(laneRange(c, 0));
+            }
+        }
+        if (occupiesLane(c, 1)) {
+            const key = c.kind === "video" && !c.audio_link ? `a_${c.id}` : c.id;
+            if (!targetAudioTracks.has(key) && !targetVideoClips.has(c)) {
+                obstaclesByLane[1].push(laneRange(c, 1));
+            }
+        }
+    }
+
+    let minStep = 1 - minStart;
+    let maxStep = Infinity;
+
+    for (const t of targets) {
+        const lanes = t.audioEdit
+            ? [1]
+            : t.clip.kind === "video" && t.clip.audio_link && !t.clip.audio_off
+              ? [0, 1]
+              : [laneOf(t.clip.kind)];
+
+        const tStart = t.startAt;
+        const tEnd = tStart + t.lenAt;
+
+        for (const L of lanes) {
+            for (const obs of obstaclesByLane[L]) {
+                if (obs.e <= tStart) {
+                    minStep = Math.max(minStep, obs.e - tStart);
+                } else if (obs.s >= tEnd) {
+                    maxStep = Math.min(maxStep, obs.s - tEnd);
+                } else {
+                    if (tStart >= obs.s) minStep = Math.max(minStep, 0);
+                    if (tEnd <= obs.e) maxStep = Math.min(maxStep, 0);
+                }
+            }
+        }
+    }
+
+    if (minStep > maxStep) return 0;
+
+    let actualStep = clamp(desiredStep, minStep, maxStep);
+
+    if (node._h3TimelineWidget?._snapEnabled !== false && scale > 0) {
+        const snapThreshold = Math.max(0.5, SNAP_PLAY_PX / scale);
+        let bestStep = actualStep;
+        let dBest = Infinity;
+
+        const probeCandidate = (candStep) => {
+            if (candStep < minStep || candStep > maxStep) return;
+            const diff = Math.abs(candStep - desiredStep);
+            if (diff <= snapThreshold && diff < dBest) {
+                dBest = diff;
+                bestStep = candStep;
+            }
+        };
+
+        const snapLines = [1, span + 1];
+        const pl = node._h3TimelineWidget?._play;
+        if (pl != null) snapLines.push(Math.round(pl) + 1);
+
+        for (const L of [0, 1]) {
+            for (const obs of obstaclesByLane[L]) {
+                snapLines.push(obs.s, obs.e);
+            }
+        }
+
+        for (const line of snapLines) {
+            for (const t of targets) {
+                probeCandidate(line - t.startAt);
+                probeCandidate(line - t.lenAt - t.startAt);
+            }
+        }
+
+        actualStep = bestStep;
+    }
+
+    return actualStep;
+}
+
 export function inRect(p, r, padX = 0, padY = 0) {
     const px = typeof padX === "number" ? padX : 0;
     const py = typeof padY === "number" ? padY : px;
