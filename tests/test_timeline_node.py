@@ -347,7 +347,6 @@ print("audio_vae requirement OK")
 
 # --- uploaded media files: clips reference {name, subfolder, type} ---
 from PIL import Image as _PILImage
-import io as _io
 import imageio_ffmpeg
 import json
 import numpy as np

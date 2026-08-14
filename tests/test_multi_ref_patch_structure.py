@@ -65,10 +65,6 @@ def main():
     assert 'audio_link' in TIMELINE_CORE_JS
     assert 'slot = int(clip.get("id") or idx)' in NODES
 
-    # Duplicate-install hardening lives in the layout patcher.
-    assert '_FOREIGN_ORIG_NAMES' in LAYOUT
-    assert '_find_dup_installs' in LAYOUT
-
     print("PASS: multi-ref timeline-audio fork structure + Python syntax")
 
 

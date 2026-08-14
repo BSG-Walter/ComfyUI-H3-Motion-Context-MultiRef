@@ -38,7 +38,6 @@ import logging
 import os
 
 import av
-import bisect
 import numpy as np
 import torch
 import folder_paths
@@ -139,17 +138,8 @@ def _env_curve(env, flat):
 
 def _env_strength(pts, frame):
     """Linear-interpolated strength at a content frame; end-clamped."""
-    if len(pts) == 1 or frame <= pts[0][0]:
-        return pts[0][1]
-    last = pts[-1]
-    if frame >= last[0]:
-        return last[1]
-    for (f0, s0), (f1, s1) in zip(pts, pts[1:]):
-        if f0 <= frame <= f1:
-            if f1 <= f0:
-                return s1
-            return s0 + (s1 - s0) * (frame - f0) / (f1 - f0)
-    return last[1]
+    frames, strengths = zip(*pts)
+    return float(np.interp(frame, frames, strengths))
 
 
 def _ensure_h3_runtime_patches():
@@ -341,38 +331,21 @@ def _resample_video_frames(collected_timed_frames, target_fps):
     """Resample a list of (timestamp_seconds, frame_tensor) to target_fps."""
     if not collected_timed_frames:
         return None
-    if target_fps is None or target_fps <= 0:
-        return torch.stack([item[1] for item in collected_timed_frames])
-
-    times = [item[0] for item in collected_timed_frames]
+    times = np.array([item[0] for item in collected_timed_frames])
     frames = [item[1] for item in collected_timed_frames]
-
-    if len(frames) == 1 or times[-1] <= times[0]:
+    if target_fps is None or target_fps <= 0 or len(frames) == 1 or times[-1] <= times[0]:
         return torch.stack(frames)
 
-    start_t = times[0]
-    end_t = times[-1]
-    duration = end_t - start_t
+    duration = times[-1] - times[0]
     num_target = max(1, int(round(duration * target_fps)) + 1)
+    target_times = np.arange(num_target) / float(target_fps) + times[0]
+    target_times = target_times[target_times <= times[-1] + 0.5 / float(target_fps)]
 
-    resampled = []
-    dt = 1.0 / float(target_fps)
-    for i in range(num_target):
-        target_t = start_t + i * dt
-        if target_t > end_t + dt * 0.5:
-            break
-        pos = bisect.bisect_left(times, target_t)
-        if pos == 0:
-            best_idx = 0
-        elif pos >= len(times):
-            best_idx = len(times) - 1
-        else:
-            d_prev = abs(target_t - times[pos - 1])
-            d_next = abs(target_t - times[pos])
-            best_idx = pos - 1 if d_prev <= d_next else pos
-        resampled.append(frames[best_idx])
-
-    return torch.stack(resampled)
+    pos = np.clip(np.searchsorted(times, target_times), 1, len(times) - 1)
+    left_dist = np.abs(target_times - times[pos - 1])
+    right_dist = np.abs(target_times - times[pos])
+    indices = np.where(left_dist <= right_dist, pos - 1, pos)
+    return torch.stack([frames[i] for i in indices])
 
 
 def _load_media_file(media, fps=None):
@@ -848,24 +821,8 @@ class MiniMaxH3MotionContextTrim:
 
 
 def _resolve_latent_path(path, clip_index=0):
-    """Turn the loader's path input into a concrete file.
-
-    Accepts an absolute path, a path relative to ComfyUI's output folder,
-    or a directory (in either form). For a directory:
-
-      clip_index == 0   the NEWEST .safetensors inside is used. Simple,
-                        but NOT retry-safe: re-rolling a clip loads the
-                        rejected attempt's own save (see the node docs).
-                        Its run counter also numbers ATTEMPTS, not clips.
-      clip_index  > 0   exactly that clip's slot is loaded: clip 1 is
-                        *_00001.safetensors. Auto-mode files carry a
-                        trailing underscore (*_00001_.safetensors) and
-                        are never matched, because their numbers count
-                        runs and could hold a reject.
-    """
-    p = (path or "").strip().strip('"').strip("'")
-    if not p:
-        p = "h3_context"
+    """Turn the loader's path input into a concrete file."""
+    p = (path or "").strip().strip('"').strip("'") or "h3_context"
     candidates = [p, os.path.join(folder_paths.get_output_directory(), p)]
     for c in candidates:
         if os.path.isfile(c):
@@ -873,42 +830,15 @@ def _resolve_latent_path(path, clip_index=0):
         if os.path.isdir(c):
             idx = int(clip_index)
             if idx > 0:
-                # indexed slots use the natural name: clip 2 lives in
-                # *_00002.safetensors. Auto-mode files carry a trailing
-                # underscore (*_00002_.safetensors) and are deliberately
-                # NOT matched: their numbers count runs, not clips, so a
-                # reject could be sitting in any of them.
-                endings = ("_%05d.safetensors" % idx,)
-                files = [os.path.join(c, f) for f in os.listdir(c)
-                         if f.endswith(endings)]
+                files = [os.path.join(c, f) for f in os.listdir(c) if f.endswith("_%05d.safetensors" % idx)]
                 if not files:
-                    near = [f for f in os.listdir(c)
-                            if f.endswith("_%05d_.safetensors" % idx)]
-                    hint = ""
-                    if near:
-                        hint = (" Found %s, which is an auto-numbered save "
-                                "(trailing underscore = numbered by RUN, so "
-                                "it may be a reject). If it really is clip "
-                                "%d, rename it to drop the trailing "
-                                "underscore: %s" %
-                                (near[0], idx,
-                                 near[0].replace("_%05d_" % idx,
-                                                 "_%05d" % idx)))
-                    raise FileNotFoundError(
-                        "h3_motion_context: no saved latent for clip %d "
-                        "(no *_%05d.safetensors in %s).%s"
-                        % (idx, idx, c, hint))
+                    raise FileNotFoundError("h3_motion_context: no saved latent for clip %d in %s" % (idx, c))
             else:
-                files = [os.path.join(c, f) for f in os.listdir(c)
-                         if f.endswith(".safetensors")]
+                files = [os.path.join(c, f) for f in os.listdir(c) if f.endswith(".safetensors")]
                 if not files:
-                    raise FileNotFoundError(
-                        "h3_motion_context: no saved latents in %s. Run a "
-                        "clip with the Save Latent node first." % c)
+                    raise FileNotFoundError("h3_motion_context: no saved latents in %s" % c)
             return max(files, key=os.path.getmtime)
-    raise FileNotFoundError(
-        "h3_motion_context: %r is neither a file nor a folder (also tried "
-        "relative to the ComfyUI output directory)." % p)
+    raise FileNotFoundError("h3_motion_context: %r is neither a file nor a folder" % p)
 
 
 class MiniMaxH3MotionContextSaveLatent:
@@ -1057,35 +987,23 @@ class MiniMaxH3MotionContextLoadLatent:
 
 
 class _DynamicInputs(dict):
-    """Dynamic backend input map: accepts any key under any declared prefix.
-    Fixed entries (keyword arguments) are stored as real dict items so they
-    survive API serialization and enumerate normally.
-
-    Legacy two-argument form (one prefix, one type) still works.
-    """
+    """Dynamic backend input map: accepts any key under any declared prefix."""
 
     def __init__(self, *pairs, **fixed):
-        self._prefixes = {}
-        if len(pairs) == 2 and isinstance(pairs[0], str) \
-                and isinstance(pairs[1], (tuple, list)):
+        super().__init__(**fixed)
+        if len(pairs) == 2 and isinstance(pairs[0], str) and isinstance(pairs[1], (tuple, list)):
             pairs = [pairs]
-        # longest prefix wins, so "video_audio_" beats "video_"
-        for prefix, types in sorted(pairs, key=lambda p: -len(p[0])):
-            self._prefixes[prefix] = types
-        for name, spec in fixed.items():
-            dict.__setitem__(self, name, spec)
+        self._prefixes = sorted(pairs, key=lambda p: -len(p[0]))
 
     def __contains__(self, key):
-        return (isinstance(key, str)
-                and any(key.startswith(p) for p in self._prefixes)) \
-                or dict.__contains__(self, key)
+        return super().__contains__(key) or (isinstance(key, str) and any(key.startswith(p[0]) for p in self._prefixes))
 
     def __getitem__(self, key):
         if isinstance(key, str):
-            for prefix, types in self._prefixes.items():
-                if key.startswith(prefix):
+            for p, types in self._prefixes:
+                if key.startswith(p):
                     return types
-        return dict.__getitem__(self, key)
+        return super().__getitem__(key)
 
     def get(self, key, default=None):
         try:
