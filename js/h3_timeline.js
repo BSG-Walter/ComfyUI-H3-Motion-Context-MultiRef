@@ -655,10 +655,8 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                     e.preventDefault();
                     const idx = nd._h3Clips?.indexOf(hit.c) ?? -1;
                     if (idx >= 0) {
-                        const envHit =
-                            hit.zone === "envpt" || hit.zone === "envln"
-                                ? { ghost: hit.ghost, p, pt: hit.pt }
-                                : null;
+                        const ghost = !!(hit.ghost || hit.zone === "audio" || hit.zone === "trimAL" || hit.zone === "trimAR");
+                        const envHit = { ghost, p: [cx, p[1]], pt: hit.pt };
                         openClipMenu(nd, this, hit.c, idx, e.clientX ?? pos[0], e.clientY ?? pos[1], hit.zone, envHit);
                     }
                     return true;
@@ -666,11 +664,12 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                 if (type.endsWith("down") && e.button === 0) {
                     const now = performance.now();
                     const dbl =
-                        now - this._lastDown < 400 &&
+                        now - (this._lastDown ?? 0) < 450 &&
                         this._lastDownPos &&
-                        Math.hypot(p[0] - this._lastDownPos[0], p[1] - this._lastDownPos[1]) < 6;
+                        Math.hypot(p[0] - this._lastDownPos[0], p[1] - this._lastDownPos[1]) < 12;
                     this._lastDown = now;
                     this._lastDownPos = p;
+                    this._dragged = false;
                     const hit = hitTest(nd, p, this._scale, this._pan);
                     if (!hit) return false;
                     e.preventDefault();
@@ -724,7 +723,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                         return true;
                     }
                     if (hit.zone === "ruler") {
-this._dragPlay = true;
+                        this._dragPlay = true;
                         const s = this._scale;
                         const v = Math.max(0, Math.round((cx - OFFSET_X) / s));
                         this._play = splitSnap(nd, v, s);
@@ -733,17 +732,18 @@ this._dragPlay = true;
                         this.redraw(nd);
                         return true;
                     }
-                    if (hit.zone === "envpt" || hit.zone === "envln") {
+                    if (hit.zone === "envpt" || hit.zone === "envln" || (dbl && hit.c)) {
                         // strength envelope: double-click a point to remove
-                        // it or the line to add one, drag a point, or drag
+                        // it or the block/line to add one, drag a point, or drag
                         // the flat line to set the flat level when no points
                         // exist
                         const s = this._scale;
                         const c = hit.c;
-                        const r = hit.ghost ? ghostRect(c, s) : blockRect(c, s);
-                        const len = envLen(c, hit.ghost);
+                        const ghost = !!(hit.ghost || hit.zone === "audio" || hit.zone === "trimAL" || hit.zone === "trimAR");
+                        const r = ghost ? ghostRect(c, s) : blockRect(c, s);
+                        const len = envLen(c, ghost);
                         if (hit.zone === "envpt" && dbl) {
-                            const env = envField(c, hit.ghost);
+                            const env = envField(c, ghost);
                             const i = Array.isArray(env) ? env.indexOf(hit.pt) : -1;
                             if (i >= 0) env.splice(i, 1);
                             writeState(nd);
@@ -751,21 +751,21 @@ this._dragPlay = true;
                             return true;
                         }
                         if (hit.zone === "envpt") {
-                            this._dragEnv = { c, ghost: hit.ghost, pt: hit.pt, len };
+                            this._dragEnv = { c, ghost, pt: hit.pt, len };
                         } else if (dbl) {
-                            const env = envNormalize(c, hit.ghost);
+                            const env = envNormalize(c, ghost);
                             const rawF = clamp(Math.round((cx - r.x) / s), 0, len);
                             const pt = [
-                                c.kind === "video" && !hit.ghost
+                                c.kind === "video" && !ghost
                                     ? tokenSnap(rawF, len)
                                     : rawF,
                                 envStrengthAtY(r, p[1]),
                             ];
                             env.push(pt);
                             env.sort((a, b) => a[0] - b[0]);
-                            this._dragEnv = { c, ghost: hit.ghost, pt, len };
-                        } else if (!envPts(c, hit.ghost).length) {
-                            this._dragFlat = { c, ghost: hit.ghost };
+                            this._dragEnv = { c, ghost, pt, len };
+                        } else if (!envPts(c, ghost).length && hit.zone === "envln") {
+                            this._dragFlat = { c, ghost };
                         } else {
                             return true;
                         }
@@ -820,6 +820,11 @@ this._dragPlay = true;
                     nd._h3Hovered = true;
                     this._hover = hitTest(nd, p, this._scale, this._pan);
                     this._hoverPos = [cx, p[1]];
+                    if (this._drag || this._dragEnv || this._dragFlat || this._dragPlay || this._dragSlider) {
+                        if (this._lastDownPos && Math.hypot(p[0] - this._lastDownPos[0], p[1] - this._lastDownPos[1]) > 8) {
+                            this._dragged = true;
+                        }
+                    }
                     if (this._dragSlider) {
                         sliderZoom(nd, this, p[0]);
                         this.redraw(nd);
@@ -992,15 +997,7 @@ this._dragPlay = true;
                     return true;
                 }
                 if (type.includes("up")) {
-                    // a drag between two clicks voids the pending double
-                    // click so a second click after a drag never deletes —
-                    // but only when the mouse actually traveled, otherwise a
-                    // plain click keeps the dbl alive (needed to add the
-                    // first point on an empty line)
-                    if (
-                        this._lastDownPos &&
-                        Math.hypot(p[0] - this._lastDownPos[0], p[1] - this._lastDownPos[1]) > 4
-                    ) {
+                    if (this._dragged) {
                         this._lastDown = 0;
                     }
                     this._drag = null;
