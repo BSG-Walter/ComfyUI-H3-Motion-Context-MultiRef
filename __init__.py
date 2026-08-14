@@ -1,11 +1,7 @@
-"""H3 Motion Context.
+"""H3 Motion Context - Timeline.
 
-Clip chaining for MiniMax H3: pin the tail of the previous clip (picture
-and sound) so the next clip genuinely continues it.
-
-Runtime patches are installed lazily. Importing this extension does not modify
-ComfyUI core classes. The first execution of H3 Motion Context or H3 Custom
-Keyframes installs and self-tests both MiniMax H3 compatibility patches.
+Visual video-editor timeline for MiniMax H3, powered natively by ComfyUI core
+guides. No monkey-patches, fully compatible with all custom nodes.
 """
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS

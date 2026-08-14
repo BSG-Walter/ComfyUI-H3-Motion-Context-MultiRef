@@ -1,20 +1,13 @@
 # H3 Motion Context — Timeline
 
-> **Fork.** Original project by [NikoDemon80](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context), licensed GPL-3.0.
+H3 Motion Context Timeline for MiniMax H3, with a full **video-editor timeline** widget that lets you place still images, video clips and audio clips at any frame position on a visual canvas.
 
-H3 Motion Context for MiniMax H3, with a full **video-editor timeline** widget that lets you place still images, video clips and audio clips at any frame position on a visual canvas.
+Powered natively by ComfyUI core MiniMax H3 guides (`minimax_keyframes`) without any monkey-patches or runtime layout overrides. Fully compatible with other custom nodes.
 
-## Fork lineage
+## What this node provides
 
-This is **ComfyUI-H3-Motion-Context-Timeline**, a fork of [ComfyUI-H3-Motion-Context-MultiRef](https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef) by seitanism, which is itself a fork of [ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) by NikoDemon80.
-
-> **Only one of these projects can be installed at the same time.** They all install the same MiniMax H3 runtime patch, so having two or more side-by-side double-wraps `PackedLayout.__init__` and breaks the self-test. Delete every other H3-Motion-Context folder from `custom_nodes` (keep only this one), clear `__pycache__` if one lingers, and restart ComfyUI.
-
-## What this fork adds
-
-### H3 Timeline Editor (headline feature)
-
-The **H3 Timeline Editor** node (`MiniMaxH3Timeline`) replaces the per-clip Custom Keyframes / Custom Audio / Custom Video nodes with a visual canvas where you arrange everything at once.
+### H3 Timeline Editor
+The **H3 Timeline Editor** node (`MiniMaxH3Timeline`) gives you a visual canvas where you arrange everything on a single timeline.
 
 - **Canvas timeline** (840px wide) with two lanes (video above, audio below), a frame ruler, zoom controls and a playhead.
 - **Undo & Redo buttons** — dedicated `↶ Undo` and `↷ Redo` toolbar buttons to safely step backward and forward through edits (clip moves, trims, deletions, paste, envelope tweaks) without interfering with ComfyUI's global graph undo.
@@ -28,30 +21,6 @@ The **H3 Timeline Editor** node (`MiniMaxH3Timeline`) replaces the per-clip Cust
 - **Playable preview** — the playhead plays through the timeline, syncing video thumbnails; playback stops at the end-line.
 - **File-backed clips** — upload videos/images/audio directly into the timeline and they decode on the node (video thumbnails + audio waveform). No need to wire separate LoadImage / VHS nodes when you just want to drop a file.
 - **Out-of-range tolerance** — clips placed beyond the latent's frame count are clamped-and-warned by the backend (parked at the last frame), never fatal. Audio clips parked or trimmed log a warning instead of raising.
-
-### H3 Custom Audio
-
-The **H3 Custom Audio** node (`MiniMaxH3CustomAudio`) pins audio clips at arbitrary positions of the target clip's audio timeline. Audio windows are cut from the head (`head`) or tail (`tail`) of their source, and each slot gets a **strength** slider (see below) controlling how much of the clip the model re-renders vs. pins exactly.
-
-### Per-clip strength slider
-
-Both the **H3 Custom Keyframes** node (from seitanism's fork) and the **H3 Custom Audio** node (ours) gained a **per-clip strength** widget:
-
-```text
-1.0      pinned exactly (default) — the model reproduces it faithfully
-0.5      half pinned, half the model's own re-render
-0.1      a light hint — the model creates most of the output
-```
-
-The strength uses a **pin-then-flip schedule**: the clip is pinned **exact** (clean rows, canonical 0.999 claim) while the schedule's progress stays below the strength, then its tokens are dropped from the layout so the model's own stream covers the region with no reference at all. Nothing noisy is ever shown to the model. The Custom Video node's per-slot strength governs its audio track the same way. The strength lives per slot inside the widget state (`"strengths"` array), so it travels with the graph and survives copies. This slider will also appear on the Timeline node's clips in the future.
-
-### Inherited from the MultiRef fork
-
-- **H3 Custom Keyframes** — place still-image keyframes at arbitrary frame positions.
-- **MultiRef compatibility patch** — Ref2VA image refs and Motion Context timeline audio coexist in the same conditioning.
-- **Lazy runtime patches** — the H3 compatibility patches are installed on first use rather than at ComfyUI startup.
-
-See [MODIFICATIONS.md](MODIFICATIONS.md) for details on the MultiRef changes.
 
 ## Install
 

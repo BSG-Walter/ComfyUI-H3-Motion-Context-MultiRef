@@ -1,40 +1,12 @@
-# MODIFIED FORK NOTICE: modified 2026-08-09 to allow ordinary MiniMax H3 Ref2VA refs
-# to coexist with H3 Motion Context timeline-audio refs. Original project by NikoDemon80.
-# See MODIFICATIONS.md. Distributed under the upstream GPL-3.0 license.
+"""MiniMax H3 Timeline Editor.
 
-"""Pin previous-clip motion at the head of an H3 clip.
-
-Wire it between a stock H3 conditioning node and the sampler:
-
-    MiniMaxH3ImageToVideo (or the t2v path)
-        -> H3 Motion Context
-        -> guider / sampler
-
-Two axes to test, both cheap.
-
-encode_mode
-  frames  one VAE call per frame, each pinned as its own cond block. The
-          model sees N snapshots at N instants.
-  video   one VAE call for the whole run. The H3 video VAE has latent_dim
-          3, so it reads the batch axis as time and compresses the run
-          into fewer latent steps (5 pixel frames -> 2 steps, 22 -> 7).
-          Each step becomes one cond block, so the motion between frames
-          lives inside the latent instead of being implied across separate
-          stills. Far fewer rows and one VAE load.
-
-anchor_mode
-  head    pinned frames occupy indices 0..N-1 of the delivered timeline.
-          They come back in the output, so trim that many frames off the
-          front before concatenating.
-  before  pinned frames sit at negative indices, ending at -1, so
-          delivered frame 0 continues from them and nothing is wasted.
-          Their time coordinates land below text_len, which is the range
-          the text rows occupy. Whether that collision matters is exactly
-          what this mode is asking.
+Visual video-editor timeline node for MiniMax H3, using native ComfyUI core
+minimax_keyframes guides.
 """
 
 import json
 import logging
+import math
 import os
 
 import av
@@ -42,131 +14,20 @@ import numpy as np
 import torch
 import folder_paths
 import node_helpers
+import comfy.utils
 from comfy_extras.nodes_audio import f32_pcm
-from comfy_extras.nodes_minimax_h3 import _resize
-from PIL import Image, ImageOps, ImageSequence
-from safetensors.torch import load_file as _st_load, save_file as _st_save
-
-from .patch_layout import (
-    MC_KEY,
-    MC_AUDIO_KEY,
-    MC_AUDIO_STRENGTH,
-    MC_VIDEO_STRENGTH,
-    apply_patch as _apply_layout_patch,
-)
-from .patch_payload import (
-    apply_patch as _apply_payload_patch,
-    apply_cond_audio_patch as _apply_cond_audio_patch,
-    apply_cond_video_patch as _apply_cond_video_patch,
-    apply_forward_patch as _apply_forward_patch,
-)
+from PIL import Image, ImageOps
 
 try:
     import torchaudio
 except ImportError:
     torchaudio = None
 
-_LOG = logging.getLogger("h3_motion_context")
+_LOG = logging.getLogger("h3_timeline")
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
-FPS = 24  # H3's native rate; audio latents run at 40 Hz, hence FRAME_RESCALE 5/3
 FRAME_RESCALE = 5.0 / 3.0
-AUDIO_HZ = 40.0
-
-# Run lengths the video VAE's downscale formula max(1, (n - 5) // 17 * 5 + 2)
-# actually distinguishes. Anything between two grid points encodes to the same
-# number of latent steps as the lower one, but the steps then cover the FIRST
-# `covered` frames of the input rather than the last: encoding 10 frames yields
-# the same 2 steps as encoding 5, representing frames [-10..-6] of the source
-# clip instead of [-5..-1]. The pinned run would end five frames early and the
-# delivered clip would continue from the wrong instant. So off-grid requests
-# are snapped DOWN before slicing, keeping content and coverage in agreement.
-VIDEO_RUN_GRID = (39, 22, 5, 1)
-
-
-def _video_runs(n):
-    """Split n pixel frames into consecutive VAE-grid runs (greedy).
-
-    The video VAE only distinguishes run lengths on VIDEO_RUN_GRID; off-grid
-    lengths silently shift coverage to the head and drop the tail, so a
-    single encode would end before the clip does. Encoding the clip as
-    consecutive grid runs keeps every frame (one VAE call per run). Safe
-    because the encoder is causal: each run's latents depend only on its
-    own frames.
-    """
-    runs, rem = [], n
-    while rem > 0:
-        r = next(g for g in VIDEO_RUN_GRID if g <= rem)
-        runs.append(r)
-        rem -= r
-    return runs
-
-
-def _assert_vae_grid(steps, run, label):
-    """Refuse to run if the VAE grid doesn't match VIDEO_RUN_GRID."""
-    if _pixel_frames(steps) != run:
-        raise RuntimeError(
-            "h3_motion_context: %s encoded %d frames to %d latent steps; "
-            "the VAE grid no longer matches VIDEO_RUN_GRID. Upstream VAE "
-            "change, refusing to run." % (label, run, steps))
-
-
-def _env_curve(env, flat):
-    """Normalize a clip's strength envelope to sorted [(frame, strength)].
-
-    Frames are content-relative (0 = first frame of the clip's window),
-    strengths clamped to [0.0, 1.0]. A clip without points collapses to a
-    flat curve at `flat`, and a leading implicit frame-0 point pins the
-    value before the first explicit point.
-    """
-    pts = []
-    for p in env or []:
-        try:
-            f = float(p[0])
-            s = float(p[1])
-        except (TypeError, ValueError, IndexError):
-            continue
-        pts.append((max(0.0, f), min(1.0, max(0.0, s))))
-    if not pts:
-        return [(0.0, 1.0 if flat is None
-                 else min(1.0, max(0.0, float(flat))))]
-    pts.sort(key=lambda t: t[0])
-    if pts[0][0] > 0.0:
-        pts.insert(0, (0.0, pts[0][1]))
-    return pts
-
-
-def _env_strength(pts, frame):
-    """Linear-interpolated strength at a content frame; end-clamped."""
-    frames, strengths = zip(*pts)
-    return float(np.interp(frame, frames, strengths))
-
-
-def _ensure_h3_runtime_patches():
-    """Install the H3 patches on first execution of a node that needs them."""
-    if not _apply_layout_patch():
-        raise RuntimeError(
-            "h3_motion_context: could not enable the MiniMax H3 layout "
-            "extension. Check the ComfyUI console for the self-test error; "
-            "if a second H3-Motion-Context custom node (upstream package or "
-            "an older version of this fork) is installed, DELETE every other "
-            "copy and restart ComfyUI.")
-    if not _apply_payload_patch():
-        raise RuntimeError(
-            "h3_motion_context: could not enable keyframe/ref coexistence. "
-            "Check the ComfyUI console.")
-    if not _apply_cond_audio_patch():
-        raise RuntimeError(
-            "h3_motion_context: could not enable per-block audio strength. "
-            "Check the ComfyUI console.")
-    if not _apply_cond_video_patch():
-        raise RuntimeError(
-            "h3_motion_context: could not enable per-block video strength. "
-            "Check the ComfyUI console.")
-    if not _apply_forward_patch():
-        raise RuntimeError(
-            "h3_motion_context: could not enable the per-keyframe pin/flip "
-            "schedule. Check the ComfyUI console.")
+FPS = 24
 
 
 def _pixel_frames(latent_t):
@@ -174,147 +35,102 @@ def _pixel_frames(latent_t):
     return sum(FRAME_PER_TOKEN[k % 5] for k in range(latent_t))
 
 
-def _target_metrics(latent):
-    """Pixel width/height and frame_count derived from a [B,C,T,H,W] latent."""
-    return (
-        int(latent.shape[4]) * 16,
-        int(latent.shape[3]) * 16,
-        _pixel_frames(int(latent.shape[2])),
-    )
+def _resize(image, width, height, crop="disabled"):
+    """Resize image tensor [B, H, W, C] to target width/height."""
+    if image is None:
+        return None
+    samples = image.movedim(-1, 1)  # [B, C, H, W]
+    if crop == "center":
+        h_ratio = height / float(samples.shape[2])
+        w_ratio = width / float(samples.shape[3])
+        scale = max(h_ratio, w_ratio)
+        new_h = int(round(samples.shape[2] * scale))
+        new_w = int(round(samples.shape[3] * scale))
+        samples = comfy.utils.common_upscale(samples, new_w, new_h, "lanczos", crop="center")
+        samples = samples[:, :, :height, :width]
+    else:
+        samples = comfy.utils.common_upscale(samples, width, height, "lanczos", crop="disabled")
+    return samples.movedim(1, -1)
 
 
-def _parse_slots(state_obj, label, slot_noun, max_count):
-    """Parse the positions/count/strengths UI block shared by the custom
-    Keyframes, Audio, and Video nodes. Returns (positions, count, strengths)."""
-    try:
-        state = json.loads(state_obj or "{}")
-    except Exception as exc:
-        raise ValueError(
-            "h3_motion_context: invalid H3 %s UI state" % label) from exc
-    positions = state.get("positions", [])
-    count = int(state.get("count", len(positions)))
-    strengths = state.get("strengths", [])
-    if count < 1 or count > max_count:
-        raise ValueError(
-            "h3_motion_context: %s count must be 1..%d" % (label, max_count))
-    if len(positions) < count:
-        raise ValueError(
-            "h3_motion_context: %d %s slots but only %d saved "
-            "positions" % (count, slot_noun, len(positions)))
-    if len(strengths) < count:
-        strengths = [1.0] * count
-    strengths = [min(1.0, max(0.0, float(s)))
-                 for s in strengths[:count]]
-    return positions, count, strengths
+def _normalize_audio_waveform(wav):
+    """Normalize any audio waveform tensor shape to [1, 2, L] stereo."""
+    if wav is None:
+        return None
+    if not isinstance(wav, torch.Tensor):
+        wav = torch.as_tensor(wav)
+    if wav.ndim == 1:
+        wav = wav.unsqueeze(0).unsqueeze(0)  # [1, 1, L]
+    elif wav.ndim == 2:
+        if wav.shape[0] in (1, 2) and wav.shape[1] > 2:
+            wav = wav.unsqueeze(0)  # [1, C, L]
+        elif wav.shape[1] in (1, 2) and wav.shape[0] > 2:
+            wav = wav.t().unsqueeze(0)  # [1, C, L]
+        else:
+            wav = wav.unsqueeze(0)
+    elif wav.ndim == 3:
+        if wav.shape[1] > 2 and wav.shape[2] in (1, 2):
+            wav = wav.movedim(-1, 1)  # [B, C, L]
+
+    if wav.shape[1] == 1:
+        wav = wav.repeat(1, 2, 1)
+    elif wav.shape[1] > 2:
+        wav = wav[:, :2, :]
+    return wav[:1]
 
 
-def _step_offsets(latent_t):
-    """Pixel-frame index at which each latent step begins."""
-    out, acc = [], 0
-    for k in range(latent_t):
-        out.append(acc)
-        acc += FRAME_PER_TOKEN[k % 5]
-    return out
-
-
-def _step_boundaries(frame_count):
-    """Cumulative pixel-grid: the pixel frame each latent step starts at."""
-    out, acc = [], 0
-    while acc < frame_count:
-        out.append(acc)
-        acc += FRAME_PER_TOKEN[len(out) % 5]
-    return out
-
-
-def _hard_video_steps(vae, frames, zero, want, width, height, crop,
-                      frame_count):
-    """VAE steps of a clip window for hard injection at sampling time
-    (patch_payload clamps the sampler output at those steps to this content,
-    so the generated video keeps the window's frames exactly instead of
-    merely hinting at them).
-
-    The whole window is encoded as one video, head held-edge padded onto the
-    model's 17-pixel chunk grid, so every latent step maps exactly onto the
-    model's token grid (the VAE's chunking is causal and 17-aligned). The
-    encoder's global 3-token drop only reproduces the grid for windows of
-    1 or 17k+2..17k+5 frames; anything else is refused (structural guard,
-    logged) rather than pinned at the wrong pixel. A step is injected when
-    its span is more than half real window pixels, and the last overlapping
-    step is always injected so the window's final content frame is sent even
-    when its token extends past the window (held-edge content).
-    """
-    hi = min(frame_count, zero + want)
-    if hi <= zero:
-        return []
-    pre = zero % 17
-    A = zero - pre
-    n_in = hi - A
-    head = frames[:1].expand(pre, *frames.shape[1:]) if pre else frames[:0]
-    win = torch.cat([head, frames[:hi - zero]], dim=0)
-    enc = vae.encode(_resize(win, width, height, crop))
-    steps = int(enc.shape[2])
-    if steps < 1 or _pixel_frames(steps - 1) >= n_in or \
-            _pixel_frames(steps) < n_in:
-        _LOG.warning(
-            "h3_motion_context: hard window of %d frames encodes off the "
-            "VAE grid (%d steps, %d pixels); not injected", n_in, steps,
-            _pixel_frames(steps) if steps else 0)
-        return []
-    B = _step_boundaries(frame_count)
-    t0 = B.index(A)  # a 17-multiple is always a grid boundary, t0 % 5 == 0
-    out = []
-    for k in range(steps):
-        a = A + _step_offsets(steps)[k]
-        b = a + FRAME_PER_TOKEN[(t0 + k) % 5]
-        real = min(hi, b) - max(zero, a)
-        if real <= 0:
-            continue
-        if real * 2 > b - a or k == steps - 1:
-            out.append({"index": t0 + k, "latent": enc[:, :, k:k + 1]})
-    return out
-
-
-def _encode_audio_window(audio_vae, audio, seconds, tail=True):
-    """Encode the last (`tail`) or first (`head`) `seconds` of a clip's audio.
-
-    Returns ([1, 32, 2, T] latent, T) where T counts 40 Hz latent steps,
-    matching what the layout calls ref_audio_t.
-    """
-    waveform = audio["waveform"]  # [B, C, L]
-    sr = int(audio["sample_rate"])
+def _encode_ref_audio(audio_vae, audio):
+    """Encode audio into H3 audio VAE latent [1, 32, 2, T]."""
+    if audio_vae is None:
+        raise ValueError("Audio VAE is required when audio clips are present on the timeline")
+    waveform = _normalize_audio_waveform(audio.get("waveform"))
+    if waveform is None:
+        raise ValueError("Audio clip contains no waveform")
+    sr = int(audio.get("sample_rate", 32000))
     vae_sr = int(getattr(audio_vae, "audio_sample_rate", 32000))
     if sr != vae_sr:
         if torchaudio is None:
-            raise RuntimeError(
-                "h3_motion_context: audio is %d Hz but the VAE wants %d Hz "
-                "and torchaudio is not available to resample." % (sr, vae_sr))
+            raise RuntimeError("torchaudio is required for audio resampling")
         waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
-    want = int(round(seconds * vae_sr))
-    have = int(waveform.shape[-1])
-    if have < want:
-        _LOG.warning("h3_motion_context: audio is %.3fs, shorter than the "
-                     "%.3fs window; windowing what there is.",
-                     have / vae_sr, seconds)
-    elif tail:
-        waveform = waveform[..., have - want:]
-    else:
-        waveform = waveform[..., :want]
+    if waveform.shape[-1] < 800:
+        waveform = torch.nn.functional.pad(waveform, (0, 800 - waveform.shape[-1]))
     z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
     return z, int(z.shape[-1])
+
+
+def _slice_audio(audio, start_sec=0.0, duration_sec=None):
+    """Slice an AUDIO dict [B, C, L] by start offset and optional duration."""
+    if audio is None:
+        return None
+    waveform = audio.get("waveform")
+    if waveform is None:
+        return audio
+    waveform = _normalize_audio_waveform(waveform)
+    sr = int(audio.get("sample_rate", 32000))
+    total_samples = int(waveform.shape[-1])
+    start_sample = max(0, int(round(start_sec * sr)))
+    if duration_sec is not None and duration_sec > 0:
+        end_sample = min(total_samples, start_sample + int(round(duration_sec * sr)))
+    else:
+        end_sample = total_samples
+    if start_sample >= total_samples:
+        start_sample = max(0, total_samples - 1)
+    sliced = waveform[..., start_sample:end_sample]
+    if sliced.shape[-1] == 0:
+        sliced = waveform[..., -1:]
+    return {"waveform": sliced, "sample_rate": sr}
 
 
 def _media_ref_path(media):
     """Resolve an uploaded media ref {name, subfolder, type} to a file path."""
     name = media.get("name") if isinstance(media, dict) else None
     if not name:
-        raise ValueError("h3_motion_context: clip media ref has no name")
+        raise ValueError("Timeline: clip media ref has no name")
     sub = media.get("subfolder") or ""
     ref = "%s/%s" % (sub, name) if sub else name
-    path = folder_paths.get_annotated_filepath(
-        "%s [%s]" % (ref, media.get("type") or "input"))
+    path = folder_paths.get_annotated_filepath("%s [%s]" % (ref, media.get("type") or "input"))
     if not os.path.isfile(path):
-        raise ValueError(
-            "h3_motion_context: media file not found: %s" % ref)
+        raise ValueError("Timeline: media file not found: %s" % ref)
     return path
 
 
@@ -351,11 +167,7 @@ def _resample_video_frames(collected_timed_frames, target_fps):
 def _load_media_file(media, fps=None):
     """Decode an uploaded audio/video file with PyAV.
 
-    Returns {"frames": [B,H,W,C]|None, "audio": AUDIO dict|None}, decoding
-    whatever streams the file actually has. A single demux pass feeds both
-    decoders: PyAV's decode() discards packets of non-requested streams, so
-    decoding one stream to EOF (or re-demuxing after EOF) drops the other.
-    When `fps` is supplied, video frames are resampled to that target frame rate.
+    Returns {"frames": [B,H,W,C]|None, "audio": AUDIO dict|None}.
     """
     frames, audio = None, None
     mpath = _media_ref_path(media)
@@ -400,613 +212,27 @@ def _load_media_file(media, fps=None):
                     "sample_rate": int(astream.codec_context.sample_rate),
                 }
     except Exception as e:
-        _LOG.warning("h3_motion_context: PyAV decode failed for %s: %s", mpath, e)
+        _LOG.warning("Timeline: PyAV decode failed for %s: %s", mpath, e)
 
     if frames is None and mpath.lower().endswith(".gif"):
         try:
             with Image.open(mpath) as img:
                 collected = []
                 t_sec = 0.0
-                for f in ImageSequence.Iterator(img):
-                    dur = float(f.info.get("duration") or 100) / 1000.0
-                    arr = np.asarray(f.convert("RGB"), dtype=np.float32) / 255.0
+                for frame in ImageSequence.Iterator(img):
+                    duration = frame.info.get("duration", 100) / 1000.0
+                    arr = np.asarray(frame.convert("RGB"), dtype=np.float32) / 255.0
                     collected.append((t_sec, torch.from_numpy(arr)))
-                    t_sec += dur
+                    t_sec += duration
                 if collected:
                     if fps is not None and fps > 0:
                         frames = _resample_video_frames(collected, fps)
                     else:
                         frames = torch.stack([item[1] for item in collected])
         except Exception as e:
-            _LOG.warning("h3_motion_context: PIL GIF fallback failed for %s: %s", mpath, e)
+            _LOG.warning("Timeline: PIL GIF fallback failed for %s: %s", mpath, e)
 
     return {"frames": frames, "audio": audio}
-
-
-def _slice_audio(audio, seconds):
-    """Drop `seconds` of sound from the FRONT of an AUDIO dict."""
-    sr = int(audio["sample_rate"])
-    n = int(round(seconds * sr))
-    w = audio["waveform"]
-    if n > 0 and n < int(w.shape[-1]):
-        return {"waveform": w[..., n:], "sample_rate": sr}
-    return audio
-
-
-def _streams_from_latent(latent):
-    """Unpack an H3 AV latent into its contained streams.
-
-    NestedTensor.__getitem__ broadcasts the index into every contained
-    tensor rather than selecting one, so samples[0] would strip the batch
-    dimension off both streams. unbind() returns the pair.
-    """
-    samples = latent["samples"]
-    if hasattr(samples, "unbind"):
-        parts = list(samples.unbind())
-    elif isinstance(samples, (tuple, list)):
-        parts = list(samples)
-    else:
-        raise ValueError(
-            "h3_motion_context: expected a MiniMax H3 AV latent (a nested "
-            "video/audio pair), got %r" % type(samples))
-    if not parts:
-        raise ValueError("h3_motion_context: AV latent contains no streams")
-    return parts
-
-
-def _video_from_latent(latent):
-    """Pull the video stream out of an H3 AV latent."""
-    video = _streams_from_latent(latent)[0]
-    if video.ndim == 4:  # unbatched [C,T,H,W]
-        video = video.unsqueeze(0)
-    if video.ndim != 5:
-        raise ValueError("h3_motion_context: expected video latent [B,C,T,H,W], "
-                         "got shape %s" % (tuple(video.shape),))
-    return video
-
-
-def _audio_tail_from_latent(latent, a_frames):
-    """Slice the last `a_frames` worth of audio steps straight out of a
-    generated H3 latent, skipping the decode -> re-encode round trip.
-
-    Returns (tail latent [1, C, 2, rt], rt, overhang) where rt counts
-    40 Hz latent steps and overhang is the fraction of a step by which the
-    clip's audio grid extends past its last pixel frame. H3 rounds the
-    audio grid UP (124 frames want 206.67 steps, the layout allocates
-    207), so the latent's final step reaches ~overhang/40 s beyond the
-    last frame. The decoded-audio path never sees this because match_tail
-    cuts it; on this path the caller compensates the placement with it,
-    so the pinned content lands exactly where its samples actually sit.
-    """
-    parts = _streams_from_latent(latent)
-    if len(parts) < 2:
-        raise ValueError(
-            "h3_motion_context: context_latent has no audio stream. Wire the "
-            "sampler output of an H3 AV graph, not a video-only latent.")
-    video, audio = parts[0], parts[1]
-    if video.ndim == 4:
-        video = video.unsqueeze(0)
-    if audio.ndim == 3:  # unbatched [C,2,T]
-        audio = audio.unsqueeze(0)
-    if audio.ndim != 4:
-        raise ValueError("h3_motion_context: expected audio latent [B,C,2,T], "
-                         "got shape %s" % (tuple(audio.shape),))
-    total_t = int(audio.shape[-1])
-    frames = _pixel_frames(int(video.shape[2]))
-    overhang = total_t - FRAME_RESCALE * frames
-    if not (0.0 <= overhang < 1.0):
-        _LOG.warning(
-            "h3_motion_context: context_latent audio grid is unexpected "
-            "(%d steps for %d frames); assuming no overhang.", total_t, frames)
-        overhang = 0.0
-    rt = int(round(a_frames / float(FPS) * AUDIO_HZ))
-    if rt > total_t:
-        _LOG.warning("h3_motion_context: asked for %d audio steps, the latent "
-                     "has %d. Pinning all of it.", rt, total_t)
-        rt = total_t
-    if rt < 1:
-        raise ValueError("h3_motion_context: audio window is empty")
-    tail = audio[:1, ..., total_t - rt:].clone()
-    return tail, rt, float(overhang)
-
-
-class MiniMaxH3MotionContext:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "conditioning": ("CONDITIONING",),
-                "vae": ("VAE",),
-                "latent": ("LATENT",),
-                "context_frames": ("IMAGE",),
-                "context_length": ("INT", {
-                    "default": 5, "min": 1, "max": 39,
-                    "tooltip": "Frames of the previous clip to carry over. In "
-                               "video mode only 1, 5, 22 and 39 are distinct; "
-                               "anything else is snapped DOWN to the nearest so "
-                               "the pinned run always ends at the clip's last "
-                               "frame."}),
-                "encode_mode": (["video", "frames"], {
-                    "default": "video",
-                    "tooltip": "video: one VAE call, motion lives inside the "
-                               "latent, fewer rows. frames: one call per frame, "
-                               "each pinned as a separate still."}),
-                "anchor_mode": (["head", "before"], {
-                    "default": "head",
-                    "tooltip": "head: pinned frames occupy the first indices and "
-                               "come back in the output, so trim them. before: "
-                               "negative indices, nothing wasted, but the "
-                               "coordinates overlap the text rows."}),
-                "crop": (["disabled", "center"], {"default": "disabled"}),
-                "audio_context_length": ("INT", {
-                    "default": 22, "min": 0, "max": 240,
-                    "tooltip": "Frames of tail audio to pin, independent of the "
-                               "video window. 0 follows context_length. In "
-                               "timeline mode the window is END-aligned with "
-                               "the pinned video, so 22 with a 22-frame video "
-                               "window overlays it exactly; longer windows "
-                               "extend backwards into vacated coordinate "
-                               "space (untested)."}),
-                "audio_mode": (["timeline", "ref"], {
-                    "default": "timeline",
-                    "tooltip": "timeline: pinned audio gets coordinates on "
-                               "this clip's own timeline, end-aligned with "
-                               "the pinned video, so the model reads it as "
-                               "this clip's sound so far and continues it. "
-                               "ref: stock placement in a span before the "
-                               "clip, which the model imitates (similar "
-                               "music, not phase-locked) rather than "
-                               "continues."}),
-            },
-            "optional": {
-                "context_latent": ("LATENT", {
-                    "tooltip": "Previous clip's SAMPLER OUTPUT latent (the same "
-                               "one you wire into the decode nodes). When "
-                               "supplied, the pinned audio is sliced straight "
-                               "from it, skipping the decode/re-encode round "
-                               "trip that dulls sound a little more at every "
-                               "link of a chain. Takes priority over "
-                               "context_audio; audio_vae is not needed on "
-                               "this path."}),
-                "audio_vae": ("VAE", {
-                    "tooltip": "H3 audio VAE. Supply with context_audio to carry "
-                               "the previous clip's tail sound across the join. "
-                               "Not needed when context_latent is wired."}),
-                "context_audio": ("AUDIO", {
-                    "tooltip": "Audio of the previous clip. The tail matching the "
-                               "pinned frames is encoded and pinned alongside "
-                               "them. Ignored when context_latent is wired."}),
-            },
-        }
-
-    RETURN_TYPES = ("CONDITIONING", "INT")
-    RETURN_NAMES = ("conditioning", "trim_frames")
-    FUNCTION = "apply"
-    CATEGORY = "conditioning/minimax"
-    DESCRIPTION = ("Pin a run of consecutive frames from a previous clip as "
-                   "never-denoised conditioning rows, so the model reads real "
-                   "motion instead of guessing it from a single still.")
-
-    def apply(self, conditioning, vae, latent, context_frames, context_length,
-              encode_mode, anchor_mode, crop, audio_context_length=22,
-              audio_mode="timeline", context_latent=None, audio_vae=None,
-              context_audio=None):
-        _ensure_h3_runtime_patches()
-
-        video = _video_from_latent(latent)
-        latent_t = int(video.shape[2])
-        width, height, frame_count = _target_metrics(video)
-
-        available = int(context_frames.shape[0])
-        n = min(int(context_length), available)
-        if n < 1:
-            raise ValueError("h3_motion_context: context_frames is empty")
-        if n < context_length:
-            _LOG.warning("h3_motion_context: only %d frames supplied, pinning %d",
-                         available, n)
-
-        if encode_mode == "video":
-            # split into VAE-grid runs BEFORE slicing: off-grid lengths make
-            # the VAE cover only the head of the input and drop the rest, so
-            # the run would end before the window does and the join would
-            # jump by the remainder (see VIDEO_RUN_GRID).
-            runs = _video_runs(n)
-            if len(runs) > 1:
-                _LOG.info(
-                    "h3_motion_context: %d context frames split into %d grid "
-                    "runs: %s", n, len(runs), runs)
-
-        if n >= frame_count:
-            raise ValueError(
-                "h3_motion_context: asked to pin %d frames into a %d frame clip. "
-                "The pinned run must be a small fraction of the timeline."
-                % (n, frame_count))
-
-        # the LAST n frames of the incoming clip become the pinned run
-        tail = _resize(context_frames[available - n:], width, height, crop)
-
-        if encode_mode == "video":
-            # one call per grid run; the VAE reads the batch axis as time
-            blocks, offsets, run_acc = [], [], 0
-            for run in runs:
-                enc = vae.encode(tail[run_acc:run_acc + run])
-                if getattr(enc, "ndim", 0) != 5:
-                    raise ValueError(
-                        "h3_motion_context: video-mode encode returned shape %s, "
-                        "expected [B,C,T,H,W]. Try encode_mode=frames."
-                        % (tuple(getattr(enc, "shape", ())),))
-                steps = int(enc.shape[2])
-                _assert_vae_grid(steps, run, "%d frames" % run)
-                offsets.extend(
-                    run_acc + o for o in _step_offsets(steps))
-                blocks.extend(enc[:, :, k:k + 1] for k in range(steps))
-                run_acc += run
-        else:
-            blocks, offsets = [], []
-            for i in range(n):
-                blocks.append(vae.encode(tail[i:i + 1]))
-                offsets.append(i)
-        span = n
-
-        if anchor_mode == "before":
-            indices = [o - span for o in offsets]
-        else:
-            indices = list(offsets)
-
-        keyframes = []
-        for p, blk in zip(indices, blocks):
-            keyframes.append({
-                # stock code accepts only 0 or frame_count-1 here; the real
-                # position rides under MC_KEY and the layout patch applies it
-                "resolved_frame_index": 0,
-                MC_KEY: p,
-                "latent": blk,
-            })
-
-        values = {
-            "minimax_keyframes": keyframes,
-            "minimax_frame_count": frame_count,
-        }
-
-        ref_audio_t = 0
-        a_frames = 0
-        audio_src = "off"
-        if context_latent is not None or context_audio is not None:
-            # the audio window is independent of the video one: audio cond
-            # rows cost rows but never cost delivered frames
-            a_frames = int(audio_context_length) or span
-            if context_latent is not None:
-                if context_audio is not None:
-                    _LOG.info("h3_motion_context: both context_latent and "
-                              "context_audio wired; using the latent (skips "
-                              "one VAE round trip).")
-                audio_latent, ref_audio_t, overhang = _audio_tail_from_latent(
-                    context_latent, a_frames)
-                audio_src = "latent"
-            else:
-                if audio_vae is None:
-                    raise ValueError(
-                        "h3_motion_context: context_audio supplied without "
-                        "audio_vae. Wire the H3 audio VAE, or wire "
-                        "context_latent instead.")
-                audio_latent, ref_audio_t = _encode_audio_window(
-                    audio_vae, context_audio, a_frames / float(FPS), tail=True)
-                overhang = 0.0  # decoded audio was match_tail-cut at the frame
-                audio_src = "vae"
-            ref = {
-                "kind": "audio",
-                "ref_audio_t": ref_audio_t,
-                "audio_latent": audio_latent,
-            }
-            if audio_mode == "timeline":
-                # end-align the audio window with the pinned video: both are
-                # the tail of clip A, so both must end at the same instant
-                # of the new timeline -- frame `span` in head mode (where
-                # A's last frame sits), frame 0 in before mode. On the
-                # latent path the sliced content reaches `overhang` of a
-                # step past A's last frame (H3 rounds its audio grid up),
-                # so the end coordinate moves by exactly that much; the
-                # layout patch takes a fractional frame index.
-                end_frame = float(span if anchor_mode == "head" else 0)
-                end_frame += overhang / FRAME_RESCALE
-                ref[MC_AUDIO_KEY] = end_frame
-        out = node_helpers.conditioning_set_values(conditioning, values)
-        if ref_audio_t:
-            # append=True preserves existing Ref2VA refs and places the
-            # Motion Context timeline-audio ref last.
-            out = node_helpers.conditioning_set_values(
-                out, {"minimax_refs": [ref]}, append=True)
-
-        trim = span if anchor_mode == "head" else 0
-        _LOG.info("h3_motion_context: %s/%s, %d frames -> %d cond blocks at "
-                  "indices %d..%d, %d frame clip at %dx%d, trim %d, audio %s",
-                  encode_mode, anchor_mode, n, len(blocks),
-                  indices[0], indices[-1], frame_count, width, height, trim,
-                  ("%d frames -> %d latent steps (%.3fs) from %s, %s"
-                   % (a_frames, ref_audio_t, ref_audio_t / AUDIO_HZ, audio_src,
-                      "on the timeline ending at frame %.3f"
-                      % float(ref.get(MC_AUDIO_KEY))
-                      if audio_mode == "timeline" else "stock ref placement"))
-                  if ref_audio_t else "off")
-        return (out, trim)
-
-
-class MiniMaxH3MotionContextTrim:
-    """Drop the pinned head off a decoded clip, picture and sound together.
-
-    The pinned frames occupy the start of the delivered timeline, so they
-    have to come off before concatenating. Trimming only the images would
-    leave the audio a full trim_frames longer than the video, and muxing
-    those puts the whole soundtrack ahead of the picture by trim_frames/24
-    seconds. At 5 frames that is 208ms, silent on ambience but squarely
-    offbeat on anything with a pulse.
-
-    So this takes both streams and removes the same span from each: whole
-    frames from the images, the matching number of samples from the
-    waveform. Wire trim_frames from the motion context node so the count
-    follows whatever the encoder actually produced.
-
-    The tail needs the same treatment for a different reason. H3's audio
-    latent runs at 40 Hz against 24 fps picture, and FRAME_RESCALE is 5/3,
-    so a 124 frame clip wants 206.67 audio steps and the layout rounds up
-    to 207. Every clip therefore ships about 8.3 ms more sound than
-    picture. Concatenate two and the second seam is out by 16.7 ms, three
-    and it is 25 ms, and the error grows without bound down a chain. It
-    reads as a faint dampening at the first join and a short click at
-    later ones. Truncating the tail to exactly frames/fps stops it
-    accumulating.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "images": ("IMAGE",),
-                "trim_frames": ("INT", {"default": 0, "min": 0, "max": 4096}),
-            },
-            "optional": {
-                "audio": ("AUDIO", {
-                    "tooltip": "Decoded audio for the same clip. Trimmed by the "
-                               "matching duration so sound stays locked to "
-                               "picture. Leave unwired for silent clips."}),
-                "fps": ("FLOAT", {
-                    "default": 24.0, "min": 1.0, "max": 240.0, "step": 0.001,
-                    "tooltip": "Frame rate used to convert the trim into an "
-                               "audio duration. Must match what you feed "
-                               "Create Video."}),
-                "match_tail": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Truncate the audio so its duration equals "
-                               "frames/fps exactly. H3 rounds its audio grid up, "
-                               "so each clip carries about 8ms of extra sound "
-                               "that accumulates at every join in a chain."}),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("images", "audio")
-    FUNCTION = "trim"
-    CATEGORY = "conditioning/minimax"
-    DESCRIPTION = ("Remove the leading pinned frames from a decoded H3 clip, "
-                   "trimming picture and sound by the same duration.")
-
-    def trim(self, images, trim_frames, audio=None, fps=24.0, match_tail=True):
-        n = max(0, int(trim_frames))
-        total = int(images.shape[0])
-        if n >= total:
-            raise ValueError(
-                "h3_motion_context: asked to trim %d frames from a %d frame clip"
-                % (n, total))
-        out_images = images[n:] if n else images
-
-        out_audio = audio
-        if audio is not None:
-            waveform = audio["waveform"]
-            sr = int(audio["sample_rate"])
-            seconds = n / float(fps)
-            cut = int(round(seconds * sr))
-            length = int(waveform.shape[-1])
-            if cut >= length:
-                raise ValueError(
-                    "h3_motion_context: trimming %.3fs from %.3fs of audio would "
-                    "leave nothing. Check that fps matches the clip."
-                    % (seconds, length / sr))
-            waveform = waveform[..., cut:]
-
-            if match_tail:
-                frames_left = total - n
-                want = int(round(frames_left / float(fps) * sr))
-                have = int(waveform.shape[-1])
-                if have > want:
-                    over = have - want
-                    waveform = waveform[..., :want]
-                    _LOG.info("h3_motion_context: tail trimmed %d samples "
-                              "(%.2fms) so audio matches %d frames exactly",
-                              over, over / sr * 1000.0, frames_left)
-                elif have < want:
-                    _LOG.warning("h3_motion_context: audio is %.2fms shorter than "
-                                 "%d frames; leaving the tail alone",
-                                 (want - have) / sr * 1000.0, frames_left)
-
-            out_audio = {"waveform": waveform, "sample_rate": sr}
-            _LOG.info("h3_motion_context: %d frames / %.4fs picture, %.4fs sound, "
-                      "drift %.2fms",
-                      total - n, (total - n) / float(fps),
-                      int(waveform.shape[-1]) / sr,
-                      abs((total - n) / float(fps) - int(waveform.shape[-1]) / sr) * 1000.0)
-        elif n:
-            _LOG.info("h3_motion_context: trimmed %d leading frames, %d remain. "
-                      "No audio wired; if this clip has sound, mux it through "
-                      "this node or it will run %.3fs ahead of the picture.",
-                      n, total - n, n / float(fps))
-
-        return (out_images, out_audio)
-
-
-def _resolve_latent_path(path, clip_index=0):
-    """Turn the loader's path input into a concrete file."""
-    p = (path or "").strip().strip('"').strip("'") or "h3_context"
-    candidates = [p, os.path.join(folder_paths.get_output_directory(), p)]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-        if os.path.isdir(c):
-            idx = int(clip_index)
-            if idx > 0:
-                files = [os.path.join(c, f) for f in os.listdir(c) if f.endswith("_%05d.safetensors" % idx)]
-                if not files:
-                    raise FileNotFoundError("h3_motion_context: no saved latent for clip %d in %s" % (idx, c))
-            else:
-                files = [os.path.join(c, f) for f in os.listdir(c) if f.endswith(".safetensors")]
-                if not files:
-                    raise FileNotFoundError("h3_motion_context: no saved latents in %s" % c)
-            return max(files, key=os.path.getmtime)
-    raise FileNotFoundError("h3_motion_context: %r is neither a file nor a folder" % p)
-
-
-class MiniMaxH3MotionContextSaveLatent:
-    """Save an H3 AV latent to disk so the NEXT run can load it.
-
-    Wiring the sampler's output straight into context_latent is a cycle:
-    the sampler would be consuming its own result. The latent that motion
-    context needs is the PREVIOUS clip's, which lives in the previous run
-    -- so it has to cross runs through disk, the same way the frames and
-    audio already do. Stock Save/Load Latent can't serialise H3's nested
-    video/audio pair; this saves the two streams side by side.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "latent": ("LATENT", {
-                    "tooltip": "The sampler's output latent (the same one "
-                               "you wire into the decode nodes)."}),
-                "filename_prefix": ("STRING", {
-                    "default": "h3_context/clip",
-                    "tooltip": "Saved under the ComfyUI output folder. The "
-                               "default keeps all chain latents in one "
-                               "folder so the Load node can always pick "
-                               "the newest."}),
-                "clip_index": ("INT", {
-                    "default": 0, "min": 0, "max": 9999,
-                    "tooltip": "Which clip of the chain THIS is. Saves to "
-                               "that clip's fixed slot, so a re-roll "
-                               "overwrites its own reject instead of "
-                               "stacking new files. Generating clip 2: "
-                               "set 2 here and 1 on the Load node. 0 = "
-                               "old behaviour, a new numbered file every "
-                               "run (numbers count runs, not clips)."}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("latent_path",)
-    FUNCTION = "save"
-    OUTPUT_NODE = True
-    CATEGORY = "conditioning/minimax"
-    DESCRIPTION = ("Save the sampler's AV latent so the next run's Motion "
-                   "Context node can pin audio from it via the matching "
-                   "Load node.")
-
-    def save(self, latent, filename_prefix, clip_index=0):
-        parts = _streams_from_latent(latent)
-        if len(parts) < 2:
-            raise ValueError(
-                "h3_motion_context: latent has no audio stream; wire the "
-                "sampler output of an H3 AV graph.")
-        video = parts[0].cpu().contiguous()
-        audio = parts[1].cpu().contiguous()
-        folder, filename, counter, _, _ = folder_paths.get_save_image_path(
-            filename_prefix, folder_paths.get_output_directory())
-        if int(clip_index) > 0:
-            # fixed slot with the natural name: clip 2 -> *_00002. A
-            # re-roll of this clip overwrites its own save, so rejects
-            # never accumulate or get loaded later. Auto mode (below)
-            # keeps a trailing underscore, which is what excludes its
-            # run-numbered files from indexed loading.
-            path = os.path.join(folder, "%s_%05d.safetensors"
-                                % (filename, int(clip_index)))
-        else:
-            path = os.path.join(folder, "%s_%05d_.safetensors"
-                                % (filename, counter))
-        _st_save({"video": video, "audio": audio}, path,
-                 metadata={"format": "h3_motion_context_av_v1"})
-        _LOG.info("h3_motion_context: saved AV latent to %s (video %s, "
-                  "audio %s)", path, tuple(video.shape), tuple(audio.shape))
-        return (path,)
-
-
-class MiniMaxH3MotionContextLoadLatent:
-    """Load a saved H3 AV latent for the context_latent input.
-
-    clip_index means exactly what it says: set it to the clip you want to
-    CONTINUE FROM, and that clip's slot is loaded. Generating clip 2 from
-    clip 1: Load node 1, Save node 2. Re-rolling clip 2 changes nothing --
-    it reloads slot 1 and overwrites slot 2's reject. Accept, then bump
-    both numbers.
-
-    At 0 it loads the newest file in the folder instead. Simple, but NOT
-    retry-safe: a re-roll's newest file is the rejected attempt's own
-    save, so the retry gets conditioned on the audio you just rejected.
-
-    The output is ONLY for the Motion Context node's context_latent input.
-    It is not a decodable latent -- do not wire it into VAE decode.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "latent_path": ("STRING", {
-                    "default": "h3_context",
-                    "tooltip": "A saved latent file, or a folder (relative "
-                               "paths resolve against the ComfyUI output "
-                               "directory). Pointing at a specific FILE "
-                               "always loads that file, ignoring "
-                               "clip_index."}),
-                "clip_index": ("INT", {
-                    "default": 0, "min": 0, "max": 9999,
-                    "tooltip": "The clip to CONTINUE FROM: that clip's "
-                               "slot is loaded. Generating clip 2 from "
-                               "clip 1: set 1 here and 2 on the Save "
-                               "node. 0 = newest file in the folder "
-                               "(NOT retry-safe: a re-roll loads its own "
-                               "rejected audio)."}),
-            },
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "load"
-    CATEGORY = "conditioning/minimax"
-    DESCRIPTION = ("Load a latent saved by H3 Motion Context Save Latent, "
-                   "for the context_latent input only.")
-
-    @classmethod
-    def IS_CHANGED(cls, latent_path, clip_index=0):
-        # the path string stays constant while the file behind it changes
-        # (newest save, or an overwritten slot), so cache on the resolved
-        # file identity instead -- otherwise ComfyUI would happily serve
-        # a stale latent forever
-        try:
-            p = _resolve_latent_path(latent_path, clip_index)
-            return "%s:%d" % (p, os.stat(p).st_mtime_ns)
-        except Exception:
-            return float("NaN")  # unresolvable: never cache
-
-    def load(self, latent_path, clip_index=0):
-        path = _resolve_latent_path(latent_path, clip_index)
-        data = _st_load(path)
-        if "video" not in data or "audio" not in data:
-            raise ValueError(
-                "h3_motion_context: %s is not an h3_motion_context latent "
-                "(missing video/audio streams). Was it saved by the stock "
-                "Save Latent node instead?" % path)
-        _LOG.info("h3_motion_context: loaded AV latent from %s", path)
-        # a plain list, not a NestedTensor: only this repo's context_latent
-        # input accepts it, which is the point -- it cannot be mistaken
-        # for a decodable latent without failing loudly downstream
-        return ({"samples": [data["video"], data["audio"]]},)
 
 
 class _DynamicInputs(dict):
@@ -1034,627 +260,10 @@ class _DynamicInputs(dict):
         except KeyError:
             return default
 
-class MiniMaxH3CustomKeyframes:
-    """Attach still-image H3 keyframes at arbitrary timeline positions.
-
-    Each slot has a strength ("keyframe N strength") between 0.0 and 1.0
-    that sets how much of the run the image stays pinned: the rows are
-    pinned EXACT (clean, under the canonical 0.999 claim) while the video
-    schedule's progress stays below the strength, then the block's tokens
-    are dropped from the layout and the model's own stream covers the
-    region with no reference at all. So 1.0 pins exactly, 0.9 almost the
-    image, 0.5 pinned half then free re-render, 0.1 a light early-structure
-    hint. Nothing noisy is ever shown to the model.
-    """
-
-    MAX_KEYFRAMES = 32
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "conditioning": (
-                    "CONDITIONING",
-                    {
-                        "tooltip": (
-                            "H3 conditioning. The node replaces its complete "
-                            "minimax_keyframes list with the keyframes below."
-                        )
-                    },
-                ),
-                "vae": (
-                    "VAE",
-                    {
-                        "tooltip": (
-                            "MiniMax H3 video VAE used to encode each still."
-                        )
-                    },
-                ),
-                "latent": (
-                    "LATENT",
-                    {
-                        "tooltip": (
-                            "Target MiniMax H3 AV latent; defines resolution "
-                            "and exact frame count."
-                        )
-                    },
-                ),
-                "keyframe_state": (
-                    "STRING",
-                    {
-                        "default": (
-                            '{"count":3,"positions":[1,22,79],'
-                            '"strengths":[1,1,1]}'
-                        ),
-                        "multiline": False,
-                        "tooltip": (
-                            "Internal UI state. Normally managed by the "
-                            "keyframe position and strength controls."
-                        ),
-                    },
-                ),
-                "indexing": (
-                    ["1-based", "0-based"],
-                    {"default": "1-based"},
-                ),
-                "crop": (
-                    ["disabled", "center"],
-                    {"default": "disabled"},
-                ),
-            },
-            "optional": _DynamicInputs("keyframe_image_", ("IMAGE",)),
-        }
-
-    RETURN_TYPES = ("CONDITIONING",)
-    RETURN_NAMES = ("conditioning",)
-    FUNCTION = "apply"
-    CATEGORY = "conditioning/minimax"
-    DESCRIPTION = (
-        "Pin still-image MiniMax H3 keyframes at arbitrary output-frame "
-        "positions. Starts with 3 keyframes; use + Add keyframe to add more. "
-        "Strength 1.0 pins the image exactly (default); lower values let "
-        "the model vary the content more."
-    )
-
-    def apply(
-        self,
-        conditioning,
-        vae,
-        latent,
-        keyframe_state,
-        indexing="1-based",
-        crop="disabled",
-        **kwargs,
-    ):
-        _ensure_h3_runtime_patches()
-
-        positions, count, strengths = _parse_slots(
-            keyframe_state, "Custom Keyframes", "keyframe", self.MAX_KEYFRAMES
-        )
-
-        video = _video_from_latent(latent)
-        width, height, frame_count = _target_metrics(video)
-
-        anchors = []
-        for slot in range(1, count + 1):
-            raw_position = int(positions[slot - 1])
-            pixel_index = (
-                raw_position - 1
-                if indexing == "1-based"
-                else raw_position
-            )
-
-            if pixel_index < 0 or pixel_index >= frame_count:
-                low, high = (
-                    (1, frame_count)
-                    if indexing == "1-based"
-                    else (0, frame_count - 1)
-                )
-                raise ValueError(
-                    "h3_motion_context: keyframe %d position %d is "
-                    "outside %d..%d"
-                    % (slot, raw_position, low, high)
-                )
-
-            image = kwargs.get("keyframe_image_%d" % slot)
-            if image is None:
-                raise ValueError(
-                    "h3_motion_context: keyframe %d has no image connected"
-                    % slot
-                )
-            if getattr(image, "ndim", 0) != 4:
-                raise ValueError(
-                    "h3_motion_context: keyframe %d expected IMAGE "
-                    "[B,H,W,C]" % slot
-                )
-            if int(image.shape[0]) != 1:
-                raise ValueError(
-                    "h3_motion_context: keyframe %d must receive exactly "
-                    "one image, not a batch of %d"
-                    % (slot, int(image.shape[0]))
-                )
-
-            anchors.append((pixel_index, slot, image))
-
-        anchors.sort(key=lambda item: item[0])
-
-        for i in range(1, len(anchors)):
-            if anchors[i - 1][0] == anchors[i][0]:
-                displayed = (
-                    anchors[i][0] + 1
-                    if indexing == "1-based"
-                    else anchors[i][0]
-                )
-                raise ValueError(
-                    "h3_motion_context: duplicate keyframe position %d"
-                    % displayed
-                )
-
-        keyframes = []
-        for pixel_index, slot, image in anchors:
-            resized = _resize(image, width, height, crop)
-            encoded = vae.encode(resized)
-
-            if (
-                getattr(encoded, "ndim", 0) != 5
-                or int(encoded.shape[2]) != 1
-            ):
-                raise ValueError(
-                    "h3_motion_context: keyframe %d encoded to %s; "
-                    "expected one H3 still latent [B,C,1,H,W]"
-                    % (
-                        slot,
-                        tuple(getattr(encoded, "shape", ())),
-                    )
-                )
-
-            keyframes.append({
-                # Stock PackedLayout accepts frame 0 here. The real temporal
-                # location is applied lazily through MC_KEY.
-                "resolved_frame_index": 0,
-                MC_KEY: int(pixel_index),
-                MC_VIDEO_STRENGTH: strengths[slot - 1],
-                "latent": encoded,
-            })
-
-        out = node_helpers.conditioning_set_values(
-            conditioning,
-            {
-                "minimax_keyframes": keyframes,
-                "minimax_frame_count": frame_count,
-            },
-        )
-
-        shown = [
-            p + 1 if indexing == "1-based" else p
-            for p, _, _ in anchors
-        ]
-        _LOG.info(
-            "h3_motion_context: Custom Keyframes pinned %d anchors at %s "
-            "in a %d-frame %dx%d target",
-            len(keyframes),
-            shown,
-            frame_count,
-            width,
-            height,
-        )
-
-        return (out,)
-
-
-class MiniMaxH3CustomAudio:
-    """Pin audio clips at arbitrary positions of the H3 output timeline.
-
-    Stock audio refs sit in a span before the clip and are merely imitated.
-    Every block attached here is instead MOVED onto the target clip's own
-    audio timeline, with its sound (or its start, in start mode) landing at
-    the requested frame, exactly how custom keyframes anchor the video. The
-    injected sound is never denoised, so the model hears it as established
-    fact and must generate the clip's audio around it -- before it, after
-    it, or both.
-
-    align=end:  the audio block ENDS at the chosen frame. Sound before that
-                instant is pinned, the model continues from it.
-    align=start: the audio block STARTS at the chosen frame. Sound from that
-                instant on is pinned, the model leads into it.
-
-    Each slot has a strength ("audio N strength") between 0.0 and 1.0 that
-    sets how much of the clip stays pinned: the rows are pinned EXACT (clean,
-    no noise) while the audio schedule's progress stays below the strength,
-    then the block's tokens are dropped from the layout and the model's own
-    stream covers the region with no reference at all. So 1.0 pins exactly,
-    0.9 almost the clip, 0.5 pinned half then free re-render, 0.1 a light
-    early-structure hint. Nothing noisy is ever shown to the model.
-    """
-
-    MAX_AUDIOS = 16
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "conditioning": (
-                    "CONDITIONING",
-                    {
-                        "tooltip": (
-                            "H3 conditioning. Custom audio blocks are appended "
-                            "to any existing minimax_refs (Ref2VA refs, H3 "
-                            "Motion Context audio)."
-                        )
-                    },
-                ),
-                "audio_vae": (
-                    "VAE",
-                    {
-                        "tooltip": (
-                            "MiniMax H3 audio VAE used to encode each audio "
-                            "clip."
-                        )
-                    },
-                ),
-                "latent": (
-                    "LATENT",
-                    {
-                        "tooltip": (
-                            "Target MiniMax H3 AV latent; defines the frame "
-                            "count the audio positions are measured against."
-                        )
-                    },
-                ),
-                "audio_state": (
-                    "STRING",
-                    {
-                        "default": '{"count":1,"positions":[1],"strengths":[1]}',
-                        "multiline": False,
-                        "tooltip": (
-                            "Internal UI state. Normally managed by the "
-                            "audio position and strength controls."
-                        ),
-                    },
-                ),
-                "indexing": (
-                    ["1-based", "0-based"],
-                    {"default": "1-based"},
-                ),
-                "align": (
-                    ["end", "start"],
-                    {
-                        "default": "end",
-                        "tooltip": (
-                            "end: the audio block finishes at the chosen "
-                            "frame (sound already here, the model continues "
-                            "it). start: the audio block begins at the "
-                            "chosen frame (sound arrives there, the model "
-                            "leads into it)."
-                        ),
-                    },
-                ),
-            },
-            "optional": _DynamicInputs("audio_", ("AUDIO",)),
-        }
-
-    RETURN_TYPES = ("CONDITIONING",)
-    RETURN_NAMES = ("conditioning",)
-    FUNCTION = "apply"
-    CATEGORY = "conditioning/minimax"
-    DESCRIPTION = (
-        "Pin MiniMax H3 audio clips at arbitrary output-frame positions, "
-        "end- or start-aligned. Starts with 1 audio slot; use + Add audio "
-        "for more. Each clip has its own strength: 1.0 pins it exactly "
-        "(default), lower values let the model vary the sound more."
-    )
-
-    def apply(
-        self,
-        conditioning,
-        audio_vae,
-        latent,
-        audio_state,
-        indexing="1-based",
-        align="end",
-        **kwargs,
-    ):
-        _ensure_h3_runtime_patches()
-
-        positions, count, strengths = _parse_slots(
-            audio_state, "Custom Audio", "audio", self.MAX_AUDIOS
-        )
-
-        frame_count = _target_metrics(_video_from_latent(latent))[2]
-
-        anchors = []
-        for slot in range(1, count + 1):
-            raw_position = int(positions[slot - 1])
-            zero_based = (
-                raw_position - 1 if indexing == "1-based" else raw_position
-            )
-
-            if align == "end":
-                # the block ends at the END of 1-based frame `position`
-                # (sound covers frames 1..position). position is the 1-based
-                # raw value; a 0-based slot maps to the same end instant.
-                if zero_based < 0 or zero_based >= frame_count:
-                    low, high = (
-                        (1, frame_count)
-                        if indexing == "1-based"
-                        else (0, frame_count - 1)
-                    )
-                    raise ValueError(
-                        "h3_motion_context: audio %d end position %d is "
-                        "outside %d..%d" % (slot, raw_position, low, high)
-                    )
-                window_frames = zero_based + 1
-            else:
-                if zero_based < 0 or zero_based >= frame_count:
-                    low, high = (
-                        (1, frame_count)
-                        if indexing == "1-based"
-                        else (0, frame_count - 1)
-                    )
-                    raise ValueError(
-                        "h3_motion_context: audio %d start position %d is "
-                        "outside %d..%d" % (slot, raw_position, low, high)
-                    )
-                window_frames = frame_count - zero_based
-
-            audio = kwargs.get("audio_%d" % slot)
-            if audio is None:
-                raise ValueError(
-                    "h3_motion_context: audio %d has no clip connected" % slot
-                )
-            waveform = audio.get("waveform")
-            if getattr(waveform, "ndim", 0) != 3 or int(waveform.shape[-1]) < 1:
-                raise ValueError(
-                    "h3_motion_context: audio %d expected an AUDIO clip "
-                    "[B,C,L]" % slot
-                )
-
-            z, rt = _encode_audio_window(
-                audio_vae, audio, window_frames / float(FPS),
-                tail=(align == "end"))
-            if rt < 1:
-                raise ValueError(
-                    "h3_motion_context: audio %d encoded to zero latent "
-                    "steps" % slot
-                )
-
-            if align == "end":
-                # sound ends at the end of 1-based frame `position`
-                end_frame = float(zero_based + 1)
-            else:
-                # sound starts at 0-based frame `zero_based` and covers
-                # rt 40 Hz steps = rt * 3/5 frame units of timeline
-                end_frame = float(zero_based) + rt / FRAME_RESCALE
-
-            anchors.append((end_frame, slot, z, rt, strengths[slot - 1]))
-
-        anchors.sort(key=lambda item: item[0])
-
-        for i in range(len(anchors)):
-            for j in range(i + 1, len(anchors)):
-                if abs(anchors[i][0] - anchors[j][0]) < 1e-6:
-                    raise ValueError(
-                        "h3_motion_context: audio %d and %d would both end at "
-                        "frame %.3f. Pick different positions."
-                        % (anchors[i][1], anchors[j][1], anchors[i][0])
-                    )
-
-        refs = [
-            {
-                "kind": "audio",
-                "ref_audio_t": rt,
-                "audio_latent": z,
-                MC_AUDIO_KEY: end_frame,
-                MC_AUDIO_STRENGTH: strength,
-            }
-            for end_frame, _, z, rt, strength in anchors
-        ]
-
-        out = node_helpers.conditioning_set_values(
-            conditioning, {"minimax_refs": refs}, append=True)
-
-        _LOG.info(
-            "h3_motion_context: Custom Audio pinned %d blocks (%s-aligned) "
-            "ending at %.3f..%.3f in a %d-frame clip",
-            len(refs), align, anchors[0][0], anchors[-1][0], frame_count,
-        )
-        return (out,)
-
-
-class MiniMaxH3CustomVideo:
-    """Pin full video clips onto the H3 output timeline.
-
-    Each clip is encoded in one VAE call; every latent step becomes a cond
-    block anchored at its own pixel frame, so the motion lives inside the
-    latents like a run of keyframes. An optional audio track per clip is
-    windowed to that clip's duration (a longer track is cut from its start)
-    and end-aligned with the clip's last frame.
-
-    Each slot has a strength ("video N strength") between 0.0 and 1.0 that
-    sets how much of the clip stays pinned: the clip is pinned EXACT (clean
-    rows under the canonical 0.999 claim) for the first `strength`-fraction
-    of the run, then its tokens are dropped from the layout and the model's
-    own stream covers the region with no reference at all. So 1.0 pins
-    exactly, 0.9 almost the clip, 0.5 pinned half then free re-render,
-    0.1 a light early-structure hint. Nothing noisy is ever shown to the
-    model. The clip's audio track follows the same strength on the same
-    schedule (audio timeline, shifted via time_shift_sigma).
-    """
-
-    MAX_VIDEOS = 8
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "conditioning": ("CONDITIONING", {
-                    "tooltip": "H3 conditioning. The node replaces its "
-                               "minimax_keyframes list with the videos' cond "
-                               "blocks and appends any audio refs to existing "
-                               "refs."}),
-                "vae": ("VAE", {
-                    "tooltip": "MiniMax H3 video VAE used to encode the "
-                               "clips."}),
-                "latent": ("LATENT", {
-                    "tooltip": "Target MiniMax H3 AV latent; defines "
-                               "resolution and exact frame count."}),
-                "video_state": ("STRING", {
-                    "default": '{"count":1,"positions":[1],"strengths":[1]}',
-                    "multiline": False,
-                    "tooltip": "Internal UI state. Normally managed by the "
-                               "video position and strength controls."}),
-                "indexing": (["1-based", "0-based"], {"default": "1-based"}),
-                "crop": (["disabled", "center"], {"default": "disabled"}),
-            },
-            "optional": _DynamicInputs(
-                ("video_", ("IMAGE",)),
-                ("video_audio_", ("AUDIO",)),
-                audio_vae=("VAE", {
-                    "tooltip": "H3 audio VAE. Required when any clip has an "
-                               "audio track wired."}),
-            ),
-        }
-
-    RETURN_TYPES = ("CONDITIONING",)
-    RETURN_NAMES = ("conditioning",)
-    FUNCTION = "apply"
-    CATEGORY = "conditioning/minimax"
-    DESCRIPTION = ("Pin full video clips, each with its own position, "
-                   "strength and optional audio track, onto the H3 timeline. "
-                   "Starts with 1 video slot; use + Add video for more. "
-                   "Strength 1.0 pins the clip exactly (default); lower "
-                   "values let the model vary the content more.")
-
-    def apply(self, conditioning, vae, latent, video_state,
-              indexing="1-based", crop="disabled", audio_vae=None, **kwargs):
-        _ensure_h3_runtime_patches()
-
-        positions, count, strengths = _parse_slots(
-            video_state, "Custom Video", "video", self.MAX_VIDEOS
-        )
-
-        target = _video_from_latent(latent)
-        width, height, frame_count = _target_metrics(target)
-
-        keyframes, hard = [], []
-        audio_refs = []
-        infos = []
-        for slot in range(1, count + 1):
-            raw_position = int(positions[slot - 1])
-            zero_based = (raw_position - 1 if indexing == "1-based"
-                          else raw_position)
-
-            video = kwargs.get("video_%d" % slot)
-            if video is None:
-                raise ValueError(
-                    "h3_motion_context: video %d has no clip connected" % slot)
-            if getattr(video, "ndim", 0) != 4 or int(video.shape[0]) < 1:
-                raise ValueError(
-                    "h3_motion_context: video %d expected IMAGE frames "
-                    "[B,H,W,C]" % slot)
-
-            n = int(video.shape[0])
-            runs = _video_runs(n)
-            if len(runs) > 1:
-                _LOG.info(
-                    "h3_motion_context: video %d split into %d grid runs: %s",
-                    slot, len(runs), runs)
-
-            if zero_based < 0 or zero_based + n > frame_count:
-                raise ValueError(
-                    "h3_motion_context: video %d does not fit: %d frames "
-                    "starting at position %d in a %d frame clip"
-                    % (slot, n, raw_position, frame_count))
-
-            strength = strengths[slot - 1]
-            run_acc = 0
-            for run in runs:
-                enc = vae.encode(_resize(
-                    video[run_acc:run_acc + run], width, height, crop))
-                steps = int(enc.shape[2])
-                _assert_vae_grid(steps, run, "video %d" % slot)
-                offsets = _step_offsets(steps)
-                for k, off in enumerate(offsets):
-                    keyframes.append({
-                        "resolved_frame_index": 0,
-                        MC_KEY: zero_based + run_acc + off,
-                        MC_VIDEO_STRENGTH: strength,
-                        "latent": enc[:, :, k:k + 1],
-                    })
-                run_acc += run
-
-            hard.extend(_hard_video_steps(
-                vae, video, zero_based, n, width, height, crop, frame_count))
-
-            audio_info = "off"
-            audio = kwargs.get("video_audio_%d" % slot)
-            if audio is not None:
-                if audio_vae is None:
-                    raise ValueError(
-                        "h3_motion_context: video %d has an audio track but "
-                        "no audio_vae. Wire the H3 audio VAE." % slot)
-                audio_latent, ref_audio_t = _encode_audio_window(
-                    audio_vae, audio, n / float(FPS), tail=False)
-                # end-aligned with this video's last frame: the block ends
-                # at 1-based frame zero_based + n
-                audio_refs.append({
-                    "kind": "audio",
-                    "ref_audio_t": ref_audio_t,
-                    "audio_latent": audio_latent,
-                    MC_AUDIO_KEY: float(zero_based + n),
-                    MC_AUDIO_STRENGTH: strength,
-                })
-                audio_info = "%d latent steps" % ref_audio_t
-
-            infos.append((slot, zero_based, zero_based + n - 1, n,
-                          audio_info))
-
-        out = node_helpers.conditioning_set_values(conditioning, {
-            "minimax_keyframes": keyframes,
-            "minimax_frame_count": frame_count,
-        })
-        if hard:
-            out = node_helpers.conditioning_set_values(
-                out, {"minimax_hard_video": hard}, append=True)
-        if audio_refs:
-            out = node_helpers.conditioning_set_values(
-                out, {"minimax_refs": audio_refs}, append=True)
-
-        _LOG.info(
-            "h3_motion_context: Custom Video pinned %d clips (%d cond blocks, "
-            "%d hard-injected steps) in a %d-frame clip: %s",
-            count, len(keyframes), len(hard), frame_count,
-            ", ".join("video %d = %d frames at %d..%d, audio %s"
-                      % (slot, run, start, end, ai)
-                      for slot, start, end, run, ai in infos),
-        )
-        return (out,)
-
 
 class MiniMaxH3Timeline:
-    """One node, one timeline: still images, video clips and audio clips.
-
-    A single ordered list of clips, each pinned at a 1-based start frame:
-      image  a still, pinned at its frame (an H3 custom keyframe)
-      video  a full clip; every latent step is pinned at its own frame and
-             its audio track (video_audio_N) rides the audio timeline
-      audio  a window of sound pinned on the audio track
-
-    A video's audio is linked by default: it follows the clip's position
-    and length. Set audio_link false in the state to move and trim it
-    independently (audio_start / audio_len / audio_align). Audio windows
-    are cut from the head ("head") or the tail ("tail") of their source.
-
-    Video and image placements are structural: they raise when they do not
-    fit the target clip. Audio windows are contextual: out-of-range starts
-    are parked at the last frame with a warning, never raised. Per-clip
-    strength rides MC_VIDEO_STRENGTH / MC_AUDIO_STRENGTH exactly like the
-    per-type custom nodes. An optional per-clip strength envelope
-    (`env: [[content_frame, strength], ...]`, frames relative to the clip
-    window) overrides the flat strength frame by frame: video keyframes
-    sample it per latent step, audio windows are split into one ref per
-    segment at its breakpoints.
-    """
+    """Video-editor timeline: still images, video clips and audio clips anchored
+    along the MiniMax H3 timeline using core minimax_keyframes guides."""
 
     MAX_CLIPS = 32
 
@@ -1663,23 +272,17 @@ class MiniMaxH3Timeline:
         return {
             "required": {
                 "conditioning": ("CONDITIONING", {
-                    "tooltip": "H3 conditioning. The node replaces its "
-                               "minimax_keyframes list with the timeline's "
-                               "blocks and appends its audio refs."}),
+                    "tooltip": "H3 positive conditioning to attach timeline guides to."}),
                 "video vae": ("VAE", {
-                    "tooltip": "MiniMax H3 video VAE used to encode the "
-                               "images and video clips."}),
+                    "tooltip": "MiniMax H3 video VAE used to encode images and video clips."}),
                 "audio vae": ("VAE", {
-                    "tooltip": "H3 audio VAE. Required when any clip has "
-                               "audio wired."}),
+                    "tooltip": "H3 audio VAE. Required when any clip on the timeline has audio."}),
                 "latent": ("LATENT", {
-                    "tooltip": "Target MiniMax H3 AV latent; defines "
-                               "resolution and exact frame count."}),
+                    "tooltip": "Target MiniMax H3 AV latent; defines canvas resolution and duration."}),
                 "timeline_state": ("STRING", {
                     "default": '{"clips":[]}',
                     "multiline": False,
-                    "tooltip": "Internal UI state. Normally managed by the "
-                               "timeline widget."}),
+                    "tooltip": "Internal UI state from the timeline widget."}),
                 "crop": (["disabled", "center"], {"default": "disabled"}),
             },
             "optional": _DynamicInputs(
@@ -1689,14 +292,10 @@ class MiniMaxH3Timeline:
                 ("audio_", ("AUDIO",)),
                 fps=("INT", {
                     "default": 24, "min": 1, "max": 240, "step": 1,
-                    "tooltip": "Override the timeline fps used for audio "
-                               "trimming. When connected, drives the node; "
-                               "otherwise the UI widget sets it."}),
+                    "tooltip": "Timeline frame rate for audio synchronization."}),
                 total_frames=("INT", {
                     "default": 240, "min": 1, "max": 100000, "step": 1,
-                    "tooltip": "Override the total frame count (ruler length). "
-                               "When connected, drives the node; otherwise "
-                               "the UI widget sets it."}),
+                    "tooltip": "Timeline ruler length in frames."}),
             ),
         }
 
@@ -1704,403 +303,167 @@ class MiniMaxH3Timeline:
     RETURN_NAMES = ("conditioning",)
     FUNCTION = "apply"
     CATEGORY = "conditioning/minimax"
-    DESCRIPTION = ("Video-editor timeline: drop still images, video clips "
-                   "and audio clips at any frame. A video's sound starts "
-                   "linked to it; unlink to move or trim it alone.")
+    DESCRIPTION = ("Video-editor timeline: place still images, video clips and audio "
+                   "tracks at any frame using ComfyUI core MiniMax H3 guides.")
 
-    @staticmethod
-    def _audio_ref(audio_vae, audio, idx, strength, a_start, a_len, align,
-                   fps=FPS, env=None):
-        """Build the audio refs for one clip window.
-
-        Like video keyframes, a strength envelope is sampled per latent step
-        (linear interpolation between points), giving one back-to-back ref
-        per step with that step's own strength. A flat envelope (no points
-        or a constant curve) still yields the single stock ref so the common
-        case costs nothing. Returns a list so callers can `extend`
-        unconditionally.
-        """
-        if audio_vae is None:
-            raise ValueError(
-                "h3_motion_context: clip %d has audio but no audio_vae. "
-                "Wire the H3 audio VAE." % idx)
-        waveform = audio.get("waveform")
-        if getattr(waveform, "ndim", 0) != 3 or int(waveform.shape[-1]) < 1:
-            raise ValueError(
-                "h3_motion_context: clip %d expected an AUDIO clip [B,C,L]"
-                % idx)
-        z, rt = _encode_audio_window(
-            audio_vae, audio, a_len / float(fps), tail=(align == "tail"))
-        if rt < 1:
-            raise ValueError(
-                "h3_motion_context: clip %d audio encoded to zero latent "
-                "steps" % idx)
-        pts = _env_curve(env, strength)
-        strengths = [_env_strength(pts, a_len * k / float(rt))
-                     for k in range(rt)]
-        if len(set(strengths)) == 1:
-            return [{
-                "kind": "audio",
-                "ref_audio_t": rt,
-                "audio_latent": z,
-                MC_AUDIO_KEY: float(a_start - 1 + a_len),
-                MC_AUDIO_STRENGTH: strengths[0],
-            }]
-        refs = []
-        for k in range(rt):
-            f1 = a_len * (k + 1) / float(rt)
-            refs.append({
-                "kind": "audio",
-                "ref_audio_t": 1,
-                "audio_latent": z[:, :, :, k:k + 1],
-                MC_AUDIO_KEY: float(a_start - 1 + f1),
-                MC_AUDIO_STRENGTH: strengths[k],
-            })
-        return refs
-
-    @staticmethod
-    def _fit_audio(start, length, frame_count, idx):
-        """Clamp an audio window into the clip. Audio rows are contextual,
-        so an out-of-range start is parked at the last frame with a warning
-        instead of killing the run."""
-        start = max(1, int(start))
-        length = max(1, int(length))
-        end = start - 1 + length
-        if start - 1 >= frame_count:
-            _LOG.warning(
-                "h3_motion_context: audio clip %d starts at frame %d, "
-                "beyond the %d frame clip; parked at the last frame",
-                idx, start, frame_count)
-            return frame_count, 1
-        if end > frame_count:
-            _LOG.warning(
-                "h3_motion_context: audio clip %d window cut from %d to %d "
-                "frames to fit the %d frame clip",
-                idx, length, frame_count - start + 1, frame_count)
-            length = frame_count - start + 1
-        return start, length
-
-    def apply(self, conditioning, latent, timeline_state,
-              crop="disabled", **kwargs):
-        # input keys carry spaces ("video vae" / "audio vae"), so they only
-        # arrive through **kwargs
+    def apply(self, conditioning, latent, timeline_state, crop="disabled", **kwargs):
         vae = kwargs.get("video vae")
         audio_vae = kwargs.get("audio vae")
         fps = int(kwargs.get("fps") or FPS)
-        _ensure_h3_runtime_patches()
 
         try:
             state = json.loads(timeline_state or "{}")
         except Exception as exc:
-            raise ValueError(
-                "h3_motion_context: invalid H3 Timeline UI state") from exc
+            raise ValueError("Timeline: invalid timeline UI state JSON") from exc
 
         clips = state.get("clips") or []
         if not clips:
-            raise ValueError("h3_motion_context: Timeline has no clips")
+            return (conditioning,)
+
         if len(clips) > self.MAX_CLIPS:
-            raise ValueError(
-                "h3_motion_context: Timeline clip count must be 1..%d"
-                % self.MAX_CLIPS)
+            raise ValueError("Timeline: clip count exceeds maximum of %d" % self.MAX_CLIPS)
 
-        target = _video_from_latent(latent)
-        width, height, frame_count = _target_metrics(target)
+        samples = latent["samples"]
+        if hasattr(samples, "tensors"):
+            video = samples.tensors[0]
+            audio = samples.tensors[1] if len(samples.tensors) > 1 else None
+        elif hasattr(samples, "unbind"):
+            unbound = samples.unbind()
+            video = unbound[0]
+            audio = unbound[1] if len(unbound) > 1 else None
+        elif isinstance(samples, (list, tuple)):
+            video = samples[0]
+            audio = samples[1] if len(samples) > 1 else None
+        else:
+            video = samples
+            audio = None
 
-        keyframes, refs = [], []
-        hard = []
-        video_blocks = []
-        infos = []
+        if video.ndim == 4:
+            video = video.unsqueeze(0)
+
+        height = int(video.shape[3]) * 16
+        width = int(video.shape[4]) * 16
+        latent_t = int(video.shape[2])
+        frame_count = _pixel_frames(latent_t)
+        audio_latent_t = int(audio.shape[-1]) if audio is not None else int(round(frame_count * FRAME_RESCALE))
+
+        keyframes = list(conditioning[0][1].get("minimax_keyframes", []))
+
         for idx, clip in enumerate(clips, 1):
             slot = int(clip.get("id") or idx)
             kind = clip.get("kind")
-            if kind not in ("image", "video", "audio"):
-                raise ValueError(
-                    "h3_motion_context: timeline clip %d has unknown kind %r"
-                    % (idx, kind))
-            start = int(clip.get("start") or 1)
-            if start < 1:
-                raise ValueError(
-                    "h3_motion_context: timeline clip %d start %d is below 1"
-                    % (idx, start))
-            sv = clip.get("strength")
-            strength = min(1.0, max(0.0, float(
-                sv if sv is not None else 1.0)))
-            zero = start - 1
+            start = max(1, int(clip.get("start") or 1))
+            resolved_frame_index = start - 1
 
-            if kind == "video":
-                frames = kwargs.get("video_%d" % slot)
-                audio = kwargs.get("video_audio_%d" % slot)
-                src_start = max(0, int(clip.get("src_start") or 0))
-                fmedia = clip.get("file")
-                if fmedia:
-                    data = _load_media_file(fmedia, fps=fps)
-                    frames = data["frames"]
-                    if frames is None:
-                        raise ValueError(
-                            "h3_motion_context: video clip %d file %r has no "
-                            "video stream"
-                            % (idx, fmedia.get("name")))
-                    if src_start >= int(frames.shape[0]):
-                        _LOG.warning(
-                            "h3_motion_context: video clip %d src_start %d "
-                            "past the %d frame file; holding the last frame",
-                            idx, src_start, int(frames.shape[0]))
-                        src_start = max(0, int(frames.shape[0]) - 1)
-                    frames = frames[src_start:]
-                    if audio is None and not clip.get("audio_off") \
-                            and data["audio"] is not None:
-                        audio = _slice_audio(
-                            data["audio"], src_start / float(fps))
-                elif frames is not None and src_start > 0:
-                    if src_start >= int(frames.shape[0]):
-                        _LOG.warning(
-                            "h3_motion_context: video clip %d src_start %d "
-                            "past the %d frame input; holding the last frame",
-                            idx, src_start, int(frames.shape[0]))
-                        src_start = max(0, int(frames.shape[0]) - 1)
-                    frames = frames[src_start:]
-                    if audio is not None and not clip.get("audio_off"):
-                        audio = _slice_audio(
-                            audio, src_start / float(fps))
-                if frames is None:
-                    raise ValueError(
-                        "h3_motion_context: video clip %d has no frames "
-                        "connected" % idx)
-                if getattr(frames, "ndim", 0) != 4 or int(frames.shape[0]) < 1:
-                    raise ValueError(
-                        "h3_motion_context: video clip %d expected IMAGE "
-                        "frames [B,H,W,C]" % idx)
-                want = min(max(1, int(clip.get("len") or 22)),
-                           int(frames.shape[0]))
-                runs = _video_runs(want)
-                if len(runs) > 1:
-                    _LOG.info(
-                        "h3_motion_context: video clip %d split into %d grid "
-                        "runs: %s", idx, len(runs), runs)
-                if zero + want > frame_count:
-                    if want >= frame_count:
-                        _LOG.warning(
-                            "h3_motion_context: video clip %d needs %d "
-                            "frames, more than the %d frame clip; skipped",
-                            idx, want, frame_count)
-                        continue
-                    _LOG.warning(
-                        "h3_motion_context: video clip %d at frame %d does "
-                        "not fit in the %d frame clip; parked at frame %d",
-                        idx, start, frame_count, frame_count - want + 1)
-                    zero = frame_count - want
-                    start = zero + 1
-                vpts = _env_curve(clip.get("env"), strength)
-                run_acc = 0
-                for run in runs:
-                    enc = vae.encode(_resize(
-                        frames[run_acc:run_acc + run], width, height, crop))
-                    steps = int(enc.shape[2])
-                    _assert_vae_grid(steps, run, "video clip %d" % idx)
-                    for k, off in enumerate(_step_offsets(steps)):
-                        keyframes.append({
-                            "resolved_frame_index": 0,
-                            MC_KEY: zero + run_acc + off,
-                            MC_VIDEO_STRENGTH: _env_strength(
-                                vpts, run_acc + off),
-                            "latent": enc[:, :, k:k + 1],
-                        })
-                    run_acc += run
-
-                video_blocks.append((zero, want, frames[:want]))
-
-                # audio is the input or the file-derived fallback above;
-                # re-reading the kwarg here would drop the file's track
-                if audio is not None and not clip.get("audio_off"):
-                    if clip.get("audio_link", True):
-                        a_start, a_len, align = start, want, "head"
-                    else:
-                        a_start, a_len = self._fit_audio(
-                            clip.get("audio_start") or start,
-                            clip.get("audio_len") or want,
-                            frame_count, idx)
-                        align = clip.get("audio_align", "head")
-                        # an unlinked band froze its own slice of the file at
-                        # unlink time (audio_src_start); slice at that offset,
-                        # not the video's current src_start, so trims to the
-                        # video no longer move the band's sound.
-                        asrc = clip.get("audio_src_start")
-                        if fmedia and asrc is not None:
-                            audio = _slice_audio(
-                                data["audio"], float(asrc) / float(fps))
-                    ast = clip.get("audio_strength")
-                    aenv = clip.get("audio_env")
-                    if aenv is None:
-                        aenv = clip.get("env")
-                    refs.extend(self._audio_ref(
-                        audio_vae, audio, idx,
-                        float(ast if ast is not None else strength),
-                        a_start, a_len, align, fps=fps,
-                        env=aenv))
-                    link = "linked" if clip.get("audio_link", True) else \
-                        "unlinked"
-                    infos.append(
-                        "clip %d: video %d..%d (src_start=%d) + audio %d..%d (%s)"
-                        % (idx, zero + 1, zero + want, src_start, a_start,
-                           a_start + a_len - 1, link))
-                else:
-                    infos.append(
-                        "clip %d: video %d..%d (src_start=%d), silent"
-                        % (idx, zero + 1, zero + want, src_start))
-
-            elif kind == "image":
-                want = max(1, int(clip.get("len") or 1))
-                steps = 1
-                while _pixel_frames(steps) < want:
-                    steps += 1
-                cover = _pixel_frames(steps)
-                if zero >= frame_count or zero + cover > frame_count:
-                    if cover >= frame_count:
-                        _LOG.warning(
-                            "h3_motion_context: image clip %d stretched to %d "
-                            "frames; holding it over the whole %d frame clip",
-                            idx, want, frame_count)
-                        zero = 0
-                    else:
-                        _LOG.warning(
-                            "h3_motion_context: image clip %d at frame %d "
-                            "does not fit with %d frames in the %d frame "
-                            "clip; parked at frame %d",
-                            idx, start, cover, frame_count,
-                            frame_count - cover + 1)
-                        zero = frame_count - cover
-                    start = zero + 1
+            if kind == "image":
                 image = kwargs.get("image_%d" % slot)
                 fmedia = clip.get("file")
                 if fmedia:
                     image = _load_image_file(fmedia)
                 if image is None:
-                    raise ValueError(
-                        "h3_motion_context: image clip %d has no image "
-                        "connected" % idx)
-                if int(image.shape[0]) != 1:
-                    raise ValueError(
-                        "h3_motion_context: image clip %d must receive "
-                        "exactly one image, not a batch of %d"
-                        % (idx, int(image.shape[0])))
-                encoded = vae.encode(_resize(image, width, height, crop))
-                if getattr(encoded, "ndim", 0) != 5 \
-                        or int(encoded.shape[2]) != 1:
-                    raise ValueError(
-                        "h3_motion_context: image clip %d encoded to %s; "
-                        "expected one H3 still latent [B,C,1,H,W]"
-                        % (idx, tuple(getattr(encoded, "shape", ()))))
-                if cover != want:
-                    _LOG.warning(
-                        "h3_motion_context: image clip %d stretched to %d "
-                        "frames, off the latent grid; holding it over %d "
-                        "frames", idx, want, cover)
-                enc = encoded.repeat(1, 1, steps, 1, 1)
-                vpts = _env_curve(clip.get("env"), strength)
-                for k, off in enumerate(_step_offsets(steps)):
-                    keyframes.append({
-                        "resolved_frame_index": 0,
-                        MC_KEY: zero + off,
-                        MC_VIDEO_STRENGTH: _env_strength(vpts, off),
-                        "latent": enc[:, :, k:k + 1],
-                    })
-                infos.append("clip %d: image at frame %d, held %d frames"
-                             % (idx, start, cover))
+                    continue
 
-            else:  # audio
-                if audio_vae is None:
-                    raise ValueError(
-                        "h3_motion_context: audio clip %d has no audio_vae. "
-                        "Wire the H3 audio VAE." % idx)
-                a_start, a_len = self._fit_audio(
-                    start, clip.get("len") or 22, frame_count, idx)
-                audio = kwargs.get("audio_%d" % slot)
+                resolved_frame_index = min(frame_count - 1, resolved_frame_index)
+                frames = _resize(image[:1], width, height, crop)
+                enc_latent = vae.encode(frames)
+                keyframes.append({
+                    "resolved_frame_index": resolved_frame_index,
+                    "latent": enc_latent,
+                })
+
+            elif kind == "video":
+                frames = kwargs.get("video_%d" % slot)
+                audio_in = kwargs.get("video_audio_%d" % slot)
+                src_start = max(0, int(clip.get("src_start") or 0))
+                fmedia = clip.get("file")
+                if fmedia:
+                    data = _load_media_file(fmedia, fps=fps)
+                    frames = data["frames"]
+                    if audio_in is None and not clip.get("audio_off") and data["audio"] is not None:
+                        audio_in = _slice_audio(data["audio"], src_start / float(fps))
+                elif frames is not None and src_start > 0:
+                    if src_start >= int(frames.shape[0]):
+                        src_start = max(0, int(frames.shape[0]) - 1)
+                    frames = frames[src_start:]
+                    if audio_in is not None and not clip.get("audio_off"):
+                        audio_in = _slice_audio(audio_in, src_start / float(fps))
+
+                if frames is None:
+                    continue
+
+                want = min(max(1, int(clip.get("len") or 22)), int(frames.shape[0]))
+                if want < 5:
+                    guide_frames = 1
+                else:
+                    guide_frames = want
+                    while guide_frames % 17 != 5:
+                        guide_frames -= 1
+
+                resolved_frame_index = max(0, min(frame_count - guide_frames, resolved_frame_index))
+                enc_latent = vae.encode(_resize(frames[:guide_frames], width, height, crop))
+                kf = {
+                    "resolved_frame_index": resolved_frame_index,
+                    "latent": enc_latent,
+                }
+
+                if audio_in is not None and not clip.get("audio_off"):
+                    if clip.get("audio_link", True):
+                        audio_slice = _slice_audio(audio_in, 0, guide_frames / float(fps))
+                        audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
+                        max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * resolved_frame_index))
+                        if audio_rt > max_rt:
+                            audio_lat = audio_lat[..., :max_rt].clone()
+                        kf["audio_latent"] = audio_lat
+                        keyframes.append(kf)
+                    else:
+                        keyframes.append(kf)
+                        a_start = int(clip.get("audio_start") or start)
+                        a_resolved = max(0, min(frame_count - 1, a_start - 1))
+                        a_len = int(clip.get("audio_len") or want)
+                        asrc = float(clip.get("audio_src_start") or 0)
+                        audio_slice = _slice_audio(audio_in, asrc / float(fps), a_len / float(fps))
+                        audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
+                        max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * a_resolved))
+                        if audio_rt > max_rt:
+                            audio_lat = audio_lat[..., :max_rt].clone()
+                        keyframes.append({
+                            "resolved_frame_index": a_resolved,
+                            "audio_latent": audio_lat,
+                        })
+                else:
+                    keyframes.append(kf)
+
+            elif kind == "audio":
+                audio_in = kwargs.get("audio_%d" % slot)
                 src_start = max(0, int(clip.get("src_start") or 0))
                 fmedia = clip.get("file")
                 if fmedia:
                     data = _load_media_file(fmedia)
-                    audio = data["audio"]
-                    if audio is None:
-                        raise ValueError(
-                            "h3_motion_context: audio clip %d file %r has no "
-                            "audio stream"
-                            % (idx, fmedia.get("name")))
-                    audio = _slice_audio(
-                        audio,
-                        src_start / float(fps))
-                elif audio is not None and src_start > 0:
-                    audio = _slice_audio(
-                        audio,
-                        src_start / float(fps))
-                if audio is None:
-                    raise ValueError(
-                        "h3_motion_context: audio clip %d has no clip "
-                        "connected" % idx)
-                refs.extend(self._audio_ref(
-                    audio_vae, audio, idx, strength,
-                    a_start, a_len, clip.get("align", "head"), fps=fps,
-                    env=clip.get("env")))
-                infos.append("clip %d: audio %d..%d"
-                             % (idx, a_start, a_start + a_len - 1))
+                    audio_in = data["audio"]
+                if audio_in is None:
+                    continue
 
-        # hard-inject each maximal run of contiguous video content as one
-        # window: the encode is chunk-aligned and exact only when the whole
-        # block is encoded together, so clip seams never show held-edge
-        # content (a lone clip re-encodes its own window per call)
-        video_blocks.sort(key=lambda b: b[0])
-        group, group_end = [], None
-        for zero, want, frames in video_blocks:
-            if group and zero != group_end:
-                hard.extend(_hard_video_steps(
-                    vae, torch.cat([g[2] for g in group], dim=0),
-                    group[0][0], sum(g[1] for g in group), width, height,
-                    crop, frame_count))
-                group = []
-            group.append((zero, want, frames))
-            group_end = zero + want
-        if group:
-            hard.extend(_hard_video_steps(
-                vae, torch.cat([g[2] for g in group], dim=0),
-                group[0][0], sum(g[1] for g in group), width, height, crop,
-                frame_count))
+                want_len = max(1, int(clip.get("len") or 22))
+                resolved_frame_index = max(0, min(frame_count - 1, resolved_frame_index))
+                audio_slice = _slice_audio(audio_in, src_start / float(fps), want_len / float(fps))
+                audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
+                max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * resolved_frame_index))
+                if audio_rt > max_rt:
+                    audio_lat = audio_lat[..., :max_rt].clone()
+                keyframes.append({
+                    "resolved_frame_index": resolved_frame_index,
+                    "audio_latent": audio_lat,
+                })
 
-        keyframes.sort(key=lambda kf: kf[MC_KEY])
-        out = node_helpers.conditioning_set_values(conditioning, {
-            "minimax_keyframes": keyframes,
-            "minimax_frame_count": frame_count,
-        })
-        if refs:
-            out = node_helpers.conditioning_set_values(
-                out, {"minimax_refs": refs}, append=True)
-        if hard:
-            out = node_helpers.conditioning_set_values(
-                out, {"minimax_hard_video": hard}, append=True)
-
-        _LOG.info(
-            "h3_motion_context: Timeline pinned %d cond blocks + %d audio "
-            "refs, %d hard-injected steps, in a %d-frame clip: %s",
-            len(keyframes), len(refs), len(hard), frame_count,
-            "; ".join(infos))
+        keyframes.sort(key=lambda k: k.get("resolved_frame_index", 0))
+        out = node_helpers.conditioning_set_values(conditioning, {"minimax_keyframes": keyframes})
         return (out,)
 
 
 NODE_CLASS_MAPPINGS = {
-    "MiniMaxH3MotionContext": MiniMaxH3MotionContext,
-    "MiniMaxH3MotionContextTrim": MiniMaxH3MotionContextTrim,
-    "MiniMaxH3MotionContextSaveLatent": MiniMaxH3MotionContextSaveLatent,
-    "MiniMaxH3MotionContextLoadLatent": MiniMaxH3MotionContextLoadLatent,
-    "MiniMaxH3CustomKeyframes": MiniMaxH3CustomKeyframes,
-    "MiniMaxH3CustomAudio": MiniMaxH3CustomAudio,
-    "MiniMaxH3CustomVideo": MiniMaxH3CustomVideo,
     "MiniMaxH3Timeline": MiniMaxH3Timeline,
 }
+
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MiniMaxH3MotionContext": "H3 Motion Context",
-    "MiniMaxH3MotionContextTrim": "H3 Motion Context Trim",
-    "MiniMaxH3MotionContextSaveLatent": "H3 Motion Context Save Latent",
-    "MiniMaxH3MotionContextLoadLatent": "H3 Motion Context Load Latent",
-    "MiniMaxH3CustomKeyframes": "H3 Custom Keyframes",
-    "MiniMaxH3CustomAudio": "H3 Custom Audio",
-    "MiniMaxH3CustomVideo": "H3 Custom Video",
     "MiniMaxH3Timeline": "H3 Timeline Editor",
 }
