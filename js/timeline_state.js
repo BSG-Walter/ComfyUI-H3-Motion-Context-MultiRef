@@ -263,7 +263,10 @@ export function ensureInputs(node) {
 export function removeClip(node, i) {
     recordHistory(node);
     const [clip] = node._h3Clips.splice(i, 1);
-    if (clip) node._h3Selected?.delete(clip.id);
+    if (clip) {
+        node._h3Selected?.delete(clip.id);
+        node._h3Selected?.delete(`a_${clip.id}`);
+    }
     // a separated (unlinked) audio band outlives its video: promote the band
     // to its own audio clip before deleting the video block, so deleting the
     // video never kills the detached audio.
@@ -296,25 +299,40 @@ export function removeClip(node, i) {
 
 export function removeSelectedClips(node) {
     if (!node._h3Selected?.size || !node._h3Clips?.length) return;
-    const toRemove = node._h3Clips.filter((c) => node._h3Selected.has(c.id));
-    if (!toRemove.length) return;
     recordHistory(node);
-    for (const clip of toRemove) {
-        const idx = node._h3Clips.indexOf(clip);
-        if (idx >= 0) node._h3Clips.splice(idx, 1);
-        node._h3Thumbs?.delete(clip.id);
-        for (const [name] of clipInputs(clip)) {
-            const slot = node.inputs?.findIndex((inp) => inp.name === name);
-            if (slot >= 0) {
-                if (node.inputs[slot].link != null) node.disconnectInput(slot);
-                node.removeInput(slot);
+    let changed = false;
+    for (const key of Array.from(node._h3Selected)) {
+        if (typeof key === "string" && key.startsWith("a_")) {
+            const id = Number(key.slice(2));
+            const clip = node._h3Clips.find((c) => c.id === id);
+            if (clip && clip.kind === "video" && !clip.audio_link) {
+                clip.audio_off = true;
+                changed = true;
+            }
+        }
+    }
+    const toRemove = node._h3Clips.filter((c) => node._h3Selected.has(c.id));
+    if (toRemove.length) {
+        changed = true;
+        for (const clip of toRemove) {
+            const idx = node._h3Clips.indexOf(clip);
+            if (idx >= 0) node._h3Clips.splice(idx, 1);
+            node._h3Thumbs?.delete(clip.id);
+            for (const [name] of clipInputs(clip)) {
+                const slot = node.inputs?.findIndex((inp) => inp.name === name);
+                if (slot >= 0) {
+                    if (node.inputs[slot].link != null) node.disconnectInput(slot);
+                    node.removeInput(slot);
+                }
             }
         }
     }
     node._h3Selected.clear();
-    ensureInputs(node);
-    writeState(node);
-    fixNodeSize(node);
+    if (changed) {
+        ensureInputs(node);
+        writeState(node);
+        fixNodeSize(node);
+    }
 }
 
 let _clipboard = [];
@@ -322,7 +340,7 @@ let _clipboard = [];
 export function copySelectedClips(node, targetClip = null) {
     let clipsToCopy = [];
     if (node._h3Selected?.size) {
-        clipsToCopy = node._h3Clips.filter((c) => node._h3Selected.has(c.id));
+        clipsToCopy = node._h3Clips.filter((c) => node._h3Selected.has(c.id) || node._h3Selected.has(`a_${c.id}`));
     }
     if (!clipsToCopy.length && targetClip) {
         clipsToCopy = [targetClip];
