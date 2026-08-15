@@ -83,6 +83,19 @@ def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
 
         print(f"[H3 Clamp Hook] Executing post-CFG step! denoised type={type(denoised)}, is_nested={is_nested}, v_shape={getattr(v, 'shape', None)}, a_shape={getattr(a, 'shape', None)}")
 
+        audio_scale = 1.0
+        if model is not None:
+            if hasattr(model, "audio_scale"):
+                try:
+                    audio_scale = float(model.audio_scale())
+                except Exception:
+                    pass
+            elif hasattr(model, "model") and hasattr(model.model, "audio_scale"):
+                try:
+                    audio_scale = float(model.model.audio_scale())
+                except Exception:
+                    pass
+
         if v is not None and v.ndim == 5:
             for spec in clamp_specs:
                 if spec["kind"] != "video":
@@ -106,6 +119,8 @@ def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
                     continue
                 s_idx = int(spec["start_idx"])
                 target = spec["latent"].to(device=a.device, dtype=a.dtype)
+                if audio_scale != 1.0:
+                    target = target * audio_scale
                 t_len = min(target.shape[-1], a.shape[-1] - s_idx)
                 if t_len <= 0 or s_idx < 0 or s_idx >= a.shape[-1]:
                     continue
@@ -115,7 +130,7 @@ def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
                     a[..., s_idx:s_idx + t_len] = tgt_slice
                 elif st > 0.0:
                     a[..., s_idx:s_idx + t_len] = (1.0 - st) * a[..., s_idx:s_idx + t_len] + st * tgt_slice
-                print(f"[H3 Clamp Hook] Clamped AUDIO: s_idx={s_idx}, t_len={t_len}, strength={st}, target_norm={tgt_slice.norm().item():.3f}, a_norm={a[..., s_idx:s_idx + t_len].norm().item():.3f}")
+                print(f"[H3 Clamp Hook] Clamped AUDIO: s_idx={s_idx}, t_len={t_len}, strength={st}, audio_scale={audio_scale}, target_norm={tgt_slice.norm().item():.3f}, a_norm={a[..., s_idx:s_idx + t_len].norm().item():.3f}")
 
         if is_nested:
             return comfy.nested_tensor.NestedTensor([v, a] if a is not None else [v])
@@ -177,21 +192,32 @@ def _normalize_audio_waveform(wav):
 
 
 def _encode_ref_audio(audio_vae, audio):
-    """Encode audio into H3 audio VAE latent [1, 32, 2, T]."""
+    """Encode audio into H3 audio VAE latent [1, 32, 2, T] using comfy-core VAE encode."""
     if audio_vae is None:
         raise ValueError("Audio VAE is required when audio clips are present on the timeline")
-    waveform = _normalize_audio_waveform(audio.get("waveform"))
+    waveform = audio.get("waveform")
     if waveform is None:
         raise ValueError("Audio clip contains no waveform")
+    if not isinstance(waveform, torch.Tensor):
+        waveform = torch.as_tensor(waveform)
+    
     sr = int(audio.get("sample_rate", 32000))
     vae_sr = int(getattr(audio_vae, "audio_sample_rate", 32000))
     if sr != vae_sr:
         if torchaudio is None:
             raise RuntimeError("torchaudio is required for audio resampling")
         waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
-    if waveform.shape[-1] < 800:
-        waveform = torch.nn.functional.pad(waveform, (0, 800 - waveform.shape[-1]))
-    z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
+
+    # VAE.encode expects input with channel dim at the end: [B, length, 2] stereo
+    if waveform.ndim == 2:
+        waveform = waveform.unsqueeze(0)
+    if waveform.ndim == 3 and waveform.shape[1] in (1, 2) and waveform.shape[2] > 2:
+        # [B, C, L] -> [B, L, C]
+        if waveform.shape[1] == 1:
+            waveform = waveform.repeat(1, 2, 1)
+        waveform = waveform.movedim(1, -1)
+
+    z = audio_vae.encode(waveform)  # Returns [1, 32, 2, T]
     return z, int(z.shape[-1])
 
 
