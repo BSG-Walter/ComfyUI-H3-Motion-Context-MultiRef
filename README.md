@@ -21,6 +21,7 @@ The **H3 Timeline Editor** node (`MiniMaxH3Timeline`) gives you a visual canvas 
 - **Playable preview** — the playhead plays through the timeline, syncing video thumbnails; playback stops at the end-line.
 - **File-backed clips** — upload videos/images/audio directly into the timeline and they decode on the node (video thumbnails + audio waveform). No need to wire separate LoadImage / VHS nodes when you just want to drop a file.
 - **Out-of-range tolerance** — clips placed beyond the latent's frame count are clamped-and-warned by the backend (parked at the last frame), never fatal. Audio clips parked or trimmed log a warning instead of raising.
+- **Dual Flow Matching Control (Soft Attention + ODE Hard Clamping)** — connects directly to `MODEL` and `CONDITIONING`. Combines native `minimax_keyframes` cross-attention conditioning with non-invasive ODE step hard clamping via `set_model_sampler_post_cfg_function` to enforce exact frame and audio slice placement without drifting.
 
 ## Install
 
