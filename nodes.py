@@ -25,6 +25,7 @@ except ImportError:
     torchaudio = None
 
 _LOG = logging.getLogger("h3_timeline")
+DEBUG_LOGS = False
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FRAME_RESCALE = 5.0 / 3.0
@@ -36,11 +37,64 @@ def _pixel_frames(latent_t):
     return sum(FRAME_PER_TOKEN[k % 5] for k in range(latent_t))
 
 
-def _frame_to_video_latent_idx(frame_idx):
-    """Map pixel frame index to video latent token index."""
-    if frame_idx <= 0:
-        return 0
-    return 1 + (frame_idx - 1) // 4
+def _video_token_window(lead, want):
+    """Segment-latent token range intersecting content frames [lead, lead+want).
+
+    Tokens follow the VAE's (1,4,4,4,4) temporal grid: token i covers
+    [cum, cum+w) segment frames. The VAE encodes each 17-frame chunk
+    independently, so tokens map 1:1 onto the target video's latent grid
+    when the segment starts on the 17-frame boundary.
+    """
+    seg_cum = 0
+    i0, i1 = None, 0
+    for i in range(1024):
+        w = FRAME_PER_TOKEN[i % 5]
+        if i0 is None and seg_cum < lead + want and seg_cum + w > lead:
+            i0 = i
+        if seg_cum >= lead + want:
+            i1 = i
+            break
+        seg_cum += w
+    if i0 is None:
+        i0 = 0
+    if i1 == 0:
+        i1 = i0 + 1
+    return i0, i1
+
+
+def _grid_segment(frame_idx, want, frame_count):
+    """Grid-align timeline content [frame_idx, frame_idx+want) for VAE clamping.
+
+    Returns (seg_start, lead, seg_len): the containing 17-grid boundary, the
+    lead-pad count, and the padded segment length (valid 17k+5 shape) covering
+    the content without exceeding the video's final boundary.
+    """
+    lead = frame_idx % 17
+    seg_start = frame_idx - lead
+    span = want + lead
+    if span <= 5:
+        seg_len = 5
+    else:
+        seg_len = 17 * ((span - 5 + 16) // 17) + 5
+    budget = frame_count - seg_start
+    if seg_len > budget:
+        seg_len = ((budget - 5) // 17) * 17 + 5
+        if seg_len < span:
+            seg_len = span
+    return seg_start, lead, seg_len
+
+
+def _pad_clip(frames, lead, tail):
+    """Pad frames [F,H,W,C] with repeated edge frames: lead before, tail after."""
+    if lead == 0 and tail == 0:
+        return frames
+    parts = []
+    if lead > 0:
+        parts.append(frames[:1].repeat(lead, 1, 1, 1))
+    parts.append(frames)
+    if tail > 0:
+        parts.append(frames[-1:].repeat(tail, 1, 1, 1))
+    return torch.cat(parts, dim=0)
 
 
 def _frame_to_audio_latent_idx(frame_idx, fps=FPS):
@@ -81,7 +135,8 @@ def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
             v = denoised
             a = None
 
-        print(f"[H3 Clamp Hook] Executing post-CFG step! denoised type={type(denoised)}, is_nested={is_nested}, v_shape={getattr(v, 'shape', None)}, a_shape={getattr(a, 'shape', None)}")
+        if DEBUG_LOGS:
+            print(f"[H3 Clamp Hook] Executing post-CFG step! denoised type={type(denoised)}, is_nested={is_nested}, v_shape={getattr(v, 'shape', None)}, a_shape={getattr(a, 'shape', None)}")
 
         audio_scale = 1.0
         if model is not None:
@@ -111,7 +166,8 @@ def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
                     v[:, :, s_idx:s_idx + t_len] = tgt_slice
                 elif st > 0.0:
                     v[:, :, s_idx:s_idx + t_len] = (1.0 - st) * v[:, :, s_idx:s_idx + t_len] + st * tgt_slice
-                print(f"[H3 Clamp Hook] Clamped VIDEO: s_idx={s_idx}, t_len={t_len}, strength={st}, target_norm={tgt_slice.norm().item():.3f}, v_norm={v[:, :, s_idx:s_idx + t_len].norm().item():.3f}")
+                if DEBUG_LOGS:
+                    print(f"[H3 Clamp Hook] Clamped VIDEO: s_idx={s_idx}, t_len={t_len}, strength={st}, target_norm={tgt_slice.norm().item():.3f}, v_norm={v[:, :, s_idx:s_idx + t_len].norm().item():.3f}")
 
         if a is not None and a.ndim == 4:
             for spec in clamp_specs:
@@ -130,7 +186,8 @@ def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
                     a[..., s_idx:s_idx + t_len] = tgt_slice
                 elif st > 0.0:
                     a[..., s_idx:s_idx + t_len] = (1.0 - st) * a[..., s_idx:s_idx + t_len] + st * tgt_slice
-                print(f"[H3 Clamp Hook] Clamped AUDIO: s_idx={s_idx}, t_len={t_len}, strength={st}, audio_scale={audio_scale}, target_norm={tgt_slice.norm().item():.3f}, a_norm={a[..., s_idx:s_idx + t_len].norm().item():.3f}")
+                if DEBUG_LOGS:
+                    print(f"[H3 Clamp Hook] Clamped AUDIO: s_idx={s_idx}, t_len={t_len}, strength={st}, audio_scale={audio_scale}, target_norm={tgt_slice.norm().item():.3f}, a_norm={a[..., s_idx:s_idx + t_len].norm().item():.3f}")
 
         if is_nested:
             return comfy.nested_tensor.NestedTensor([v, a] if a is not None else [v])
@@ -556,23 +613,32 @@ class MiniMaxH3Timeline:
                     guide_frames = 1
 
                 if image.shape[0] > 1:
-                    frames = _resize(image[:guide_frames], width, height, crop)
-                    if int(frames.shape[0]) < guide_frames:
-                        last_f = frames[-1:]
-                        frames = torch.cat([frames, last_f.repeat(guide_frames - int(frames.shape[0]), 1, 1, 1)], dim=0)
+                    content = _resize(image[:want_len], width, height, crop)
+                    if int(content.shape[0]) < want_len:
+                        last_f = content[-1:]
+                        content = torch.cat([content, last_f.repeat(want_len - int(content.shape[0]), 1, 1, 1)], dim=0)
                 else:
                     base_frame = _resize(image[:1], width, height, crop)
-                    frames = base_frame.repeat(guide_frames, 1, 1, 1) if guide_frames > 1 else base_frame
+                    content = base_frame.repeat(want_len, 1, 1, 1)
 
-                enc_latent = vae.encode(frames)
+                guide_chunk = content[:guide_frames]
+                guide_latent = vae.encode(guide_chunk)
                 keyframes.append({
                     "resolved_frame_index": resolved_frame_index,
-                    "latent": enc_latent,
+                    "latent": guide_latent,
                 })
+
+                seg_start, lead, seg_len = _grid_segment(resolved_frame_index, want_len, frame_count)
+                if lead == 0 and seg_len == want_len and guide_frames == want_len:
+                    enc_latent = guide_latent
+                else:
+                    seg = _pad_clip(content, lead, seg_len - want_len - lead)
+                    enc_latent = vae.encode(seg)
+                i0, i1 = _video_token_window(lead, want_len)
                 clamp_specs.append({
                     "kind": "video",
-                    "start_idx": _frame_to_video_latent_idx(resolved_frame_index),
-                    "latent": enc_latent,
+                    "start_idx": (seg_start // 17) * 5 + i0,
+                    "latent": enc_latent[:, :, i0:i1],
                     "strength": float(clip.get("strength", 1.0)),
                 })
 
@@ -592,21 +658,13 @@ class MiniMaxH3Timeline:
                 if frames is not None and not fmedia:
                     want = min(want, max(1, int(frames.shape[0]) - src_start))
 
-                # For hard-clamping we want the full clip length (rounded down to valid 1 + 4*k for VAE)
-                if want >= 5:
-                    full_clip_frames = 1 + ((want - 1) // 4) * 4
-                else:
-                    full_clip_frames = 1
-
-                # Core minimax_keyframes cross-attention guide requires guide_frames % 17 == 5
-                guide_frames = full_clip_frames
-                if guide_frames >= 5:
-                    while guide_frames % 17 != 5 and guide_frames > 5:
-                        guide_frames -= 4
-                    if guide_frames % 17 != 5:
-                        guide_frames = 1
-                else:
+                # Core minimax_keyframes cross-attention guide requires guide_frames % 17 == 5 or single frame
+                if want < 5:
                     guide_frames = 1
+                else:
+                    guide_frames = want
+                    while guide_frames % 17 != 5:
+                        guide_frames -= 1
 
                 data = None
                 if fmedia:
@@ -633,26 +691,39 @@ class MiniMaxH3Timeline:
                 if frames is None:
                     continue
 
-                full_frames_chunk = frames[:full_clip_frames]
-                if int(full_frames_chunk.shape[0]) < full_clip_frames:
-                    last_f = full_frames_chunk[-1:]
-                    full_frames_chunk = torch.cat([full_frames_chunk, last_f.repeat(full_clip_frames - int(full_frames_chunk.shape[0]), 1, 1, 1)], dim=0)
+                content = frames[:want]
+                if int(content.shape[0]) < want:
+                    last_f = content[-1:]
+                    content = torch.cat([content, last_f.repeat(want - int(content.shape[0]), 1, 1, 1)], dim=0)
 
-                video_frames = _resize(full_frames_chunk, width, height, crop)
-                enc_latent = vae.encode(video_frames)
+                # Encode cross-attention guide frames (exact 1 or 17k+5 frames)
+                guide_frames_chunk = content[:guide_frames]
+                guide_video_frames = _resize(guide_frames_chunk, width, height, crop)
+                guide_latent = vae.encode(guide_video_frames)
 
-                # Cross-attention conditioning keyframe (uses guide_frames slice)
-                guide_latent_t = _frame_to_video_latent_idx(guide_frames) if guide_frames > 1 else 1
+                # Cross-attention conditioning keyframe
                 kf = {
                     "resolved_frame_index": resolved_frame_index,
-                    "latent": enc_latent[:, :, :guide_latent_t],
+                    "latent": guide_latent,
                 }
+
+                # ODE Hard Clamping: grid-align the segment to the VAE's independent
+                # 17-frame chunk lattice so tokens map 1:1 onto the target video's
+                # latent. Lead/tail are frozen repeats (only the intersecting
+                # tokens are clamped, so the clip's visible span stays exact).
+                seg_start, lead, seg_len = _grid_segment(resolved_frame_index, want, frame_count)
+                if lead == 0 and seg_len == want and guide_frames == want:
+                    enc_latent = guide_latent
+                else:
+                    seg = _pad_clip(_resize(content, width, height, crop), lead, seg_len - want - lead)
+                    enc_latent = vae.encode(seg)
+                i0, i1 = _video_token_window(lead, want)
 
                 # ODE Hard Clamping spec (uses full encoded latent steps)
                 clamp_specs.append({
                     "kind": "video",
-                    "start_idx": _frame_to_video_latent_idx(resolved_frame_index),
-                    "latent": enc_latent,
+                    "start_idx": (seg_start // 17) * 5 + i0,
+                    "latent": enc_latent[:, :, i0:i1],
                     "strength": float(clip.get("strength", 1.0)),
                 })
 
@@ -719,12 +790,13 @@ class MiniMaxH3Timeline:
                 })
 
         keyframes.sort(key=lambda k: k.get("resolved_frame_index", 0))
-        print(f"[H3 Timeline] Compiled {len(keyframes)} keyframes, {len(clamp_specs)} clamp specs:")
-        for idx, kf in enumerate(keyframes):
-            has_v = "latent" in kf
-            has_a = "audio_latent" in kf
-            rf = kf.get("resolved_frame_index")
-            print(f"  - Keyframe #{idx}: frame_idx={rf}, video={has_v}, audio={has_a}")
+        if DEBUG_LOGS:
+            print(f"[H3 Timeline] Compiled {len(keyframes)} keyframes, {len(clamp_specs)} clamp specs:")
+            for idx, kf in enumerate(keyframes):
+                has_v = "latent" in kf
+                has_a = "audio_latent" in kf
+                rf = kf.get("resolved_frame_index")
+                print(f"  - Keyframe #{idx}: frame_idx={rf}, video={has_v}, audio={has_a}")
 
         out_cond = node_helpers.conditioning_set_values(conditioning, {"minimax_keyframes": keyframes})
         out_model = model

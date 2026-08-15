@@ -122,7 +122,7 @@ assert "audio_latent" not in kfs[0]
 
 # Video at start 10 -> resolved_frame_index = 9 (linked audio attached to the same keyframe)
 assert kfs[1]["resolved_frame_index"] == 9
-assert kfs[1]["latent"].shape[2] == 2  # guide_frames % 17 == 5 -> 5 frames -> 2 steps
+assert kfs[1]["latent"].shape[2] == 7  # 22-frame clip is 17+5 aligned -> 7 tokens
 assert "audio_latent" in kfs[1]
 
 # Audio at start 60 -> resolved_frame_index = 59
@@ -350,6 +350,28 @@ assert torch.isclose(res11[:, :, 0], torch.tensor(5.0)).all()
 # Token 1 should remain untouched 0.0
 assert (res11[:, :, 1:] == 0.0).all()
 print("Test 11 OK: partial clamp strength blending")
+
+# 12. Off-grid clip clamping lands on the VAE's 17-frame chunk lattice
+state12 = '{"clips":[{"id":1,"kind":"video","start":10,"len":22,"audio_link":false}]}'
+class GridVAE:
+    def encode(self, pix):
+        n = pix.shape[0]
+        steps = 1 if n == 1 else (n - 5) // 17 * 5 + 2
+        return torch.full((1, 24, steps, 2, 2), float(pix.shape[0]))
+
+_, patched12 = run_full(state12, AudioVAE(), vae=GridVAE(), model=dummy_patcher,
+                        video_1=torch.rand(22, 32, 32, 3))
+hook12 = patched12.model_options["sampler_post_cfg_function"][0]
+v12 = torch.zeros(1, 24, 25, 2, 2)
+res12 = hook12({"denoised": v12.clone(), "model_options": {}})
+# Clip at F=9, want=22: seg_start=0, lead=9, span=31 -> seg_len=39 (next 17k+5).
+# Token grid (1,4,4,4,4): t3=[9,13) t4=[13,17) t5=[17,18) t6=[18,22) t7=[22,26)
+# t8=[26,30) t9=[30,34). Tokens intersecting content [9,31) = t3..t9 (7 tokens).
+assert res12.shape == v12.shape
+clamped = res12[:, :, 3:10]
+assert (clamped == 39.0).all(), f"Expected 7 clamped tokens with value 39.0, got {clamped.unique().tolist()}"
+assert (res12[:, :, :3] == 0.0).all() and (res12[:, :, 10:] == 0.0).all()
+print("Test 12 OK: off-grid clip clamps onto the 17-frame chunk lattice")
 
 dummy_patcher.detach()
 patched_model.detach()
