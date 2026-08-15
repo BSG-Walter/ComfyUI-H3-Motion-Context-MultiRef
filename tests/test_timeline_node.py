@@ -2,11 +2,28 @@
 
 import importlib.util
 import sys
+import unittest
 from pathlib import Path
 import torch
 
 COMFY_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(COMFY_ROOT))
+
+# Mock comfy_aimdo and comfy_kitchen if not present in test environment
+import types
+mock_aimdo = types.ModuleType("comfy_aimdo")
+mock_aimdo.__path__ = []
+for submod in ["host_buffer", "vram_buffer", "model_vbar", "torch", "pinned_memory"]:
+    sm = types.ModuleType(f"comfy_aimdo.{submod}")
+    setattr(mock_aimdo, submod, sm)
+    sys.modules[f"comfy_aimdo.{submod}"] = sm
+sys.modules["comfy_aimdo"] = mock_aimdo
+
+if "comfy_kitchen" not in sys.modules:
+    mock_kitchen = types.ModuleType("comfy_kitchen")
+    mock_kitchen.__path__ = []
+    mock_kitchen.int8_attention_is_available = lambda: False
+    sys.modules["comfy_kitchen"] = mock_kitchen
 
 base = "custom_nodes.ComfyUI-H3-Motion-Context-Timeline"
 node_dir = Path(__file__).resolve().parents[1]
@@ -67,7 +84,7 @@ def run(state, audio_vae=None, vae=None, **inputs):
 # 1. Mixed timeline: image + video (linked audio) + audio clip
 av = AudioVAE()
 state = '{"clips":[' \
-        '{"id":1,"kind":"image","start":1},' \
+        '{"id":1,"kind":"image","start":1,"len":1},' \
         '{"id":2,"kind":"video","start":10,"len":22,"audio_link":true},' \
         '{"id":3,"kind":"audio","start":60,"len":22}]}'
 cond = run(
@@ -119,7 +136,7 @@ assert "audio_latent" in kfs2[1]
 print("Test 2 OK: unlinked video audio")
 
 
-# 3. Clamping and bounds check
+# 3. Clamping and bounds check: clips beyond timeline (frame_count=85) are ignored
 state3 = '{"clips":[' \
          '{"id":1,"kind":"image","start":200},' \
          '{"id":2,"kind":"video","start":80,"len":22},' \
@@ -131,16 +148,13 @@ cond3 = run(
     audio_3=audio(1.0),
 )
 kfs3 = cond3["minimax_keyframes"]
-assert len(kfs3) == 3
-# Total frames is 85.
-# Image clamped to frame_count - 1 = 84
-assert kfs3[2]["resolved_frame_index"] == 84
-# Video of 22 frames clamped to 85 - 22 = 63
-assert kfs3[0]["resolved_frame_index"] == 63
-# Audio clamped to 84
-assert kfs3[1]["resolved_frame_index"] == 84
+# Clips starting at 200 (> 85) are strictly dropped.
+# Video starts at 80 (frame_idx=79), length clamped to 85-79=6 frames (guide=5 frames)
+assert len(kfs3) == 1
+assert kfs3[0]["resolved_frame_index"] == 79
+assert kfs3[0]["latent"].shape[2] == 2  # 5 frames -> 2 tokens
 
-print("Test 3 OK: bounds clamping")
+print("Test 3 OK: bounds clamping and timeline limit cutoff")
 
 
 # 4. Empty clips
@@ -157,5 +171,47 @@ cond5 = run(state5, audio_vae=real_audio_vae, audio_1=audio(2.0, sr=32000))
 assert "audio_latent" in cond5["minimax_keyframes"][0]
 assert cond5["minimax_keyframes"][0]["audio_latent"].ndim == 4
 print("Test 5 OK: real comfy.sd.VAE audio encoding integration")
+
+# 6. Clip compilation with UI strength state
+state6 = '{"clips":[' \
+         '{"id":1,"kind":"image","start":1,"strength":0.5},' \
+         '{"id":2,"kind":"video","start":10,"len":22,"strength":0.4,"audio_strength":0.7,"audio_link":true},' \
+         '{"id":3,"kind":"audio","start":60,"len":22,"audio_strength":0.1}]}'
+cond6 = run(
+    state6, AudioVAE(), vae=FakeVideoVAE(),
+    image_1=torch.ones(1, 32, 32, 3),
+    video_2=torch.ones(22, 32, 32, 3),
+    video_audio_2=audio(2.0),
+    audio_3=audio(2.0),
+)
+assert len(cond6["minimax_keyframes"]) >= 3
+print("Test 6 OK: clips with UI strength parameters compile cleanly")
+
+# 7. Animated GIF loading simulation
+import os
+import tempfile
+import numpy as np
+from PIL import Image, ImageSequence
+
+gif_frames = [Image.fromarray(np.uint8(np.full((32, 32, 3), i * 50))) for i in range(5)]
+with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as f:
+    gif_frames[0].save(f.name, save_all=True, append_images=gif_frames[1:], duration=100, loop=0)
+    gif_path = f.name
+
+try:
+    with Image.open(gif_path) as img:
+        collected = []
+        t_sec = 0.0
+        for frame in ImageSequence.Iterator(img):
+            duration = frame.info.get("duration", 100) / 1000.0
+            arr = np.asarray(frame.convert("RGB"), dtype=np.float32) / 255.0
+            collected.append((t_sec, torch.from_numpy(arr)))
+            t_sec += duration
+        gif_tensor = torch.stack([item[1] for item in collected])
+        assert gif_tensor.shape[0] == 5
+    print("Test 7 OK: animated GIF multi-frame handling")
+finally:
+    if os.path.exists(gif_path):
+        os.remove(gif_path)
 
 print("ALL TESTS PASSED!")

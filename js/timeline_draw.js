@@ -1,6 +1,6 @@
 // Canvas painting helpers for the H3 timeline widget.
 
-import { bandSrc, bandGeom, clamp, COLORS, ghostRect, WIDTH, envFlat, envLen, envPts, envStrengthAt, envX, envY, videoTokenStarts } from "./timeline_core.js";
+import { bandSrc, bandGeom, clamp, COLORS, ghostRect, WIDTH, envFlat, envLen, envPts, envStrengthAt, envX, envY, videoChunkStarts } from "./timeline_core.js";
 import { ensureMedia, getClipGifFrame } from "./timeline_media.js";
 
 function paintCover(ctx, el, r) {
@@ -148,78 +148,38 @@ function envChip(ctx, x, y, text) {
     ctx.fillText(text, cx + tw / 2, y + 0.5);
 }
 
-// the block's strength envelope as a green automation line: flat at the
-// block's own flat strength when no points, a polyline through the points
-// otherwise, with each point labeled and a live value chip at the right
-// end. When `playX` (pixel x) sits across the block, a dot on the curve
-// plus a chip show the strength the playhead is currently touching. A dark
-// backing stroke keeps it readable over thumbnails and waveforms; the
-// ghost band draws it dimmed.
+// the block's strength as a single horizontal green automation line
 export function drawEnvelope(ctx, r, c, s, ghost, playX) {
     const flat = envFlat(c, ghost);
-    const L = envLen(c, ghost);
-    const pts = envPts(c, ghost).filter((p) => p[0] >= 0 && p[0] <= L);
-    // video blocks: the node samples the strength once per latent token at
-    // the token's first frame (5 tokens per 17 frames), so draw the applied
-    // stepped curve instead of a smooth polyline; everything else (image
-    // clips, audio bands) is truly linear between points.
-    const stepped = c.kind === "video" && !ghost;
-    const seg = [];
-    if (!pts.length) {
-        seg.push([r.x + 0.5, envY(r, flat)], [r.x + r.w - 0.5, envY(r, flat)]);
-    } else if (stepped) {
-        let lastY = envY(r, envStrengthAt(c, ghost, 0));
-        seg.push([r.x + 0.5, lastY]);
-        for (const t of videoTokenStarts(L + 1).slice(1)) {
-            const x = envX(r, t, s);
-            const y = envY(r, envStrengthAt(c, ghost, t));
-            if (y !== lastY) seg.push([x, lastY], [x, y]);
-            lastY = y;
-        }
-        seg.push([r.x + r.w - 0.5, lastY]);
-    } else {
-        seg.push([r.x + 0.5, envY(r, pts[0][1])]);
-        for (const [f, v] of pts) seg.push([envX(r, f, s), envY(r, v)]);
-        seg.push([r.x + r.w - 0.5, envY(r, pts[pts.length - 1][1])]);
-    }
-    const trace = () => {
-        ctx.beginPath();
-        seg.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
-        ctx.stroke();
-    };
+    const y = envY(r, flat);
+
     ctx.save();
     ctx.globalAlpha = ghost ? 0.45 : 0.95;
     ctx.lineWidth = 4;
     ctx.strokeStyle = "rgba(0,0,0,0.45)";
-    trace();
+    ctx.beginPath();
+    ctx.moveTo(r.x + 0.5, y);
+    ctx.lineTo(r.x + r.w - 0.5, y);
+    ctx.stroke();
+
     ctx.lineWidth = ghost ? 1 : 1.5;
     ctx.strokeStyle = ENV_COLOR;
-    trace();
-    ctx.font = "8px sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "bottom";
-    for (const [f, v] of pts) {
-        ctx.beginPath();
-        ctx.arc(envX(r, f, s), envY(r, v), ghost ? 2.5 : 3.5, 0, Math.PI * 2);
-        ctx.fillStyle = ENV_COLOR;
-        ctx.fill();
-        ctx.fillStyle = ghost ? "#aafaa0" : "#d8ffd4";
-        ctx.fillText(v.toFixed(2), envX(r, f, s), envY(r, v) - 5);
-    }
+    ctx.beginPath();
+    ctx.moveTo(r.x + 0.5, y);
+    ctx.lineTo(r.x + r.w - 0.5, y);
+    ctx.stroke();
+
     if (playX != null && playX >= r.x && playX <= r.x + r.w) {
-        const v = envStrengthAt(c, ghost, (playX - r.x) / s);
-        const y = envY(r, v);
         ctx.beginPath();
         ctx.arc(playX, y, ghost ? 3 : 4, 0, Math.PI * 2);
         ctx.fillStyle = "#ffd166";
         ctx.fill();
-        const str = v.toFixed(2);
+        const str = flat.toFixed(2);
         ctx.font = "8px sans-serif";
         const tw = ctx.measureText(str).width + 8;
         const chipRight = playX + tw + 4 <= r.x + r.w ? playX + tw + 4 : playX - 4;
         envChip(ctx, chipRight, y, str);
     }
-    const endV = pts.length ? pts[pts.length - 1][1] : flat;
-    if (r.w > 40) envChip(ctx, r.x + r.w - 2, envY(r, endV), endV.toFixed(2));
+    if (r.w > 40) envChip(ctx, r.x + r.w - 2, y, flat.toFixed(2));
     ctx.restore();
 }

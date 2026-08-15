@@ -398,46 +398,28 @@ export function playHeadBoundary(node) {
     return Math.max(1, w?._frame ?? 1);
 }
 
-// --- strength envelope (volume-automation style) ---------------------------
-//
-// Each video/audio clip may carry a strength envelope: `env` for the video
-// block, `audio_env` for a video's sound band (ghost), `env` for plain
-// audio clips. Points are [[content_frame, strength], ...], frames relative
-// to the clip's own content (0 = first frame of the clip's window),
-// strengths in [0, 1]. No points = flat at `strength` (or
-// `audio_strength` for the band). The green line edits it like an audio
-// volume lane: click/double-click adds a point, drag moves it, right-click
-// removes it.
-
+// strength envelope (flat strength per clip)
 export const ENV_MIN = 0.0;
 export const ENV_MAX = 1.0;
 
-// deep copy of an envelope so two clips never share point arrays
 export function cloneEnv(env) {
     return Array.isArray(env) ? env.map((p) => [Number(p[0]), Number(p[1])]) : env;
 }
 
-// the envelope a block edits: video/audio blocks use `env`, the sound band
-// of a video uses its own `audio_env`; while linked and without an own
-// curve the band shares the video's curve (separation freezes a copy)
 export function envField(c, ghost) {
     if (!ghost) return c.env;
     if (Array.isArray(c.audio_env)) return c.audio_env;
     return c.audio_link ? c.env : c.audio_env;
 }
 
-// flat strength of a block when its envelope has no points; the band of a
-// video falls back to the video's own strength until separated
 export function envFlat(c, ghost) {
     if (ghost) {
         const own = Number(c.audio_strength);
-        if (Number.isFinite(own)) return own;
-        const v = Number(c.strength);
-        if (Number.isFinite(v)) return v;
+        if (Number.isFinite(own)) return clamp(own, ENV_MIN, ENV_MAX);
         return ENV_MAX;
     }
     const own = Number(c.strength);
-    if (Number.isFinite(own)) return own;
+    if (Number.isFinite(own)) return clamp(own, ENV_MIN, ENV_MAX);
     return ENV_MAX;
 }
 
@@ -447,108 +429,47 @@ export function envLen(c, ghost) {
 }
 
 export function envPts(c, ghost) {
-    const e = Array.isArray(envField(c, ghost)) ? envField(c, ghost) : [];
-    return e.filter(
-        (p) => Array.isArray(p) && Number.isFinite(Number(p[0])) && Number.isFinite(Number(p[1])),
-    );
+    return [];
 }
 
-// normalize the block's envelope in place: valid numeric pairs, clamped,
-// sorted by frame
 export function envNormalize(c, ghost) {
-    const clean = envPts(c, ghost).map((p) => [Math.max(0, Number(p[0])), clamp(Number(p[1]), ENV_MIN, ENV_MAX)]);
-    clean.sort((a, b) => a[0] - b[0]);
-    if (ghost) {
-        if (Array.isArray(c.audio_env) || !c.audio_link) c.audio_env = clean;
-        else c.env = clean;
-    } else {
-        c.env = clean;
-    }
-    return clean;
+    return [];
 }
 
-// strength at a content frame: linear between points, flat when no points
 export function envStrengthAt(c, ghost, frame) {
-    const pts = envPts(c, ghost);
-    if (!pts.length) return clamp(envFlat(c, ghost), ENV_MIN, ENV_MAX);
-    if (pts.length === 1 || frame <= pts[0][0]) return pts[0][1];
-    const last = pts[pts.length - 1];
-    if (frame >= last[0]) return last[1];
-    for (let i = 0; i < pts.length - 1; i++) {
-        const f0 = pts[i][0];
-        const s0 = pts[i][1];
-        const f1 = pts[i + 1][0];
-        const s1 = pts[i + 1][1];
-        if (frame <= f1) {
-            if (f1 <= f0) return s1;
-            return s0 + ((s1 - s0) * (frame - f0)) / (f1 - f0);
-        }
-    }
-    return last[1];
+    return envFlat(c, ghost);
 }
 
-// --- video token grid ------------------------------------------------------
-// The node rebuilds a video clip window as greedy VAE-grid runs (39, 22, 5,
-// 1 frames) and samples the strength envelope once per latent token, at the
-// token's first frame. Within a run the 5-token pattern 1,4,4,4,4 repeats
-// every 17 frames (offsets 0,1,5,9,13), so each run's token starts are its
-// own truncated pattern. Only edits on these frames matter — anything
-// between is interpolated but never read. Snapping edits here makes the
-// editor match the applied curve exactly.
-export const TOKEN_OFFSETS = [0, 1, 5, 9, 13];
-const RUN_GRID = [39, 22, 5, 1];
-const RUN_STEPS = { 39: 12, 22: 7, 5: 2, 1: 1 };
+export const RUN_GRID = [39, 22, 5, 1];
 
-// content-frame of each token start up to (but not past) `len`
-export function videoTokenStarts(len) {
+export function videoChunkStarts(len) {
     const out = [];
     let acc = 0;
     while (acc < len) {
+        out.push(acc);
         const rem = len - acc;
-        const r = RUN_GRID.find((g) => g <= rem);
-        const steps = RUN_STEPS[r];
-        for (let k = 0; k < steps; k++) {
-            const o = Math.floor(k / 5) * 17 + TOKEN_OFFSETS[k % 5];
-            if (acc + o >= len) break;
-            out.push(acc + o);
-        }
+        const r = RUN_GRID.find((g) => g <= rem) || 1;
         acc += r;
     }
     return out;
 }
 
-// nearest token-start frame, clamped to [0, len]
 export function tokenSnap(f, len) {
-    const starts = videoTokenStarts(len + 1);
-    let best = 0;
-    let bd = Infinity;
-    for (const t of starts) {
-        const d = Math.abs(t - f);
-        if (d < bd) {
-            bd = d;
-            best = t;
-        }
-    }
-    return Math.min(best, len);
+    return Math.min(Math.max(0, f), len);
 }
 
-// pixel y of a strength inside a block rect (top = 1.0, bottom = 0.0)
 export function envY(r, v) {
     return r.y + r.h - 6 - ((clamp(v, ENV_MIN, ENV_MAX) - ENV_MIN) / (ENV_MAX - ENV_MIN)) * (r.h - 12);
 }
 
-// strength from a pixel y inside a block rect
 export function envStrengthAtY(r, y) {
     return clamp(ENV_MIN + ((r.y + r.h - 6 - y) / (r.h - 12)) * (ENV_MAX - ENV_MIN), ENV_MIN, ENV_MAX);
 }
 
-// pixel x of a content frame inside a block rect
 export function envX(r, f, s) {
     return clamp(r.x + f * s, r.x + 0.5, r.x + r.w - 0.5);
 }
 
-// envelope hit zone for one clip: points first, then the line. The ghost's
-// unlink toggle and the block edges keep priority over the line.
 export function envZone(c, p, s) {
     const rects = [];
     if (c.kind === "video") {
@@ -558,26 +479,15 @@ export function envZone(c, p, s) {
         rects.push([blockRect(c, s), false]);
     }
     for (const [r, ghost] of rects) {
-        if (r.w < 16) continue; // let narrow blocks be grabbed/dragged freely
+        if (r.w < 16) continue;
         if (p[0] < r.x || p[0] > r.x + r.w || p[1] < r.y || p[1] > r.y + r.h) continue;
         if (ghost) {
             const bx = r.x + 8;
             const by = r.y + r.h / 2;
-            if (Math.hypot(p[0] - bx, p[1] - by) < 9) continue; // unlink toggle wins
+            if (Math.hypot(p[0] - bx, p[1] - by) < 9) continue;
         }
-        const L = envLen(c, ghost);
-        const pts = envPts(c, ghost);
-        for (const pt of pts) {
-            if (pt[0] < -0.5 || pt[0] > L + 0.5) continue;
-            if (Math.hypot(p[0] - envX(r, pt[0], s), p[1] - envY(r, pt[1])) <= 6) {
-                return { zone: "envpt", ghost, pt };
-            }
-        }
-        // the trim edges keep priority over the line so resizing still
-        // works where the envelope passes the borders
         if (p[0] < r.x + 5 || p[0] > r.x + r.w - 5) continue;
-        const frame = (p[0] - r.x) / s;
-        if (Math.abs(p[1] - envY(r, envStrengthAt(c, ghost, frame))) <= 5) {
+        if (Math.abs(p[1] - envY(r, envFlat(c, ghost))) <= 6) {
             return { zone: "envln", ghost };
         }
     }

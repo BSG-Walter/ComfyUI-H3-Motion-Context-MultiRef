@@ -229,43 +229,6 @@ function openClipMenu(node, widget, clip, idx, x, y, zone, envHit) {
             items.push(["Copy clip (Ctrl+C)", () => copySelectedClips(node, clip)]);
             items.push(["Replace clip\u2026", () => replaceClipMedia(node, clip)]);
         }
-        if (envHit?.pt) {
-            // right-clicked an envelope point: offer to remove it
-            items.push([
-                "Remove strength point",
-                () => {
-                    recordHistory(node);
-                    const env = envField(clip, envHit.ghost);
-                    const i = Array.isArray(env) ? env.indexOf(envHit.pt) : -1;
-                    if (i >= 0) env.splice(i, 1);
-                    writeState(node);
-                    widget.redraw(node);
-                },
-            ]);
-        } else if (envHit) {
-            // right-clicked the envelope line: offer to add a point there
-            items.push([
-                "Add strength point",
-                () => {
-                    recordHistory(node);
-                    const s = widget._scale;
-                    const r = envHit.ghost ? ghostRect(clip, s) : blockRect(clip, s);
-                    const env = envNormalize(clip, envHit.ghost);
-                    const len = envLen(clip, envHit.ghost);
-                    const rawF = clamp(Math.round((envHit.p[0] - r.x) / s), 0, len);
-                    const pt = [
-                        clip.kind === "video" && !envHit.ghost
-                            ? tokenSnap(rawF, len)
-                            : rawF,
-                        envStrengthAtY(r, envHit.p[1]),
-                    ];
-                    env.push(pt);
-                    env.sort((a, b) => a[0] - b[0]);
-                    writeState(node);
-                    widget.redraw(node);
-                },
-            ]);
-        }
     }
     if (hasClipboard()) {
         items.push(["Paste clips (Ctrl+V)", () => {
@@ -919,44 +882,11 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                         this.redraw(nd);
                         return true;
                     }
-                    if (hit.zone === "envpt" || hit.zone === "envln" || (dbl && hit.c)) {
-                        // strength envelope: double-click a point to remove
-                        // it or the block/line to add one, drag a point, or drag
-                        // the flat line to set the flat level when no points
-                        // exist
+                    if (hit.zone === "envln") {
                         recordHistory(nd);
-                        const s = this._scale;
                         const c = hit.c;
                         const ghost = !!(hit.ghost || hit.zone === "audio" || hit.zone === "trimAL" || hit.zone === "trimAR");
-                        const r = ghost ? ghostRect(c, s) : blockRect(c, s);
-                        const len = envLen(c, ghost);
-                        if (hit.zone === "envpt" && dbl) {
-                            const env = envField(c, ghost);
-                            const i = Array.isArray(env) ? env.indexOf(hit.pt) : -1;
-                            if (i >= 0) env.splice(i, 1);
-                            writeState(nd);
-                            this.redraw(nd);
-                            return true;
-                        }
-                        if (hit.zone === "envpt") {
-                            this._dragEnv = { c, ghost, pt: hit.pt, len };
-                        } else if (dbl) {
-                            const env = envNormalize(c, ghost);
-                            const rawF = clamp(Math.round((cx - r.x) / s), 0, len);
-                            const pt = [
-                                c.kind === "video" && !ghost
-                                    ? tokenSnap(rawF, len)
-                                    : rawF,
-                                envStrengthAtY(r, p[1]),
-                            ];
-                            env.push(pt);
-                            env.sort((a, b) => a[0] - b[0]);
-                            this._dragEnv = { c, ghost, pt, len };
-                        } else if (!envPts(c, ghost).length && hit.zone === "envln") {
-                            this._dragFlat = { c, ghost };
-                        } else {
-                            return true;
-                        }
+                        this._dragFlat = { c, ghost };
                         writeState(nd);
                         this.redraw(nd);
                         return true;
@@ -970,9 +900,11 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                         if (hit.c.audio_link) {
                             hit.c.audio_start = hit.c.start;
                             hit.c.audio_len = hit.c.len;
-                            hit.c.audio_strength = Number.isFinite(Number(hit.c.strength))
-                                ? Number(hit.c.strength)
-                                : ENV_MAX;
+                            if (hit.c.audio_strength === undefined) {
+                                hit.c.audio_strength = Number.isFinite(Number(hit.c.strength))
+                                    ? Number(hit.c.strength)
+                                    : ENV_MAX;
+                            }
                             hit.c.audio_env = cloneEnv(hit.c.env);
                             // the band freezes its own slice of the file, so
                             // trimming the video no longer moves the sound
@@ -1072,31 +1004,16 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                         this.redraw(nd);
                         return true;
                     }
-                    if (this._dragEnv) {
-                        const s = this._scale;
-                        const de = this._dragEnv;
-                        const r = de.ghost ? ghostRect(de.c, s) : blockRect(de.c, s);
-                        const rawF = clamp(Math.round((cx - r.x) / s), 0, de.len);
-                        de.pt[0] =
-                            de.c.kind === "video" && !de.ghost
-                                ? tokenSnap(rawF, de.len)
-                                : rawF;
-                        de.pt[1] = envStrengthAtY(r, p[1]);
-                        envField(de.c, de.ghost).sort((a, b) => a[0] - b[0]);
-                        writeState(nd);
-                        this.redraw(nd);
-                        return true;
-                    }
                     if (this._dragFlat) {
                         const s = this._scale;
                         const dfl = this._dragFlat;
                         const r = dfl.ghost ? ghostRect(dfl.c, s) : blockRect(dfl.c, s);
-                        dfl.c[
-                            dfl.ghost &&
-                            (Array.isArray(dfl.c.audio_env) || !dfl.c.audio_link)
-                                ? "audio_strength"
-                                : "strength"
-                        ] = envStrengthAtY(r, p[1]);
+                        const val = envStrengthAtY(r, p[1]);
+                        if (dfl.ghost) {
+                            dfl.c.audio_strength = val;
+                        } else {
+                            dfl.c.strength = val;
+                        }
                         writeState(nd);
                         this.redraw(nd);
                         return true;

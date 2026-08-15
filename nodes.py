@@ -16,7 +16,7 @@ import folder_paths
 import node_helpers
 import comfy.utils
 from comfy_extras.nodes_audio import f32_pcm
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageSequence
 
 try:
     import torchaudio
@@ -134,13 +134,30 @@ def _media_ref_path(media):
     return path
 
 
-def _load_image_file(media):
-    """Load an uploaded still image as [1,H,W,C] float IMAGE frames."""
-    img = node_helpers.pillow(
-        ImageOps.exif_transpose,
-        node_helpers.pillow(Image.open, _media_ref_path(media)))
-    img = img.convert("RGB")
-    return torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0)[None]
+def _load_image_file(media, fps=None):
+    """Load an uploaded image or animated GIF/webp as [F,H,W,C] float IMAGE frames."""
+    path = _media_ref_path(media)
+    try:
+        with Image.open(path) as img:
+            n_frames = getattr(img, "n_frames", 1)
+            if n_frames > 1:
+                collected = []
+                t_sec = 0.0
+                for frame in ImageSequence.Iterator(img):
+                    duration = frame.info.get("duration", 100) / 1000.0
+                    arr = np.asarray(frame.convert("RGB"), dtype=np.float32) / 255.0
+                    collected.append((t_sec, torch.from_numpy(arr)))
+                    t_sec += duration
+                if collected:
+                    if fps is not None and fps > 0:
+                        return _resample_video_frames(collected, fps)
+                    return torch.stack([item[1] for item in collected])
+            else:
+                img_conv = ImageOps.exif_transpose(img).convert("RGB")
+                return torch.from_numpy(np.asarray(img_conv, dtype=np.float32) / 255.0)[None]
+    except Exception as e:
+        _LOG.warning("Timeline: _load_image_file failed for %s: %s", path, e)
+        return None
 
 
 def _resample_video_frames(collected_timed_frames, target_fps):
@@ -355,16 +372,43 @@ class MiniMaxH3Timeline:
             start = max(1, int(clip.get("start") or 1))
             resolved_frame_index = start - 1
 
+            if resolved_frame_index >= frame_count:
+                continue
+
             if kind == "image":
                 image = kwargs.get("image_%d" % slot)
+                src_start = max(0, int(clip.get("src_start") or 0))
                 fmedia = clip.get("file")
                 if fmedia:
-                    image = _load_image_file(fmedia)
+                    image = _load_image_file(fmedia, fps=fps)
                 if image is None:
                     continue
 
-                resolved_frame_index = min(frame_count - 1, resolved_frame_index)
-                frames = _resize(image[:1], width, height, crop)
+                if src_start > 0 and image.shape[0] > 1:
+                    if src_start >= int(image.shape[0]):
+                        src_start = max(0, int(image.shape[0]) - 1)
+                    image = image[src_start:]
+
+                want_len = max(1, min(int(clip.get("len") or 1), frame_count - resolved_frame_index))
+                if want_len < 5:
+                    guide_frames = 1
+                else:
+                    guide_frames = want_len
+                    while guide_frames % 17 != 5:
+                        guide_frames -= 1
+
+                if resolved_frame_index + guide_frames > frame_count:
+                    guide_frames = 1
+
+                if image.shape[0] > 1:
+                    frames = _resize(image[:guide_frames], width, height, crop)
+                    if int(frames.shape[0]) < guide_frames:
+                        last_f = frames[-1:]
+                        frames = torch.cat([frames, last_f.repeat(guide_frames - int(frames.shape[0]), 1, 1, 1)], dim=0)
+                else:
+                    base_frame = _resize(image[:1], width, height, crop)
+                    frames = base_frame.repeat(guide_frames, 1, 1, 1) if guide_frames > 1 else base_frame
+
                 enc_latent = vae.encode(frames)
                 keyframes.append({
                     "resolved_frame_index": resolved_frame_index,
@@ -391,37 +435,49 @@ class MiniMaxH3Timeline:
                 if frames is None:
                     continue
 
-                want = min(max(1, int(clip.get("len") or 22)), int(frames.shape[0]))
-                if want < 5:
-                    guide_frames = 1
-                else:
-                    guide_frames = want
+                # Clamp clip strictly to timeline boundary
+                avail_timeline_frames = frame_count - resolved_frame_index
+                if avail_timeline_frames <= 0:
+                    continue
+                want = min(max(1, int(clip.get("len") or 22)), int(frames.shape[0]), avail_timeline_frames)
+
+                guide_frames = want
+                if guide_frames >= 5:
                     while guide_frames % 17 != 5:
                         guide_frames -= 1
+                else:
+                    guide_frames = 1
 
-                resolved_frame_index = max(0, min(frame_count - guide_frames, resolved_frame_index))
-                enc_latent = vae.encode(_resize(frames[:guide_frames], width, height, crop))
+                chunk_frames = frames[:guide_frames]
+                video_frames = _resize(chunk_frames, width, height, crop)
+                enc_latent = vae.encode(video_frames)
                 kf = {
                     "resolved_frame_index": resolved_frame_index,
                     "latent": enc_latent,
                 }
 
-                if audio_in is not None and not clip.get("audio_off"):
-                    if clip.get("audio_link", True):
-                        audio_slice = _slice_audio(audio_in, 0, guide_frames / float(fps))
-                        audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
-                        max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * resolved_frame_index))
-                        if audio_rt > max_rt:
-                            audio_lat = audio_lat[..., :max_rt].clone()
-                        kf["audio_latent"] = audio_lat
-                        keyframes.append(kf)
-                    else:
-                        keyframes.append(kf)
-                        a_start = int(clip.get("audio_start") or start)
-                        a_resolved = max(0, min(frame_count - 1, a_start - 1))
-                        a_len = int(clip.get("audio_len") or want)
-                        asrc = float(clip.get("audio_src_start") or 0)
-                        audio_slice = _slice_audio(audio_in, asrc / float(fps), a_len / float(fps))
+                if audio_in is not None and not clip.get("audio_off") and clip.get("audio_link", True):
+                    audio_slice = _slice_audio(audio_in, 0, guide_frames / float(fps))
+                    audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
+                    max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * resolved_frame_index))
+                    if audio_rt > max_rt:
+                        audio_lat = audio_lat[..., :max_rt].clone()
+                    kf["audio_latent"] = audio_lat
+                    keyframes.append(kf)
+                else:
+                    keyframes.append(kf)
+
+                if audio_in is not None and not clip.get("audio_off") and not clip.get("audio_link", True):
+                    a_start = int(clip.get("audio_start") or start)
+                    a_resolved = a_start - 1
+                    if a_resolved < frame_count:
+                        a_avail = frame_count - a_resolved
+                        a_len = min(int(clip.get("audio_len") or want), a_avail)
+                        asrc = float(clip.get("audio_src_start") if clip.get("audio_src_start") is not None else src_start)
+                        raw_audio = data["audio"] if fmedia and data.get("audio") is not None else audio_in
+                        src_sec = asrc / float(fps) if fmedia and data.get("audio") is not None else (asrc - src_start) / float(fps)
+
+                        audio_slice = _slice_audio(raw_audio, src_sec, a_len / float(fps))
                         audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
                         max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * a_resolved))
                         if audio_rt > max_rt:
@@ -430,8 +486,6 @@ class MiniMaxH3Timeline:
                             "resolved_frame_index": a_resolved,
                             "audio_latent": audio_lat,
                         })
-                else:
-                    keyframes.append(kf)
 
             elif kind == "audio":
                 audio_in = kwargs.get("audio_%d" % slot)
@@ -440,11 +494,10 @@ class MiniMaxH3Timeline:
                 if fmedia:
                     data = _load_media_file(fmedia)
                     audio_in = data["audio"]
-                if audio_in is None:
+                if audio_in is None or resolved_frame_index >= frame_count:
                     continue
 
-                want_len = max(1, int(clip.get("len") or 22))
-                resolved_frame_index = max(0, min(frame_count - 1, resolved_frame_index))
+                want_len = min(max(1, int(clip.get("len") or 22)), frame_count - resolved_frame_index)
                 audio_slice = _slice_audio(audio_in, src_start / float(fps), want_len / float(fps))
                 audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
                 max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * resolved_frame_index))
@@ -456,6 +509,13 @@ class MiniMaxH3Timeline:
                 })
 
         keyframes.sort(key=lambda k: k.get("resolved_frame_index", 0))
+        print(f"[H3 Timeline] Compiled {len(keyframes)} keyframes:")
+        for idx, kf in enumerate(keyframes):
+            has_v = "latent" in kf
+            has_a = "audio_latent" in kf
+            rf = kf.get("resolved_frame_index")
+            print(f"  - Keyframe #{idx}: frame_idx={rf}, video={has_v}, audio={has_a}")
+
         out = node_helpers.conditioning_set_values(conditioning, {"minimax_keyframes": keyframes})
         return (out,)
 

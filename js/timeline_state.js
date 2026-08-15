@@ -622,6 +622,7 @@ export function splitAt(node) {
         audio_env: spliceEnv(c.audio_env, cut),
         audio_start: (Number(c.audio_start ?? c.start) || 1) + cut,
         audio_len: Math.max(1, (Number(c.audio_len ?? c.len ?? 22) || 1) - cut),
+        audio_src_start: (Number(c.audio_src_start ?? c.src_start) || 0) + cut,
         source_end: src + (Number(c.len) || 1),
     };
     clips.splice(i, 1, left, right);
