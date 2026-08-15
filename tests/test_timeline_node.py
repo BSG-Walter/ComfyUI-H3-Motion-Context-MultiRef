@@ -122,7 +122,7 @@ assert "audio_latent" not in kfs[0]
 
 # Video at start 10 -> resolved_frame_index = 9 (linked audio attached to the same keyframe)
 assert kfs[1]["resolved_frame_index"] == 9
-assert kfs[1]["latent"].shape[2] == 7  # 22 frames -> 7 steps
+assert kfs[1]["latent"].shape[2] == 2  # guide_frames % 17 == 5 -> 5 frames -> 2 steps
 assert "audio_latent" in kfs[1]
 
 # Audio at start 60 -> resolved_frame_index = 59

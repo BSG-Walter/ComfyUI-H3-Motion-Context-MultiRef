@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import folder_paths
 import node_helpers
+import comfy.nested_tensor
 import comfy.utils
 from comfy_extras.nodes_audio import f32_pcm
 from PIL import Image, ImageOps, ImageSequence
@@ -42,11 +43,12 @@ def _frame_to_video_latent_idx(frame_idx):
     return 1 + (frame_idx - 1) // 4
 
 
-def _frame_to_audio_latent_idx(frame_idx):
-    """Map pixel frame index to audio latent token index."""
+def _frame_to_audio_latent_idx(frame_idx, fps=FPS):
+    """Map pixel frame index to audio latent token index at 40 latents/sec."""
     if frame_idx <= 0:
         return 0
-    return int(round(frame_idx * FRAME_RESCALE))
+    sec = float(frame_idx) / float(fps or FPS)
+    return int(round(sec * 40.0))
 
 
 def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
@@ -57,7 +59,12 @@ def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
             return denoised
 
         is_nested = getattr(denoised, "is_nested", False)
+        model = args.get("model")
         latent_shapes = args.get("model_options", {}).get("latent_shapes")
+        if latent_shapes is None and model is not None:
+            latent_shapes = getattr(model, "latent_shapes", None)
+            if latent_shapes is None and hasattr(model, "model"):
+                latent_shapes = getattr(model.model, "latent_shapes", None)
 
         if is_nested:
             streams = list(denoised.unbind())
@@ -67,9 +74,14 @@ def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
             unpacked = comfy.utils.unpack_latents(denoised, latent_shapes)
             v = unpacked[0]
             a = unpacked[1] if len(unpacked) > 1 else None
+        elif isinstance(denoised, (list, tuple)):
+            v = denoised[0]
+            a = denoised[1] if len(denoised) > 1 else None
         else:
             v = denoised
             a = None
+
+        print(f"[H3 Clamp Hook] Executing post-CFG step! denoised type={type(denoised)}, is_nested={is_nested}, v_shape={getattr(v, 'shape', None)}, a_shape={getattr(a, 'shape', None)}")
 
         if v is not None and v.ndim == 5:
             for spec in clamp_specs:
@@ -86,6 +98,7 @@ def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
                     v[:, :, s_idx:s_idx + t_len] = tgt_slice
                 elif st > 0.0:
                     v[:, :, s_idx:s_idx + t_len] = (1.0 - st) * v[:, :, s_idx:s_idx + t_len] + st * tgt_slice
+                print(f"[H3 Clamp Hook] Clamped VIDEO: s_idx={s_idx}, t_len={t_len}, strength={st}, target_norm={tgt_slice.norm().item():.3f}, v_norm={v[:, :, s_idx:s_idx + t_len].norm().item():.3f}")
 
         if a is not None and a.ndim == 4:
             for spec in clamp_specs:
@@ -102,13 +115,17 @@ def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
                     a[..., s_idx:s_idx + t_len] = tgt_slice
                 elif st > 0.0:
                     a[..., s_idx:s_idx + t_len] = (1.0 - st) * a[..., s_idx:s_idx + t_len] + st * tgt_slice
+                print(f"[H3 Clamp Hook] Clamped AUDIO: s_idx={s_idx}, t_len={t_len}, strength={st}, target_norm={tgt_slice.norm().item():.3f}, a_norm={a[..., s_idx:s_idx + t_len].norm().item():.3f}")
 
         if is_nested:
-            import comfy.nested_tensor
             return comfy.nested_tensor.NestedTensor([v, a] if a is not None else [v])
         elif latent_shapes is not None and len(latent_shapes) > 1:
             repacked, _ = comfy.utils.pack_latents([v, a] if a is not None else [v])
             return repacked
+        elif isinstance(denoised, tuple):
+            return tuple([v, a] if a is not None else [v])
+        elif isinstance(denoised, list):
+            return [v, a] if a is not None else [v]
         else:
             return v
 
@@ -413,15 +430,15 @@ class MiniMaxH3Timeline:
                 ("audio_", ("AUDIO",)),
                 model=("MODEL", {
                     "tooltip": "MiniMax H3 MODEL. When connected, enables non-invasive hard clamping to guarantee exact video/audio preservation."}),
-                clamp_strength=("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Hard clamping strength. 1.0 = exact source preservation, <1.0 = blend with DiT prediction."}),
                 fps=("INT", {
                     "default": 24, "min": 1, "max": 240, "step": 1,
                     "tooltip": "Timeline frame rate for audio synchronization."}),
                 total_frames=("INT", {
                     "default": 240, "min": 1, "max": 100000, "step": 1,
                     "tooltip": "Timeline ruler length in frames."}),
+                clamp_strength=("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Hard clamping strength. 1.0 = exact source preservation, <1.0 = blend with DiT prediction."}),
             ),
         }
 
@@ -549,17 +566,26 @@ class MiniMaxH3Timeline:
                 if frames is not None and not fmedia:
                     want = min(want, max(1, int(frames.shape[0]) - src_start))
 
-                guide_frames = want
+                # For hard-clamping we want the full clip length (rounded down to valid 1 + 4*k for VAE)
+                if want >= 5:
+                    full_clip_frames = 1 + ((want - 1) // 4) * 4
+                else:
+                    full_clip_frames = 1
+
+                # Core minimax_keyframes cross-attention guide requires guide_frames % 17 == 5
+                guide_frames = full_clip_frames
                 if guide_frames >= 5:
-                    while guide_frames % 17 != 5:
-                        guide_frames -= 1
+                    while guide_frames % 17 != 5 and guide_frames > 5:
+                        guide_frames -= 4
+                    if guide_frames % 17 != 5:
+                        guide_frames = 1
                 else:
                     guide_frames = 1
 
                 data = None
                 if fmedia:
                     start_sec = src_start / float(fps)
-                    duration_sec = (guide_frames + 1) / float(fps)
+                    duration_sec = clip_len / float(fps)
                     data = _load_media_file(
                         fmedia,
                         fps=fps,
@@ -570,7 +596,7 @@ class MiniMaxH3Timeline:
                     )
                     frames = data["frames"]
                     if audio_in is None and not clip.get("audio_off") and data["audio"] is not None:
-                        audio_in = _slice_audio(data["audio"], start_sec)
+                        audio_in = data["audio"]
                 elif frames is not None and src_start > 0:
                     if src_start >= int(frames.shape[0]):
                         src_start = max(0, int(frames.shape[0]) - 1)
@@ -581,17 +607,22 @@ class MiniMaxH3Timeline:
                 if frames is None:
                     continue
 
-                chunk_frames = frames[:guide_frames]
-                if int(chunk_frames.shape[0]) < guide_frames:
-                    last_f = chunk_frames[-1:]
-                    chunk_frames = torch.cat([chunk_frames, last_f.repeat(guide_frames - int(chunk_frames.shape[0]), 1, 1, 1)], dim=0)
+                full_frames_chunk = frames[:full_clip_frames]
+                if int(full_frames_chunk.shape[0]) < full_clip_frames:
+                    last_f = full_frames_chunk[-1:]
+                    full_frames_chunk = torch.cat([full_frames_chunk, last_f.repeat(full_clip_frames - int(full_frames_chunk.shape[0]), 1, 1, 1)], dim=0)
 
-                video_frames = _resize(chunk_frames, width, height, crop)
+                video_frames = _resize(full_frames_chunk, width, height, crop)
                 enc_latent = vae.encode(video_frames)
+
+                # Cross-attention conditioning keyframe (uses guide_frames slice)
+                guide_latent_t = _frame_to_video_latent_idx(guide_frames) if guide_frames > 1 else 1
                 kf = {
                     "resolved_frame_index": resolved_frame_index,
-                    "latent": enc_latent,
+                    "latent": enc_latent[:, :, :guide_latent_t],
                 }
+
+                # ODE Hard Clamping spec (uses full encoded latent steps)
                 clamp_specs.append({
                     "kind": "video",
                     "start_idx": _frame_to_video_latent_idx(resolved_frame_index),
@@ -601,12 +632,12 @@ class MiniMaxH3Timeline:
 
                 if audio_in is not None and not clip.get("audio_off") and clip.get("audio_link", True):
                     audio_lat = _prepare_audio_latent(
-                        audio_vae, audio_in, 0, guide_frames / float(fps), resolved_frame_index, audio_latent_t
+                        audio_vae, audio_in, 0, want / float(fps), resolved_frame_index, audio_latent_t
                     )
                     kf["audio_latent"] = audio_lat
                     clamp_specs.append({
                         "kind": "audio",
-                        "start_idx": _frame_to_audio_latent_idx(resolved_frame_index),
+                        "start_idx": _frame_to_audio_latent_idx(resolved_frame_index, fps=fps),
                         "latent": audio_lat,
                         "strength": float(clip.get("audio_strength", clip.get("strength", 1.0))),
                     })
@@ -631,7 +662,7 @@ class MiniMaxH3Timeline:
                         })
                         clamp_specs.append({
                             "kind": "audio",
-                            "start_idx": _frame_to_audio_latent_idx(a_resolved),
+                            "start_idx": _frame_to_audio_latent_idx(a_resolved, fps=fps),
                             "latent": a_lat,
                             "strength": float(clip.get("audio_strength", clip.get("strength", 1.0))),
                         })
@@ -656,7 +687,7 @@ class MiniMaxH3Timeline:
                 })
                 clamp_specs.append({
                     "kind": "audio",
-                    "start_idx": _frame_to_audio_latent_idx(resolved_frame_index),
+                    "start_idx": _frame_to_audio_latent_idx(resolved_frame_index, fps=fps),
                     "latent": a_lat,
                     "strength": float(clip.get("strength", 1.0)),
                 })
