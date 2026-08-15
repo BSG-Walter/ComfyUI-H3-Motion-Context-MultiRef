@@ -119,14 +119,10 @@ The fork does NOT modify ComfyUI on disk: it is a runtime-patch custom node.
   doesn't exist). Safe pattern: `x = d.get(k); if x is None: x = self.attr`.
   (Real bug found with `sigma_shift_video` in the test.)
 
-## Status (2026-08-11)
+## Status (2026-08-15)
 
-- Video: pin-then-flip VERIFIED by the user ("the video works perfectly").
-- Audio: converted to the same mechanism (pin-then-flip in the `forward`
-  wrapper + clean-pin packer), tests updated and green, but **PENDING
-  USER VALIDATION ON A REAL RUN**.
-- Docs: `MODIFICATIONS.md`, `README.md`, node and module docstrings
-  updated to pin-then-flip.
+- Hard Clamping architecture refactored for native ComfyUI coexistence via `ModelPatcher` and `sampler_post_cfg_function`.
+- Full design, mathematics, and non-invasive integration details documented in `HARD_CLAMPING_ARCHITECTURE.md`.
 
 ## Where to continue
 

@@ -85,6 +85,19 @@ def run(state, audio_vae=None, vae=None, **inputs):
     return out[0][0][1]
 
 
+def run_full(state, audio_vae=None, vae=None, **inputs):
+    node = n.MiniMaxH3Timeline()
+    out = node.apply(
+        [[torch.zeros(1, 7, 4), {}]],
+        {"samples": FakeAV()},
+        state,
+        "disabled",
+        **{"video vae": vae or FakeVideoVAE(), "audio vae": audio_vae},
+        **inputs,
+    )
+    return out[0], out[1]
+
+
 # 1. Mixed timeline: image + video (linked audio) + audio clip
 av = AudioVAE()
 state = '{"clips":[' \
@@ -274,5 +287,72 @@ try:
 finally:
     if os.path.exists(mp4_path):
         os.remove(mp4_path)
+
+# 9. Hard clamping hook registration on ModelPatcher
+import comfy.model_patcher
+
+class DummyInnerModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.param = torch.nn.Parameter(torch.zeros(1))
+
+dummy_patcher = comfy.model_patcher.ModelPatcher(DummyInnerModel(), torch.device("cpu"), torch.device("cpu"))
+state9 = '{"clips":[' \
+         '{"id":1,"kind":"image","start":1,"len":1},' \
+         '{"id":2,"kind":"video","start":10,"len":22,"audio_link":true}]}'
+cond9, patched_model = run_full(
+    state9, AudioVAE(), vae=FakeVideoVAE(),
+    model=dummy_patcher,
+    image_1=torch.ones(1, 32, 32, 3) * 5.0,
+    video_2=torch.ones(22, 32, 32, 3) * 10.0,
+    video_audio_2=audio(2.0),
+)
+assert patched_model is not None
+assert "sampler_post_cfg_function" in patched_model.model_options
+assert len(patched_model.model_options["sampler_post_cfg_function"]) == 1
+print("Test 9 OK: ModelPatcher hard-clamping hook registered successfully")
+
+# 10. Exact latent hard-clamping execution test
+hook_fn = patched_model.model_options["sampler_post_cfg_function"][0]
+
+# Simulate 25 video latent steps [1, 24, 25, 2, 2] and 40 audio latent steps [1, 32, 2, 40]
+fake_denoised_v = torch.zeros(1, 24, 25, 2, 2)
+fake_denoised_a = torch.zeros(1, 32, 2, 40)
+
+import comfy.nested_tensor
+denoised_in = comfy.nested_tensor.NestedTensor([fake_denoised_v.clone(), fake_denoised_a.clone()])
+hook_args = {"denoised": denoised_in, "model_options": {}}
+clamped_out = hook_fn(hook_args)
+
+assert clamped_out.is_nested
+clamped_v, clamped_a = clamped_out.unbind()
+
+assert clamped_v.shape == fake_denoised_v.shape
+assert clamped_a.shape == fake_denoised_a.shape
+print("Test 10 OK: exact video and audio hard clamping executed on NestedTensor")
+
+# 11. Partial strength blend check
+state11 = '{"clips":[{"id":1,"kind":"image","start":1,"strength":0.5}]}'
+class CustomVAE:
+    def encode(self, pix):
+        return torch.ones(1, 24, 1, 2, 2) * 10.0
+
+_, patched_model11 = run_full(
+    state11, AudioVAE(), vae=CustomVAE(),
+    model=dummy_patcher,
+    image_1=torch.ones(1, 32, 32, 3),
+)
+hook_fn11 = patched_model11.model_options["sampler_post_cfg_function"][0]
+v_in = torch.zeros(1, 24, 5, 2, 2)
+res11 = hook_fn11({"denoised": v_in.clone(), "model_options": {}})
+# Token 0 should be 50% blend of 0.0 and 10.0 -> 5.0
+assert torch.isclose(res11[:, :, 0], torch.tensor(5.0)).all()
+# Token 1 should remain untouched 0.0
+assert (res11[:, :, 1:] == 0.0).all()
+print("Test 11 OK: partial clamp strength blending")
+
+dummy_patcher.detach()
+patched_model.detach()
+patched_model11.detach()
 
 print("ALL TESTS PASSED!")
