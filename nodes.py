@@ -577,6 +577,7 @@ class MiniMaxH3Timeline:
 
         keyframes = list(conditioning[0][1].get("minimax_keyframes", []))
         clamp_specs = []
+        audio_jobs = []
 
         for idx, clip in enumerate(clips, 1):
             slot = int(clip.get("id") or idx)
@@ -602,15 +603,6 @@ class MiniMaxH3Timeline:
                     image = image[src_start:]
 
                 want_len = max(1, min(int(clip.get("len") or 1), frame_count - resolved_frame_index))
-                if want_len < 5:
-                    guide_frames = 1
-                else:
-                    guide_frames = want_len
-                    while guide_frames % 17 != 5:
-                        guide_frames -= 1
-
-                if resolved_frame_index + guide_frames > frame_count:
-                    guide_frames = 1
 
                 if image.shape[0] > 1:
                     content = _resize(image[:want_len], width, height, crop)
@@ -621,24 +613,24 @@ class MiniMaxH3Timeline:
                     base_frame = _resize(image[:1], width, height, crop)
                     content = base_frame.repeat(want_len, 1, 1, 1)
 
-                guide_chunk = content[:guide_frames]
-                guide_latent = vae.encode(guide_chunk)
+                seg_start, lead, seg_len = _grid_segment(resolved_frame_index, want_len, frame_count)
+                seg = _pad_clip(content, lead, seg_len - want_len - lead)
+                enc_latent = vae.encode(seg)
+                i0, i1 = _video_token_window(lead, want_len)
+                if i1 > int(enc_latent.shape[2]):
+                    i1 = int(enc_latent.shape[2])
+                if i0 >= i1:
+                    i0 = max(0, i1 - 1)
+                win_latent = enc_latent[:, :, i0:i1]
+
                 keyframes.append({
                     "resolved_frame_index": resolved_frame_index,
-                    "latent": guide_latent,
+                    "latent": win_latent,
                 })
-
-                seg_start, lead, seg_len = _grid_segment(resolved_frame_index, want_len, frame_count)
-                if lead == 0 and seg_len == want_len and guide_frames == want_len:
-                    enc_latent = guide_latent
-                else:
-                    seg = _pad_clip(content, lead, seg_len - want_len - lead)
-                    enc_latent = vae.encode(seg)
-                i0, i1 = _video_token_window(lead, want_len)
                 clamp_specs.append({
                     "kind": "video",
                     "start_idx": (seg_start // 17) * 5 + i0,
-                    "latent": enc_latent[:, :, i0:i1],
+                    "latent": win_latent,
                     "strength": float(clip.get("strength", 1.0)),
                 })
 
@@ -657,14 +649,6 @@ class MiniMaxH3Timeline:
                 want = min(clip_len, avail_timeline_frames)
                 if frames is not None and not fmedia:
                     want = min(want, max(1, int(frames.shape[0]) - src_start))
-
-                # Core minimax_keyframes cross-attention guide requires guide_frames % 17 == 5 or single frame
-                if want < 5:
-                    guide_frames = 1
-                else:
-                    guide_frames = want
-                    while guide_frames % 17 != 5:
-                        guide_frames -= 1
 
                 data = None
                 if fmedia:
@@ -696,46 +680,44 @@ class MiniMaxH3Timeline:
                     last_f = content[-1:]
                     content = torch.cat([content, last_f.repeat(want - int(content.shape[0]), 1, 1, 1)], dim=0)
 
-                # Encode cross-attention guide frames (exact 1 or 17k+5 frames)
-                guide_frames_chunk = content[:guide_frames]
-                guide_video_frames = _resize(guide_frames_chunk, width, height, crop)
-                guide_latent = vae.encode(guide_video_frames)
+                # One VAE encode per clip: grid-align the segment to the VAE's
+                # independent 17-frame chunk lattice so tokens map 1:1 onto the
+                # target latent. Lead/tail are frozen repeats; only the tokens
+                # intersecting the clip are clamped and reused as the
+                # cross-attention guide (a constant <=4 frame offset, invisible
+                # under soft guidance).
+                seg_start, lead, seg_len = _grid_segment(resolved_frame_index, want, frame_count)
+                seg = _pad_clip(_resize(content, width, height, crop), lead, seg_len - want - lead)
+                enc_latent = vae.encode(seg)
+                i0, i1 = _video_token_window(lead, want)
+                if i1 > int(enc_latent.shape[2]):
+                    i1 = int(enc_latent.shape[2])
+                if i0 >= i1:
+                    i0 = max(0, i1 - 1)
+                win_latent = enc_latent[:, :, i0:i1]
 
-                # Cross-attention conditioning keyframe
+                # Cross-attention conditioning keyframe (same latent as the clamp)
                 kf = {
                     "resolved_frame_index": resolved_frame_index,
-                    "latent": guide_latent,
+                    "latent": win_latent,
                 }
 
-                # ODE Hard Clamping: grid-align the segment to the VAE's independent
-                # 17-frame chunk lattice so tokens map 1:1 onto the target video's
-                # latent. Lead/tail are frozen repeats (only the intersecting
-                # tokens are clamped, so the clip's visible span stays exact).
-                seg_start, lead, seg_len = _grid_segment(resolved_frame_index, want, frame_count)
-                if lead == 0 and seg_len == want and guide_frames == want:
-                    enc_latent = guide_latent
-                else:
-                    seg = _pad_clip(_resize(content, width, height, crop), lead, seg_len - want - lead)
-                    enc_latent = vae.encode(seg)
-                i0, i1 = _video_token_window(lead, want)
-
-                # ODE Hard Clamping spec (uses full encoded latent steps)
+                # ODE Hard Clamping spec
                 clamp_specs.append({
                     "kind": "video",
                     "start_idx": (seg_start // 17) * 5 + i0,
-                    "latent": enc_latent[:, :, i0:i1],
+                    "latent": win_latent,
                     "strength": float(clip.get("strength", 1.0)),
                 })
 
                 if audio_in is not None and not clip.get("audio_off") and clip.get("audio_link", True):
-                    audio_lat = _prepare_audio_latent(
-                        audio_vae, audio_in, 0, want / float(fps), resolved_frame_index, audio_latent_t
-                    )
-                    kf["audio_latent"] = audio_lat
-                    clamp_specs.append({
-                        "kind": "audio",
-                        "start_idx": _frame_to_audio_latent_idx(resolved_frame_index, fps=fps),
-                        "latent": audio_lat,
+                    # Audio encoding deferred to the second pass (all video encodes first)
+                    audio_jobs.append({
+                        "kf": kf,
+                        "audio": audio_in,
+                        "src_sec": 0.0,
+                        "duration": want / float(fps),
+                        "frame": resolved_frame_index,
                         "strength": float(clip.get("audio_strength", clip.get("strength", 1.0))),
                     })
                 keyframes.append(kf)
@@ -749,18 +731,15 @@ class MiniMaxH3Timeline:
                         asrc = float(clip.get("audio_src_start") if clip.get("audio_src_start") is not None else src_start)
                         raw_audio = data["audio"] if fmedia and data is not None and data.get("audio") is not None else audio_in
                         src_sec = asrc / float(fps) if fmedia and data is not None and data.get("audio") is not None else (asrc - src_start) / float(fps)
-                        a_lat = _prepare_audio_latent(
-                            audio_vae, raw_audio, src_sec, a_len / float(fps), a_resolved, audio_latent_t
-                        )
 
-                        keyframes.append({
-                            "resolved_frame_index": a_resolved,
-                            "audio_latent": a_lat,
-                        })
-                        clamp_specs.append({
-                            "kind": "audio",
-                            "start_idx": _frame_to_audio_latent_idx(a_resolved, fps=fps),
-                            "latent": a_lat,
+                        a_kf = {"resolved_frame_index": a_resolved}
+                        keyframes.append(a_kf)
+                        audio_jobs.append({
+                            "kf": a_kf,
+                            "audio": raw_audio,
+                            "src_sec": src_sec,
+                            "duration": a_len / float(fps),
+                            "frame": a_resolved,
                             "strength": float(clip.get("audio_strength", clip.get("strength", 1.0))),
                         })
 
@@ -775,19 +754,30 @@ class MiniMaxH3Timeline:
                     continue
 
                 want_len = min(max(1, int(clip.get("len") or 22)), frame_count - resolved_frame_index)
-                a_lat = _prepare_audio_latent(
-                    audio_vae, audio_in, src_start / float(fps), want_len / float(fps), resolved_frame_index, audio_latent_t
-                )
-                keyframes.append({
-                    "resolved_frame_index": resolved_frame_index,
-                    "audio_latent": a_lat,
-                })
-                clamp_specs.append({
-                    "kind": "audio",
-                    "start_idx": _frame_to_audio_latent_idx(resolved_frame_index, fps=fps),
-                    "latent": a_lat,
+                a_kf = {"resolved_frame_index": resolved_frame_index}
+                keyframes.append(a_kf)
+                audio_jobs.append({
+                    "kf": a_kf,
+                    "audio": audio_in,
+                    "src_sec": src_start / float(fps),
+                    "duration": want_len / float(fps),
+                    "frame": resolved_frame_index,
                     "strength": float(clip.get("strength", 1.0)),
                 })
+
+        # Second pass: all audio encodes together so the audio VAE is loaded once
+        # (the video VAE stayed resident through the first pass).
+        for job in audio_jobs:
+            audio_lat = _prepare_audio_latent(
+                audio_vae, job["audio"], job["src_sec"], job["duration"], job["frame"], audio_latent_t
+            )
+            job["kf"]["audio_latent"] = audio_lat
+            clamp_specs.append({
+                "kind": "audio",
+                "start_idx": _frame_to_audio_latent_idx(job["frame"], fps=fps),
+                "latent": audio_lat,
+                "strength": job["strength"],
+            })
 
         keyframes.sort(key=lambda k: k.get("resolved_frame_index", 0))
         if DEBUG_LOGS:

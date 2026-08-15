@@ -169,7 +169,9 @@ kfs3 = cond3["minimax_keyframes"]
 # Video starts at 80 (frame_idx=79), length clamped to 85-79=6 frames (guide=5 frames)
 assert len(kfs3) == 1
 assert kfs3[0]["resolved_frame_index"] == 79
-assert kfs3[0]["latent"].shape[2] == 2  # 5 frames -> 2 tokens
+# Pathological non-17k+5 target (85 frames): segment capped to 17 px -> 2 VAE tokens,
+# window [3:5) guarded down to the single cap-adjacent token.
+assert kfs3[0]["latent"].shape[2] == 1
 
 print("Test 3 OK: bounds clamping and timeline limit cutoff")
 
