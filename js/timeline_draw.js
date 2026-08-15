@@ -1,6 +1,6 @@
 // Canvas painting helpers for the H3 timeline widget.
 
-import { bandSrc, bandGeom, clamp, COLORS, ghostRect, WIDTH, envFlat, envLen, envPts, envStrengthAt, envX, envY, videoChunkStarts } from "./timeline_core.js";
+import { bandSrc, bandGeom, COLORS, ghostRect, envFlat, envY } from "./timeline_core.js";
 import { ensureMedia, getClipGifFrame } from "./timeline_media.js";
 
 function paintCover(ctx, el, r) {

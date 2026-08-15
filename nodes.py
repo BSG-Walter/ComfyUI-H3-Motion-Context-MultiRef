@@ -121,6 +121,14 @@ def _slice_audio(audio, start_sec=0.0, duration_sec=None):
     return {"waveform": sliced, "sample_rate": sr}
 
 
+def _prepare_audio_latent(audio_vae, audio, src_sec, duration_sec, resolved_frame, audio_latent_t):
+    """Slice, encode, and clamp audio latent to the timeline boundary."""
+    audio_slice = _slice_audio(audio, src_sec, duration_sec)
+    audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
+    max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * resolved_frame))
+    return audio_lat[..., :max_rt].clone() if audio_rt > max_rt else audio_lat
+
+
 def _media_ref_path(media):
     """Resolve an uploaded media ref {name, subfolder, type} to a file path."""
     name = media.get("name") if isinstance(media, dict) else None
@@ -232,22 +240,7 @@ def _load_media_file(media, fps=None):
         _LOG.warning("Timeline: PyAV decode failed for %s: %s", mpath, e)
 
     if frames is None and mpath.lower().endswith(".gif"):
-        try:
-            with Image.open(mpath) as img:
-                collected = []
-                t_sec = 0.0
-                for frame in ImageSequence.Iterator(img):
-                    duration = frame.info.get("duration", 100) / 1000.0
-                    arr = np.asarray(frame.convert("RGB"), dtype=np.float32) / 255.0
-                    collected.append((t_sec, torch.from_numpy(arr)))
-                    t_sec += duration
-                if collected:
-                    if fps is not None and fps > 0:
-                        frames = _resample_video_frames(collected, fps)
-                    else:
-                        frames = torch.stack([item[1] for item in collected])
-        except Exception as e:
-            _LOG.warning("Timeline: PIL GIF fallback failed for %s: %s", mpath, e)
+        frames = _load_image_file(media, fps=fps)
 
     return {"frames": frames, "audio": audio}
 
@@ -457,15 +450,10 @@ class MiniMaxH3Timeline:
                 }
 
                 if audio_in is not None and not clip.get("audio_off") and clip.get("audio_link", True):
-                    audio_slice = _slice_audio(audio_in, 0, guide_frames / float(fps))
-                    audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
-                    max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * resolved_frame_index))
-                    if audio_rt > max_rt:
-                        audio_lat = audio_lat[..., :max_rt].clone()
-                    kf["audio_latent"] = audio_lat
-                    keyframes.append(kf)
-                else:
-                    keyframes.append(kf)
+                    kf["audio_latent"] = _prepare_audio_latent(
+                        audio_vae, audio_in, 0, guide_frames / float(fps), resolved_frame_index, audio_latent_t
+                    )
+                keyframes.append(kf)
 
                 if audio_in is not None and not clip.get("audio_off") and not clip.get("audio_link", True):
                     a_start = int(clip.get("audio_start") or start)
@@ -477,14 +465,11 @@ class MiniMaxH3Timeline:
                         raw_audio = data["audio"] if fmedia and data.get("audio") is not None else audio_in
                         src_sec = asrc / float(fps) if fmedia and data.get("audio") is not None else (asrc - src_start) / float(fps)
 
-                        audio_slice = _slice_audio(raw_audio, src_sec, a_len / float(fps))
-                        audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
-                        max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * a_resolved))
-                        if audio_rt > max_rt:
-                            audio_lat = audio_lat[..., :max_rt].clone()
                         keyframes.append({
                             "resolved_frame_index": a_resolved,
-                            "audio_latent": audio_lat,
+                            "audio_latent": _prepare_audio_latent(
+                                audio_vae, raw_audio, src_sec, a_len / float(fps), a_resolved, audio_latent_t
+                            ),
                         })
 
             elif kind == "audio":
@@ -498,14 +483,11 @@ class MiniMaxH3Timeline:
                     continue
 
                 want_len = min(max(1, int(clip.get("len") or 22)), frame_count - resolved_frame_index)
-                audio_slice = _slice_audio(audio_in, src_start / float(fps), want_len / float(fps))
-                audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
-                max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * resolved_frame_index))
-                if audio_rt > max_rt:
-                    audio_lat = audio_lat[..., :max_rt].clone()
                 keyframes.append({
                     "resolved_frame_index": resolved_frame_index,
-                    "audio_latent": audio_lat,
+                    "audio_latent": _prepare_audio_latent(
+                        audio_vae, audio_in, src_start / float(fps), want_len / float(fps), resolved_frame_index, audio_latent_t
+                    ),
                 })
 
         keyframes.sort(key=lambda k: k.get("resolved_frame_index", 0))

@@ -34,15 +34,9 @@ import {
     probeSnap,
     splitSnap,
     hitTest,
-    envLen,
-    envField,
-    envPts,
-    envNormalize,
+    envFlat,
     envStrengthAtY,
-    envStrengthAt,
     envY,
-    tokenSnap,
-    cloneEnv,
     ENV_MAX,
 } from "./timeline_core.js";
 import { ensureMedia, thumbSeek, sourceFrames } from "./timeline_media.js";
@@ -688,8 +682,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                 if (this._dragFlat) {
                     const dfl = this._dragFlat;
                     const r = dfl.ghost ? ghostRect(dfl.c, this._scale) : blockRect(dfl.c, this._scale);
-                    const f = this._hoverPos ? (this._hoverPos[0] - r.x) / this._scale : 0;
-                    const v = envStrengthAt(dfl.c, dfl.ghost, f);
+                    const v = envFlat(dfl.c, dfl.ghost);
                     const bx = clamp(r.x + r.w - 2, 0, WIDTH);
                     ctx.fillStyle = "rgba(0,0,0,0.65)";
                     ctx.beginPath();
@@ -706,7 +699,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                     const r = h.ghost ? ghostRect(h.c, this._scale) : blockRect(h.c, this._scale);
                     if (h.zone === "envln") {
                         const x = clamp(this._hoverPos[0], r.x + 1, r.x + r.w - 1);
-                        const y = envY(r, envStrengthAt(h.c, h.ghost, (x - r.x) / this._scale));
+                        const y = envY(r, envFlat(h.c, h.ghost));
                         ctx.strokeStyle = "#66ff66";
                         ctx.lineWidth = 2;
                         ctx.beginPath();
@@ -905,7 +898,6 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
                                     ? Number(hit.c.strength)
                                     : ENV_MAX;
                             }
-                            hit.c.audio_env = cloneEnv(hit.c.env);
                             // the band freezes its own slice of the file, so
                             // trimming the video no longer moves the sound
                             hit.c.audio_src_start = Number(hit.c.src_start) || 0;

@@ -402,16 +402,6 @@ export function playHeadBoundary(node) {
 export const ENV_MIN = 0.0;
 export const ENV_MAX = 1.0;
 
-export function cloneEnv(env) {
-    return Array.isArray(env) ? env.map((p) => [Number(p[0]), Number(p[1])]) : env;
-}
-
-export function envField(c, ghost) {
-    if (!ghost) return c.env;
-    if (Array.isArray(c.audio_env)) return c.audio_env;
-    return c.audio_link ? c.env : c.audio_env;
-}
-
 export function envFlat(c, ghost) {
     if (ghost) {
         const own = Number(c.audio_strength);
@@ -423,51 +413,12 @@ export function envFlat(c, ghost) {
     return ENV_MAX;
 }
 
-export function envLen(c, ghost) {
-    if (c.kind === "audio") return Number(c.len) || 22;
-    return ghost ? Number(c.audio_len ?? c.len ?? 22) : clipLen(c);
-}
-
-export function envPts(c, ghost) {
-    return [];
-}
-
-export function envNormalize(c, ghost) {
-    return [];
-}
-
-export function envStrengthAt(c, ghost, frame) {
-    return envFlat(c, ghost);
-}
-
-export const RUN_GRID = [39, 22, 5, 1];
-
-export function videoChunkStarts(len) {
-    const out = [];
-    let acc = 0;
-    while (acc < len) {
-        out.push(acc);
-        const rem = len - acc;
-        const r = RUN_GRID.find((g) => g <= rem) || 1;
-        acc += r;
-    }
-    return out;
-}
-
-export function tokenSnap(f, len) {
-    return Math.min(Math.max(0, f), len);
-}
-
 export function envY(r, v) {
     return r.y + r.h - 6 - ((clamp(v, ENV_MIN, ENV_MAX) - ENV_MIN) / (ENV_MAX - ENV_MIN)) * (r.h - 12);
 }
 
 export function envStrengthAtY(r, y) {
     return clamp(ENV_MIN + ((r.y + r.h - 6 - y) / (r.h - 12)) * (ENV_MAX - ENV_MIN), ENV_MIN, ENV_MAX);
-}
-
-export function envX(r, f, s) {
-    return clamp(r.x + f * s, r.x + 0.5, r.x + r.w - 0.5);
 }
 
 export function envZone(c, p, s) {
