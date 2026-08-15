@@ -1,4 +1,8 @@
-"""Runtime checks for the MiniMax H3 Timeline node using ComfyUI core guides."""
+r"""Runtime checks for the MiniMax H3 Timeline node using ComfyUI core guides.
+
+# Run with ComfyUI venv:
+# C:\Users\Walter\AppData\Local\Comfy-Desktop\ComfyUI-Installs\ComfyUI\ComfyUI\.venv\Scripts\python.exe tests/test_timeline_node.py
+"""
 
 import importlib.util
 import sys
@@ -213,5 +217,62 @@ try:
 finally:
     if os.path.exists(gif_path):
         os.remove(gif_path)
+
+# 8. Video file fast slicing and split timeline test
+import av
+with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+    mp4_path = f.name
+
+try:
+    with av.open(mp4_path, mode="w") as container:
+        vstream = container.add_stream("h264", rate=24)
+        vstream.width = 64
+        vstream.height = 64
+        vstream.pix_fmt = "yuv420p"
+        astream = container.add_stream("aac", rate=44100)
+        astream.layout = "stereo"
+        for i in range(120):  # 5 seconds at 24fps
+            img = np.full((64, 64, 3), i * 2, dtype=np.uint8)
+            vf = av.VideoFrame.from_ndarray(img, format="rgb24")
+            for packet in vstream.encode(vf):
+                container.mux(packet)
+        for packet in vstream.encode():
+            container.mux(packet)
+        for _ in range(5):
+            samples = np.zeros((1, 44100 * 2), dtype=np.float32)
+            af_frame = av.AudioFrame.from_ndarray(samples, format="flt", layout="stereo")
+            af_frame.sample_rate = 44100
+            for packet in astream.encode(af_frame):
+                container.mux(packet)
+        for packet in astream.encode():
+            container.mux(packet)
+
+    # Test loading slice from 2.0s (frame 48) for 22 frames
+    dummy_media = {"name": os.path.basename(mp4_path), "type": "input", "subfolder": ""}
+    import folder_paths
+    orig_annotated = folder_paths.get_annotated_filepath
+    folder_paths.get_annotated_filepath = lambda ref: mp4_path
+
+    try:
+        data = n._load_media_file(dummy_media, fps=24, start_sec=2.0, duration_sec=22/24.0, load_video=True, load_audio=True)
+        assert data["frames"] is not None
+        assert data["frames"].shape[0] >= 22
+        assert data["audio"] is not None
+
+        # Test in node timeline with split clips (left + right split)
+        state8 = '{"clips":[' \
+                 '{"id":1,"kind":"video","start":1,"len":22,"src_start":0,"file":{"name":"dummy.mp4","type":"input"}},' \
+                 '{"id":2,"kind":"video","start":25,"len":22,"src_start":48,"file":{"name":"dummy.mp4","type":"input"}}]}'
+        cond8 = run(state8, AudioVAE(), vae=FakeVideoVAE())
+        kfs8 = cond8["minimax_keyframes"]
+        assert len(kfs8) == 2
+        assert kfs8[0]["resolved_frame_index"] == 0
+        assert kfs8[1]["resolved_frame_index"] == 24
+        print("Test 8 OK: fast video seek/slice and split clips handling")
+    finally:
+        folder_paths.get_annotated_filepath = orig_annotated
+finally:
+    if os.path.exists(mp4_path):
+        os.remove(mp4_path)
 
 print("ALL TESTS PASSED!")
