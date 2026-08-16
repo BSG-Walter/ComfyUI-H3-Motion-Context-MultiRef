@@ -517,8 +517,8 @@ class MiniMaxH3Timeline:
                     "default": 24, "min": 1, "max": 240, "step": 1,
                     "tooltip": "Timeline frame rate for audio synchronization."}),
                 total_frames=("INT", {
-                    "default": 240, "min": 1, "max": 100000, "step": 1,
-                    "tooltip": "Timeline ruler length in frames."}),
+                    "default": 243, "min": 5, "max": 100000, "step": 17,
+                    "tooltip": "Timeline ruler length in frames (valid 5 + 17N frames: 5, 22, 39, 56, ...)."}),
                 clamp_strength=("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Hard clamping strength. 1.0 = exact source preservation, <1.0 = blend with DiT prediction."}),

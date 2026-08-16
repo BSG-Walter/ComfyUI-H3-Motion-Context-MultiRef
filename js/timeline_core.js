@@ -5,7 +5,14 @@ import { api } from "../../../scripts/api.js";
 export const STATE_NAME = "timeline_state";
 export const MAX_CLIPS = 32;
 
-export const SPAN = 240; // ruler length in frames
+export const SPAN = 243; // ruler length in frames (5 + 14 * 17)
+
+export function snapTo17k5(v) {
+    const num = Math.round(Number(v) || SPAN);
+    if (num <= 5) return 5;
+    const n = Math.round((num - 5) / 17);
+    return 5 + n * 17;
+}
 export const PX = 3.5; // pixels per frame (base zoom)
 export const ZOOM_MIN = 1; // px/frame limits for zoom buttons
 export const ZOOM_MAX = 24;
@@ -178,7 +185,7 @@ export function probeSnap(node, value, scale) {
         }
     };
     probe(1);
-    probe(span + 1);
+    probe(span);
     const pl = node._h3TimelineWidget?._play;
     if (pl != null) probe(Math.round(pl) + 1);
     if (dBest <= Math.max(0.5, SNAP_PLAY_PX / scale)) return best;
@@ -203,7 +210,7 @@ export function laneFree(node, c, lane, s, len) {
 export function resolveMove(node, c, lane, s, len, grab, px) {
     const clips = node._h3Clips;
     const span = node._h3Span ?? SPAN;
-    const endLine = span + 1;
+    const endLine = span;
     // a linked video drags its sound band along, so it must not plow
     // through audio clips either: both lanes block the whole clip.
     const lanes =
@@ -246,7 +253,7 @@ export function resolveMove(node, c, lane, s, len, grab, px) {
         };
         probe(1);
         probe(endLine);
-        probe(endLine - len);
+        probe(endLine - len + 1);
         const pl = node._h3TimelineWidget?._play;
         if (pl != null) {
             const f = Math.round(pl) + 1;
@@ -328,7 +335,7 @@ export function resolveMultiMove(node, targets, desiredStep, scale) {
             }
         };
 
-        const snapLines = [1, span + 1];
+        const snapLines = [1, span];
         const pl = node._h3TimelineWidget?._play;
         if (pl != null) snapLines.push(Math.round(pl) + 1);
 
@@ -521,7 +528,7 @@ export function splitSnap(node, p, s) {
             probe(v.e - 1);
         }
     }
-    probe(span); // end-line
+    probe(span - 1); // end-line
     if (dBest <= Math.max(0.5, SNAP_PX / s)) return best;
     return p;
 }

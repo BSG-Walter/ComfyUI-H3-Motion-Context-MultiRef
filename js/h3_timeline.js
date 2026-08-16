@@ -4,6 +4,7 @@
 import { app } from "../../scripts/app.js";
 import {
     SPAN,
+    snapTo17k5,
     PX,
     ZOOM_MIN,
     ZOOM_MAX,
@@ -242,20 +243,27 @@ function sliderZoom(nd, w, x) {
 // number widget that doubles as an optional input slot: Python may have
 // already created it from the INT input (look it up first, and skip creation
 // when it was converted to an input)
-function ensureNumWidget(node, name, def, store) {
+function ensureNumWidget(node, name, def, store, opts = {}) {
     const slot = node._h3NumWidgets ?? (node._h3NumWidgets = {});
     if (!slot[name]) slot[name] = node.widgets?.find((w) => w.name === name);
     const isInput = node.inputs?.some((i) => i.name === name);
+    const min = opts.min ?? (name === "total_frames" ? 5 : 1);
+    const max = opts.max ?? (name === "fps" ? 240 : 100000);
+    const step = opts.step ?? (name === "total_frames" ? 17 : 1);
     if (!slot[name] && !isInput) {
         const w = node.addWidget("number", name, def, (v) => {
-            store(Math.max(1, Math.round(Number(v) || def)));
+            const val = name === "total_frames" ? snapTo17k5(v) : Math.max(min, Math.round(Number(v) || def));
+            store(val);
+            if (w) w.value = val;
             node._h3TimelineWidget?.redraw?.(node);
-        }, { min: 1, max: name === "fps" ? 240 : 100000, step: 1 });
+        }, { min, max, step });
         slot[name] = w;
     }
     const w = slot[name];
     if (w && (w.value == null || !Number.isFinite(Number(w.value)))) w.value = def;
-    if (w) w.value = Math.max(1, Math.round(Number(w.value) || def));
+    if (w) {
+        w.value = name === "total_frames" ? snapTo17k5(w.value) : Math.max(min, Math.round(Number(w.value) || def));
+    }
     return w;
 }
 
@@ -400,7 +408,7 @@ function setup(node) {
                 const clips = nd._h3Clips || [];
                 const s = this._scale;
                 const span0 = nd._h3Span ?? SPAN;
-                this._pan = clamp(this._pan ?? 0, 0, Math.max(0, OFFSET_X + span0 * s - width + 4));
+                this._pan = clamp(this._pan ?? 0, 0, Math.max(0, OFFSET_X + (span0 - 1) * s - width + 4));
 
                 // sync fps/total_frames: spinner buttons mutate widget.value
                 // without firing the callback, so poll here each paint.
@@ -414,7 +422,7 @@ function setup(node) {
                 }
                 const spanW = nd.widgets?.find((w) => w.name === "total_frames") || nd._h3SpanWidget;
                 if (spanW && spanW.value != null && Number.isFinite(Number(spanW.value))) {
-                    nd._h3Span = Math.max(1, Math.round(Number(spanW.value) || SPAN));
+                    nd._h3Span = snapTo17k5(spanW.value);
                 }
 
                 ctx.fillStyle = "rgba(0,0,0,0.25)";
@@ -483,9 +491,17 @@ function setup(node) {
                 ctx.restore();
 
                 // opaque backdrop over the toolbar strip (buttons + slider) so ruler
-// labels don't bleed through; the number band below stays clear
-ctx.fillStyle = "#1a1a2a";
-ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
+                // labels don't bleed through; the number band below stays clear
+                ctx.fillStyle = "#1a1a2a";
+                ctx.fillRect(0, 0, WIDTH, RULER_H - 16);
+
+                // Total duration in seconds based on total_frames (span) and fps
+                const durSec = (span / fps).toFixed(2);
+                ctx.fillStyle = "#7aa2f7";
+                ctx.font = "bold 10px sans-serif";
+                ctx.textAlign = "left";
+                ctx.textBaseline = "middle";
+                ctx.fillText(`⏱ ${durSec}s (${span}f @ ${fps}fps)`, 6, 3 + BTN_H / 2 + 0.5);
 
                 // toolbar: text buttons measured at paint time; _btns/_sliderX
                 // are reused by btnZone for hit-testing
@@ -589,7 +605,7 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
 
                 // end-line + dim everything past it
                 {
-                    const ex = OFFSET_X + span * s;
+                    const ex = OFFSET_X + (span - 1) * s;
                     if (ex < WIDTH) {
                         ctx.fillStyle = "rgba(0,0,0,0.45)";
                         ctx.fillRect(ex, RULER_H, WIDTH - ex, H - RULER_H);
@@ -1309,10 +1325,10 @@ ctx.fillRect(TOOL_X - 4, 0, WIDTH - (TOOL_X - 4), RULER_H - 16);
     });
     // total_frames widget: same pattern as fps
     const spanW = ensureNumWidget(node, "total_frames", SPAN, (v) => {
-        node._h3Span = v;
-    });
+        node._h3Span = snapTo17k5(v);
+    }, { min: 5, max: 100000, step: 17 });
     node._h3SpanWidget = spanW;
-    if (spanW) node._h3Span = Math.max(1, Math.round(Number(spanW.value) || SPAN));
+    if (spanW) node._h3Span = snapTo17k5(spanW.value);
     else node._h3Span = node._h3Span ?? SPAN;
 
     const tw = node._h3TimelineWidget;

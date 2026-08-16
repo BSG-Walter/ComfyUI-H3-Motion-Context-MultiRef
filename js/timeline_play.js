@@ -20,7 +20,7 @@ export function togglePlay(node) {
             const pos = (w._play ?? 0) + dt * (w._fps || 24);
             w._play = Math.max(0, pos);
             syncPreview(node);
-            if (pos > (node._h3Span ?? SPAN)) {
+            if (pos >= (node._h3Span ?? SPAN) - 1) {
                 w._playing = false;
                 stopPlay(node);
             }
