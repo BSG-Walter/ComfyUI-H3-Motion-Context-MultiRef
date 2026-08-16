@@ -627,10 +627,13 @@ class MiniMaxH3Timeline:
                     "resolved_frame_index": resolved_frame_index,
                     "latent": win_latent,
                 })
+                i0c = i0 + 1 if kind == "video" and i1 - i0 > 1 else i0
+                if i0c >= i1:
+                    i0c = max(0, i1 - 1)
                 clamp_specs.append({
                     "kind": "video",
-                    "start_idx": (seg_start // 17) * 5 + i0,
-                    "latent": win_latent,
+                    "start_idx": (seg_start // 17) * 5 + i0c,
+                    "latent": enc_latent[:, :, i0c:i1],
                     "strength": float(clip.get("strength", 1.0)),
                 })
 
