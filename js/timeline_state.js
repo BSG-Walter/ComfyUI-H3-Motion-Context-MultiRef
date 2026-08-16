@@ -462,6 +462,7 @@ export async function addClipWithMedia(node, kind, startFrom = null) {
         info = await uploadMedia(file);
     } catch (err) {
         console.warn("h3 timeline: upload failed", err);
+        window.alert?.(err?.message || `Upload failed: ${err}`);
         return;
     }
     const detected = kindOfFile(info);
@@ -539,7 +540,14 @@ export function addClip(node, kind, info, lenOverride, startFrom = null) {
 export async function replaceClipMedia(node, c) {
     const file = await pickFile();
     if (!file) return;
-    const info = await uploadMedia(file);
+    let info = null;
+    try {
+        info = await uploadMedia(file);
+    } catch (err) {
+        console.warn("h3 timeline: replace upload failed", err);
+        window.alert?.(err?.message || `Upload failed: ${err}`);
+        return;
+    }
     recordHistory(node);
     const kind = kindOfFile(info);
     if (kind) c.kind = kind;

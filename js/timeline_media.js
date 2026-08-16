@@ -9,7 +9,23 @@ export async function uploadMedia(file) {
     fd.append("type", "input");
     fd.append("overwrite", "true");
     const resp = await api.fetchApi("/upload/image", { method: "POST", body: fd });
-    if (!resp.ok) throw new Error("upload failed: " + resp.status);
+    if (!resp.ok) {
+        if (resp.status === 413) {
+            const sizeMB = file?.size ? (file.size / (1024 * 1024)).toFixed(1) : "?";
+            throw new Error(
+                `File "${file.name}" (${sizeMB} MB) exceeds ComfyUI's upload limit (default 100 MB, HTTP 413).\n\n` +
+                `Solutions:\n` +
+                `• Compress or trim the video to under 100 MB.\n` +
+                `• Or start ComfyUI with the argument: --max-upload-size 1000 (allows up to 1 GB).`
+            );
+        }
+        let detail = "";
+        try {
+            const txt = await resp.text();
+            if (txt) detail = `: ${txt}`;
+        } catch (_) {}
+        throw new Error(`Upload failed (${resp.status})${detail}`);
+    }
     const info = await resp.json();
     return { name: info.name, subfolder: info.subfolder || "", type: info.type || "input" };
 }
