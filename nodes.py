@@ -151,6 +151,22 @@ def _normalize_audio_waveform(wav):
     return wav[:1]
 
 
+def _apply_strength(latent, strength, seed=0, scaled=False):
+    """Condition noise augmentation: weaker guide = noisier condition = free repaint.
+
+    scaled=True sizes the noise to the latent's own std, because audio latents
+    are far smaller than video ones and unit noise would drown them in static.
+    """
+    strength = max(0.0, min(1.0, float(strength)))
+    if strength >= 1.0:
+        return latent
+    gen = torch.Generator("cpu").manual_seed(seed)
+    noise = torch.randn(latent.shape, generator=gen, dtype=torch.float32, device=latent.device)
+    if scaled:
+        noise = noise * (latent.std().clamp_min(1e-6) if latent.numel() > 1 else 1e-3)
+    return strength * latent + (1.0 - strength) * noise
+
+
 def _encode_ref_audio(audio_vae, audio):
     """Encode audio into H3 audio VAE latent [1, 32, 2, T] using comfy-core VAE encode."""
     if audio_vae is None:
@@ -353,10 +369,7 @@ def _load_media_file(media, fps=None, start_sec=0.0, duration_sec=None, load_vid
                     n_channels = astream.channels
                     sr = float(astream.codec_context.sample_rate)
                     for frame in packet.decode():
-                        # Time-filter like the video stream: the seek lands ~1s
-                        # early (tolerance pre-roll), so raw audio would start
-                        # at the wrong file position. Keep only frames that
-                        # overlap [start_sec, end_sec).
+                        # Video seek lands ~1s early (pre-roll); keep only frames in range.
                         if frame.pts is not None and atimebase:
                             t_sec = float(frame.pts * atimebase)
                             f_dur = frame.samples / sr
@@ -450,9 +463,6 @@ class MiniMaxH3Timeline:
                 total_frames=("INT", {
                     "default": 243, "min": 5, "max": 100000, "step": 17,
                     "tooltip": "Timeline ruler length in frames (valid 5 + 17N frames: 5, 22, 39, 56, ...)."}),
-                clamp_strength=("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Mask preservation strength. 1.0 = exact source preservation (denoise mask 0), <1.0 = blend with DiT prediction (mask > 0)."}),
             ),
         }
 
@@ -464,7 +474,6 @@ class MiniMaxH3Timeline:
                    "tracks at any frame using ComfyUI core MiniMax H3 guides.")
 
     def apply(self, conditioning, latent, timeline_state, crop="disabled", **kwargs):
-        clamp_strength = float(kwargs.get("clamp_strength", 1.0))
         vae = kwargs.get("video vae")
         audio_vae = kwargs.get("audio vae")
         fps = int(kwargs.get("fps") or FPS)
@@ -512,8 +521,12 @@ class MiniMaxH3Timeline:
         audio_jobs = []
 
         def preserve(span_start, span_end, span_latent, strength, is_audio=False):
-            """Inject an encoded clip window into the clean composite + mask."""
-            strength = max(0.0, min(1.0, float(strength) * float(clamp_strength)))
+            """Inject an encoded clip window into the clean composite + mask.
+
+            Strength scales the denoise mask (1.0 = exact preservation, 0.0 =
+            region fully handed to the model). The injected latent stays full.
+            """
+            strength = max(0.0, min(1.0, float(strength)))
             mask_val = 1.0 - strength
             if is_audio:
                 span_end = min(int(audio_mask.shape[-1]), span_end)
@@ -527,7 +540,7 @@ class MiniMaxH3Timeline:
                 span_end = min(int(video_mask.shape[2]), span_end)
                 if span_end <= span_start:
                     return
-                clean_video[:, :, span_start:span_end] = span_latent
+                clean_video[:, :, span_start:span_end] = span_latent[:, :, :span_end - span_start]
                 video_mask[:, :, span_start:span_end] = torch.minimum(
                     video_mask[:, :, span_start:span_end],
                     torch.full_like(video_mask[:, :, span_start:span_end], mask_val))
@@ -574,7 +587,7 @@ class MiniMaxH3Timeline:
                     i1 = int(enc_latent.shape[2])
                 if i0 >= i1:
                     i0 = max(0, i1 - 1)
-                win_latent = enc_latent[:, :, i0:i1]
+                win_latent = _apply_strength(enc_latent[:, :, i0:i1], clip.get("strength", 1.0))
 
                 keyframes.append({
                     "resolved_frame_index": resolved_frame_index,
@@ -629,12 +642,8 @@ class MiniMaxH3Timeline:
                     last_f = content[-1:]
                     content = torch.cat([content, last_f.repeat(want - int(content.shape[0]), 1, 1, 1)], dim=0)
 
-                # One VAE encode per clip: grid-align the segment to the VAE's
-                # independent 17-frame chunk lattice so tokens map 1:1 onto the
-                # target latent. Lead/tail are frozen repeats; only the tokens
-                # intersecting the clip are clamped and reused as the
-                # cross-attention guide (a constant <=4 frame offset, invisible
-                # under soft guidance).
+                # VAE chunk lattice (17 frames) is independent of the timeline grid:
+                # grid-align so clip tokens map 1:1 onto the target latent.
                 seg_start, lead, seg_len = _grid_segment(resolved_frame_index, want, frame_count)
                 seg = _pad_clip(_resize(content, width, height, crop), lead, seg_len - want - lead)
                 enc_latent = vae.encode(seg)
@@ -643,7 +652,7 @@ class MiniMaxH3Timeline:
                     i1 = int(enc_latent.shape[2])
                 if i0 >= i1:
                     i0 = max(0, i1 - 1)
-                win_latent = enc_latent[:, :, i0:i1]
+                win_latent = _apply_strength(enc_latent[:, :, i0:i1], clip.get("strength", 1.0))
 
                 # Cross-attention conditioning keyframe (same latent as the injection)
                 kf = {
@@ -718,10 +727,11 @@ class MiniMaxH3Timeline:
             )
             if audio_lat is None:
                 continue
-            job["kf"]["audio_latent"] = audio_lat
+            strength = max(0.0, min(1.0, float(job["strength"])))
+            job["kf"]["audio_latent"] = _apply_strength(audio_lat, strength, seed=1, scaled=True)
             preserve(_frame_to_audio_latent_idx(job["frame"], fps=fps),
                      _frame_to_audio_latent_idx(job["frame"], fps=fps) + int(audio_lat.shape[-1]),
-                     audio_lat, job["strength"], is_audio=True)
+                     audio_lat, strength, is_audio=True)
 
         keyframes.sort(key=lambda k: k.get("resolved_frame_index", 0))
         if DEBUG_LOGS:

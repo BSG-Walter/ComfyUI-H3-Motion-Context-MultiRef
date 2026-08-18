@@ -333,13 +333,13 @@ assert (v9[:, :, 0] == 0.2).all()  # image -> encoder output for 1-frame seg
 assert (v9[:, :, 3:10] == 0.8).all()  # video clip content window
 print("Test 10 OK: clean composite carries encoded clip content")
 
-# 11. Partial strength -> fractional mask value (1 - strength), clean still injected
+# 11. Partial strength -> mask (1 - strength), clean at full, guide noise-augmented
 state11 = '{"clips":[{"id":1,"kind":"image","start":1,"strength":0.5}]}'
 class CustomVAE:
     def encode(self, pix):
         return torch.ones(1, 24, 1, 2, 2) * 10.0
 
-_, latent11 = run_full(
+cond11, latent11 = run_full(
     state11, AudioVAE(), vae=CustomVAE(),
     image_1=torch.ones(1, 32, 32, 3),
 )
@@ -347,8 +347,13 @@ mv11, _ = latent11["noise_mask"].unbind()
 v11, _ = latent11["samples"].unbind()
 assert (mv11[:, :, 0] == 0.5).all(), f"Expected 0.5 mask at token 0, got {mv11[:, :, 0].unique().tolist()}"
 assert (mv11[:, :, 1:] == 1.0).all()
-assert (v11[:, :, 0] == 10.0).all()
-print("Test 11 OK: fractional strength maps to mask value 1 - strength")
+assert (v11[:, :, 0] == 10.0).all(), f"Expected full clean 10.0 at token 0, got {v11[:, :, 0].unique().tolist()}"
+kf11 = cond11[0][1].get("minimax_keyframes", [])
+assert kf11, "expected a keyframe"
+g = kf11[0]["latent"]
+assert abs(g.mean().item() - 5.0) < 0.5, f"Expected guide mean ~5.0 (0.5*10 + 0.5*noise), got {g.mean().item()}"
+assert g.std().item() > 0.2, f"Expected guide to carry noise at strength 0.5, got std {g.std().item()}"
+print("Test 11 OK: partial strength noise-augments the keyframe guide, clean stays full")
 
 # 12. Off-grid clip lands on the VAE's 17-frame chunk lattice
 state12 = '{"clips":[{"id":1,"kind":"video","start":10,"len":22,"audio_link":false}]}'
@@ -384,5 +389,37 @@ cond13, latent13 = run_full(state13, AudioVAE(), vae=FakeVideoVAE(),
                             video_audio_1=empty_zero)
 assert all("audio_latent" not in kf for kf in cond13[0][1]["minimax_keyframes"])
 print("Test 13 OK: degenerate audio skipped without crashing the VAE")
+
+# 14. Per-clip audio strength: guide noise-augmented at content scale, mask follows
+class LoudAudioVAE:
+    def encode(self, wav):
+        return torch.linspace(1, 3, 12 * 2 * 32).view(1, 32, 2, 12)
+
+state14 = '{"clips":[{"id":1,"kind":"video","start":1,"len":22,"audio_link":true,"audio_strength":0.5}]}'
+cond14, latent14 = run_full(state14, LoudAudioVAE(), vae=FakeVideoVAE(),
+                            video_1=torch.rand(22, 32, 32, 3),
+                            video_audio_1=audio(1.0))
+kf14 = [kf for kf in cond14[0][1]["minimax_keyframes"] if kf.get("audio_latent") is not None]
+assert kf14, "expected an audio keyframe"
+g14 = kf14[0]["audio_latent"]
+assert abs(g14.mean().item() - 1.0) < 0.3, f"Expected audio guide mean ~1.0 (0.5*2 + content-scaled noise), got {g14.mean().item()}"
+assert 0.05 < g14.std().item() < 2.0, f"Expected content-scale degradation, got std {g14.std().item()}"
+_, ma14 = latent14["noise_mask"].unbind()
+rt = g14.shape[-1]
+assert (ma14[..., :rt] == 0.5).all(), f"Expected mask 0.5 over audio clip span, got {ma14[..., :rt].unique().tolist()}"
+assert (ma14[..., rt:] == 1.0).all()
+print("Test 14 OK: audio strength noise-augments the guide at content scale")
+
+# 15. Zero audio strength: guide = content-scaled noise, mask 1 (free regeneration)
+state15 = '{"clips":[{"id":1,"kind":"video","start":1,"len":22,"audio_link":true,"audio_strength":0.0}]}'
+cond15, latent15 = run_full(state15, LoudAudioVAE(), vae=FakeVideoVAE(),
+                            video_1=torch.rand(22, 32, 32, 3),
+                            video_audio_1=audio(1.0))
+kf15 = [kf for kf in cond15[0][1]["minimax_keyframes"] if kf.get("audio_latent") is not None]
+g15 = kf15[0]["audio_latent"]
+assert g15.std().item() > 0.01, "zero-strength audio guide should be content-scaled noise"
+_, ma15 = latent15["noise_mask"].unbind()
+assert (ma15[..., :g15.shape[-1]] == 1.0).all(), "mask 1 = region regenerates from the model"
+print("Test 15 OK: zero audio strength = content-scale noise guide + mask 1")
 
 print("ALL TESTS PASSED!")
