@@ -1,7 +1,9 @@
 """MiniMax H3 Timeline Editor.
 
 Visual video-editor timeline node for MiniMax H3, using native ComfyUI core
-minimax_keyframes guides.
+minimax_keyframes guides and native per-token denoise masks (commit
+ff6c8a8a, PR #15375): clip content is injected as clean latent + noise_mask
+into the sampler, replacing the old post-CFG hard-clamp hook.
 """
 
 import json
@@ -105,105 +107,6 @@ def _frame_to_audio_latent_idx(frame_idx, fps=FPS):
     return int(round(sec * 40.0))
 
 
-def _create_h3_clamp_hook(clamp_specs, clamp_strength=1.0):
-    """Create a non-invasive sampler_post_cfg_function callback for exact latent clamping."""
-    def post_cfg_callback(args):
-        denoised = args.get("denoised")
-        if denoised is None or not clamp_specs:
-            return denoised
-
-        is_nested = getattr(denoised, "is_nested", False)
-        model = args.get("model")
-        latent_shapes = args.get("model_options", {}).get("latent_shapes")
-        if latent_shapes is None and model is not None:
-            latent_shapes = getattr(model, "latent_shapes", None)
-            if latent_shapes is None and hasattr(model, "model"):
-                latent_shapes = getattr(model.model, "latent_shapes", None)
-
-        if is_nested:
-            streams = list(denoised.unbind())
-            v = streams[0]
-            a = streams[1] if len(streams) > 1 else None
-        elif latent_shapes is not None and len(latent_shapes) > 1:
-            unpacked = comfy.utils.unpack_latents(denoised, latent_shapes)
-            v = unpacked[0]
-            a = unpacked[1] if len(unpacked) > 1 else None
-        elif isinstance(denoised, (list, tuple)):
-            v = denoised[0]
-            a = denoised[1] if len(denoised) > 1 else None
-        else:
-            v = denoised
-            a = None
-
-        if DEBUG_LOGS:
-            print(f"[H3 Clamp Hook] Executing post-CFG step! denoised type={type(denoised)}, is_nested={is_nested}, v_shape={getattr(v, 'shape', None)}, a_shape={getattr(a, 'shape', None)}")
-
-        audio_scale = 1.0
-        if model is not None:
-            if hasattr(model, "audio_scale"):
-                try:
-                    audio_scale = float(model.audio_scale())
-                except Exception:
-                    pass
-            elif hasattr(model, "model") and hasattr(model.model, "audio_scale"):
-                try:
-                    audio_scale = float(model.model.audio_scale())
-                except Exception:
-                    pass
-
-        if v is not None and v.ndim == 5:
-            for spec in clamp_specs:
-                if spec["kind"] != "video":
-                    continue
-                s_idx = int(spec["start_idx"])
-                target = spec["latent"].to(device=v.device, dtype=v.dtype)
-                t_len = min(target.shape[2], v.shape[2] - s_idx)
-                if t_len <= 0 or s_idx < 0 or s_idx >= v.shape[2]:
-                    continue
-                tgt_slice = target[:, :, :t_len]
-                st = float(spec.get("strength", 1.0)) * float(clamp_strength)
-                if st >= 1.0:
-                    v[:, :, s_idx:s_idx + t_len] = tgt_slice
-                elif st > 0.0:
-                    v[:, :, s_idx:s_idx + t_len] = (1.0 - st) * v[:, :, s_idx:s_idx + t_len] + st * tgt_slice
-                if DEBUG_LOGS:
-                    print(f"[H3 Clamp Hook] Clamped VIDEO: s_idx={s_idx}, t_len={t_len}, strength={st}, target_norm={tgt_slice.norm().item():.3f}, v_norm={v[:, :, s_idx:s_idx + t_len].norm().item():.3f}")
-
-        if a is not None and a.ndim == 4:
-            for spec in clamp_specs:
-                if spec["kind"] != "audio":
-                    continue
-                s_idx = int(spec["start_idx"])
-                target = spec["latent"].to(device=a.device, dtype=a.dtype)
-                if audio_scale != 1.0:
-                    target = target * audio_scale
-                t_len = min(target.shape[-1], a.shape[-1] - s_idx)
-                if t_len <= 0 or s_idx < 0 or s_idx >= a.shape[-1]:
-                    continue
-                tgt_slice = target[..., :t_len]
-                st = float(spec.get("strength", 1.0)) * float(clamp_strength)
-                if st >= 1.0:
-                    a[..., s_idx:s_idx + t_len] = tgt_slice
-                elif st > 0.0:
-                    a[..., s_idx:s_idx + t_len] = (1.0 - st) * a[..., s_idx:s_idx + t_len] + st * tgt_slice
-                if DEBUG_LOGS:
-                    print(f"[H3 Clamp Hook] Clamped AUDIO: s_idx={s_idx}, t_len={t_len}, strength={st}, audio_scale={audio_scale}, target_norm={tgt_slice.norm().item():.3f}, a_norm={a[..., s_idx:s_idx + t_len].norm().item():.3f}")
-
-        if is_nested:
-            return comfy.nested_tensor.NestedTensor([v, a] if a is not None else [v])
-        elif latent_shapes is not None and len(latent_shapes) > 1:
-            repacked, _ = comfy.utils.pack_latents([v, a] if a is not None else [v])
-            return repacked
-        elif isinstance(denoised, tuple):
-            return tuple([v, a] if a is not None else [v])
-        elif isinstance(denoised, list):
-            return [v, a] if a is not None else [v]
-        else:
-            return v
-
-    return post_cfg_callback
-
-
 def _resize(image, width, height, crop="disabled"):
     """Resize image tensor [B, H, W, C] to target width/height."""
     if image is None:
@@ -274,18 +177,28 @@ def _encode_ref_audio(audio_vae, audio):
             waveform = waveform.repeat(1, 2, 1)
         waveform = waveform.movedim(1, -1)
 
+    if waveform.ndim < 3 or waveform.shape[-1] == 0 or waveform.shape[-2] == 0:
+        _LOG.warning("Timeline: skipping degenerate audio waveform shape=%s sr=%d", tuple(waveform.shape), sr)
+        return None, 0
+
     z = audio_vae.encode(waveform)  # Returns [1, 32, 2, T]
     return z, int(z.shape[-1])
 
 
 def _slice_audio(audio, start_sec=0.0, duration_sec=None):
-    """Slice an AUDIO dict [B, C, L] by start offset and optional duration."""
+    """Slice an AUDIO dict [B, C, L] by start offset and optional duration.
+
+    Returns None when the source has no usable audio (0 channels or 0 samples),
+    so callers can skip the clip instead of feeding a degenerate waveform to the VAE.
+    """
     if audio is None:
         return None
     waveform = audio.get("waveform")
     if waveform is None:
         return audio
     waveform = _normalize_audio_waveform(waveform)
+    if waveform.shape[-1] == 0 or waveform.shape[-2] == 0:
+        return None
     sr = int(audio.get("sample_rate", 32000))
     total_samples = int(waveform.shape[-1])
     start_sample = max(0, int(round(start_sec * sr)))
@@ -304,7 +217,12 @@ def _slice_audio(audio, start_sec=0.0, duration_sec=None):
 def _prepare_audio_latent(audio_vae, audio, src_sec, duration_sec, resolved_frame, audio_latent_t):
     """Slice, encode, and clamp audio latent to the timeline boundary."""
     audio_slice = _slice_audio(audio, src_sec, duration_sec)
+    if audio_slice is None:
+        _LOG.warning("Timeline: audio slice empty (src_sec=%.3f duration=%.3f frame=%d)", src_sec, duration_sec, resolved_frame)
+        return None
     audio_lat, audio_rt = _encode_ref_audio(audio_vae, audio_slice)
+    if audio_lat is None:
+        return None
     max_rt = max(1, math.floor(audio_latent_t - FRAME_RESCALE * resolved_frame))
     return audio_lat[..., :max_rt].clone() if audio_rt > max_rt else audio_lat
 
@@ -388,6 +306,9 @@ def _load_media_file(media, fps=None, start_sec=0.0, duration_sec=None, load_vid
 
             vtimebase = float(vstream.time_base) if vstream and vstream.time_base is not None else None
             vrate = float(vstream.average_rate) if vstream and vstream.average_rate else (float(fps) if fps else 24.0)
+            atimebase = (float(astream.time_base)
+                         if astream and astream.time_base is not None
+                         else (1.0 / float(astream.codec_context.sample_rate) if astream else None))
 
             if vstream is not None and start_sec > 0:
                 try:
@@ -430,7 +351,19 @@ def _load_media_file(media, fps=None, start_sec=0.0, duration_sec=None, load_vid
                             break
                 elif stype == "audio" and astream is not None:
                     n_channels = astream.channels
+                    sr = float(astream.codec_context.sample_rate)
                     for frame in packet.decode():
+                        # Time-filter like the video stream: the seek lands ~1s
+                        # early (tolerance pre-roll), so raw audio would start
+                        # at the wrong file position. Keep only frames that
+                        # overlap [start_sec, end_sec).
+                        if frame.pts is not None and atimebase:
+                            t_sec = float(frame.pts * atimebase)
+                            f_dur = frame.samples / sr
+                            if end_sec is not None and t_sec > end_sec + f_dur:
+                                continue
+                            if t_sec + f_dur < start_sec:
+                                continue
                         buf = torch.from_numpy(frame.to_ndarray())
                         if buf.shape[0] != n_channels:
                             buf = buf.view(-1, n_channels).t()
@@ -511,8 +444,6 @@ class MiniMaxH3Timeline:
                 ("video_audio_", ("AUDIO",)),
                 ("image_", ("IMAGE",)),
                 ("audio_", ("AUDIO",)),
-                model=("MODEL", {
-                    "tooltip": "MiniMax H3 MODEL. When connected, enables non-invasive hard clamping to guarantee exact video/audio preservation."}),
                 fps=("INT", {
                     "default": 24, "min": 1, "max": 240, "step": 1,
                     "tooltip": "Timeline frame rate for audio synchronization."}),
@@ -521,19 +452,18 @@ class MiniMaxH3Timeline:
                     "tooltip": "Timeline ruler length in frames (valid 5 + 17N frames: 5, 22, 39, 56, ...)."}),
                 clamp_strength=("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Hard clamping strength. 1.0 = exact source preservation, <1.0 = blend with DiT prediction."}),
+                    "tooltip": "Mask preservation strength. 1.0 = exact source preservation (denoise mask 0), <1.0 = blend with DiT prediction (mask > 0)."}),
             ),
         }
 
-    RETURN_TYPES = ("CONDITIONING", "MODEL",)
-    RETURN_NAMES = ("conditioning", "model",)
+    RETURN_TYPES = ("CONDITIONING", "LATENT",)
+    RETURN_NAMES = ("conditioning", "latent",)
     FUNCTION = "apply"
     CATEGORY = "conditioning/minimax"
     DESCRIPTION = ("Video-editor timeline: place still images, video clips and audio "
                    "tracks at any frame using ComfyUI core MiniMax H3 guides.")
 
     def apply(self, conditioning, latent, timeline_state, crop="disabled", **kwargs):
-        model = kwargs.get("model")
         clamp_strength = float(kwargs.get("clamp_strength", 1.0))
         vae = kwargs.get("video vae")
         audio_vae = kwargs.get("audio vae")
@@ -545,8 +475,6 @@ class MiniMaxH3Timeline:
             raise ValueError("Timeline: invalid timeline UI state JSON") from exc
 
         clips = state.get("clips") or []
-        if not clips:
-            return (conditioning, model)
 
         if len(clips) > self.MAX_CLIPS:
             raise ValueError("Timeline: clip count exceeds maximum of %d" % self.MAX_CLIPS)
@@ -576,8 +504,33 @@ class MiniMaxH3Timeline:
         audio_latent_t = int(audio.shape[-1]) if audio is not None else int(round(frame_count * FRAME_RESCALE))
 
         keyframes = list(conditioning[0][1].get("minimax_keyframes", []))
-        clamp_specs = []
+        clean_video = torch.zeros_like(video)
+        video_mask = torch.ones([1, 1] + list(video.shape[2:]), dtype=torch.float32, device=video.device)
+        clean_audio = torch.zeros_like(audio) if audio is not None else None
+        audio_mask = (torch.ones([1, 1] + list(audio.shape[2:]), dtype=torch.float32, device=audio.device)
+                      if audio is not None else None)
         audio_jobs = []
+
+        def preserve(span_start, span_end, span_latent, strength, is_audio=False):
+            """Inject an encoded clip window into the clean composite + mask."""
+            strength = max(0.0, min(1.0, float(strength) * float(clamp_strength)))
+            mask_val = 1.0 - strength
+            if is_audio:
+                span_end = min(int(audio_mask.shape[-1]), span_end)
+                if span_end <= span_start:
+                    return
+                clean_audio[..., span_start:span_end] = span_latent[..., :span_end - span_start]
+                audio_mask[..., span_start:span_end] = torch.minimum(
+                    audio_mask[..., span_start:span_end],
+                    torch.full_like(audio_mask[..., span_start:span_end], mask_val))
+            else:
+                span_end = min(int(video_mask.shape[2]), span_end)
+                if span_end <= span_start:
+                    return
+                clean_video[:, :, span_start:span_end] = span_latent
+                video_mask[:, :, span_start:span_end] = torch.minimum(
+                    video_mask[:, :, span_start:span_end],
+                    torch.full_like(video_mask[:, :, span_start:span_end], mask_val))
 
         for idx, clip in enumerate(clips, 1):
             slot = int(clip.get("id") or idx)
@@ -627,15 +580,8 @@ class MiniMaxH3Timeline:
                     "resolved_frame_index": resolved_frame_index,
                     "latent": win_latent,
                 })
-                i0c = i0 + 1 if kind == "video" and i1 - i0 > 1 else i0
-                if i0c >= i1:
-                    i0c = max(0, i1 - 1)
-                clamp_specs.append({
-                    "kind": "video",
-                    "start_idx": (seg_start // 17) * 5 + i0c,
-                    "latent": enc_latent[:, :, i0c:i1],
-                    "strength": float(clip.get("strength", 1.0)),
-                })
+                preserve((seg_start // 17) * 5 + i0, (seg_start // 17) * 5 + i1,
+                         enc_latent[:, :, i0:i1], clip.get("strength", 1.0))
 
             elif kind == "video":
                 frames = kwargs.get("video_%d" % slot)
@@ -699,19 +645,15 @@ class MiniMaxH3Timeline:
                     i0 = max(0, i1 - 1)
                 win_latent = enc_latent[:, :, i0:i1]
 
-                # Cross-attention conditioning keyframe (same latent as the clamp)
+                # Cross-attention conditioning keyframe (same latent as the injection)
                 kf = {
                     "resolved_frame_index": resolved_frame_index,
                     "latent": win_latent,
                 }
 
-                # ODE Hard Clamping spec
-                clamp_specs.append({
-                    "kind": "video",
-                    "start_idx": (seg_start // 17) * 5 + i0,
-                    "latent": win_latent,
-                    "strength": float(clip.get("strength", 1.0)),
-                })
+                # Native denoise-mask injection
+                preserve((seg_start // 17) * 5 + i0, (seg_start // 17) * 5 + i1,
+                         enc_latent[:, :, i0:i1], clip.get("strength", 1.0))
 
                 if audio_in is not None and not clip.get("audio_off") and clip.get("audio_link", True):
                     # Audio encoding deferred to the second pass (all video encodes first)
@@ -733,7 +675,7 @@ class MiniMaxH3Timeline:
                         a_len = min(int(clip.get("audio_len") or want), a_avail)
                         asrc = float(clip.get("audio_src_start") if clip.get("audio_src_start") is not None else src_start)
                         raw_audio = data["audio"] if fmedia and data is not None and data.get("audio") is not None else audio_in
-                        src_sec = asrc / float(fps) if fmedia and data is not None and data.get("audio") is not None else (asrc - src_start) / float(fps)
+                        src_sec = (asrc - src_start) / float(fps)
 
                         a_kf = {"resolved_frame_index": a_resolved}
                         keyframes.append(a_kf)
@@ -774,17 +716,18 @@ class MiniMaxH3Timeline:
             audio_lat = _prepare_audio_latent(
                 audio_vae, job["audio"], job["src_sec"], job["duration"], job["frame"], audio_latent_t
             )
+            if audio_lat is None:
+                continue
             job["kf"]["audio_latent"] = audio_lat
-            clamp_specs.append({
-                "kind": "audio",
-                "start_idx": _frame_to_audio_latent_idx(job["frame"], fps=fps),
-                "latent": audio_lat,
-                "strength": job["strength"],
-            })
+            preserve(_frame_to_audio_latent_idx(job["frame"], fps=fps),
+                     _frame_to_audio_latent_idx(job["frame"], fps=fps) + int(audio_lat.shape[-1]),
+                     audio_lat, job["strength"], is_audio=True)
 
         keyframes.sort(key=lambda k: k.get("resolved_frame_index", 0))
         if DEBUG_LOGS:
-            print(f"[H3 Timeline] Compiled {len(keyframes)} keyframes, {len(clamp_specs)} clamp specs:")
+            masked_v = int((video_mask < 1.0).sum().item())
+            masked_a = int((audio_mask < 1.0).sum().item()) if audio_mask is not None else 0
+            print(f"[H3 Timeline] Compiled {len(keyframes)} keyframes, mask coverage: {masked_v} video tokens, {masked_a} audio tokens:")
             for idx, kf in enumerate(keyframes):
                 has_v = "latent" in kf
                 has_a = "audio_latent" in kf
@@ -792,13 +735,15 @@ class MiniMaxH3Timeline:
                 print(f"  - Keyframe #{idx}: frame_idx={rf}, video={has_v}, audio={has_a}")
 
         out_cond = node_helpers.conditioning_set_values(conditioning, {"minimax_keyframes": keyframes})
-        out_model = model
-        if model is not None and clamp_specs:
-            out_model = model.clone()
-            hook = _create_h3_clamp_hook(clamp_specs, clamp_strength=clamp_strength)
-            out_model.set_model_sampler_post_cfg_function(hook)
+        if audio is not None:
+            samples = comfy.nested_tensor.NestedTensor((clean_video, clean_audio))
+            noise_mask = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
+        else:
+            samples = clean_video
+            noise_mask = video_mask
+        out_latent = {"samples": samples, "noise_mask": noise_mask}
 
-        return (out_cond, out_model)
+        return (out_cond, out_latent)
 
 
 NODE_CLASS_MAPPINGS = {

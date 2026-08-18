@@ -273,6 +273,10 @@ try:
         assert data["frames"] is not None
         assert data["frames"].shape[0] >= 22
         assert data["audio"] is not None
+        aw = data["audio"]["waveform"]
+        # audio window is time-filtered: ~0.92s of samples (+straddling AAC
+        # frames), not the whole file (10s) nor the ~1s seek pre-roll extra
+        assert aw.shape[-1] > 30000 and aw.shape[-1] < 60000, aw.shape
 
         # Test in node timeline with split clips (left + right split)
         state8 = '{"clips":[' \
@@ -290,70 +294,63 @@ finally:
     if os.path.exists(mp4_path):
         os.remove(mp4_path)
 
-# 9. Hard clamping hook registration on ModelPatcher
-import comfy.model_patcher
+# 9. Native inpaint latent: nested samples + noise_mask
+class EncVAE:
+    def encode(self, pix):
+        n = pix.shape[0]
+        steps = 1 if n == 1 else (n - 5) // 17 * 5 + 2
+        return torch.full((1, 24, steps, 2, 2), float(pix[0, 0, 0, 0].item()))
 
-class DummyInnerModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.param = torch.nn.Parameter(torch.zeros(1))
-
-dummy_patcher = comfy.model_patcher.ModelPatcher(DummyInnerModel(), torch.device("cpu"), torch.device("cpu"))
 state9 = '{"clips":[' \
          '{"id":1,"kind":"image","start":1,"len":1},' \
          '{"id":2,"kind":"video","start":10,"len":22,"audio_link":true}]}'
-cond9, patched_model = run_full(
-    state9, AudioVAE(), vae=FakeVideoVAE(),
-    model=dummy_patcher,
-    image_1=torch.ones(1, 32, 32, 3) * 5.0,
-    video_2=torch.ones(22, 32, 32, 3) * 10.0,
+cond9, latent9 = run_full(
+    state9, AudioVAE(), vae=EncVAE(),
+    image_1=torch.ones(1, 32, 32, 3) * 0.2,
+    video_2=torch.ones(22, 32, 32, 3) * 0.8,
     video_audio_2=audio(2.0),
 )
-assert patched_model is not None
-assert "sampler_post_cfg_function" in patched_model.model_options
-assert len(patched_model.model_options["sampler_post_cfg_function"]) == 1
-print("Test 9 OK: ModelPatcher hard-clamping hook registered successfully")
+assert latent9["samples"].is_nested
+v9, a9 = latent9["samples"].unbind()
+mv9, ma9 = latent9["noise_mask"].unbind()
+assert v9.shape == (1, 24, 25, 2, 2)
+assert a9.shape == (1, 32, 2, 40)
+assert mv9.shape == (1, 1, 25, 2, 2)
+assert ma9.shape == (1, 1, 2, 40)
+# image at F=0 -> token 0 masked (strongest preservation = 0.0)
+assert (mv9[:, :, 0] == 0.0).all()
+# video at F=9, want=22: tokens intersecting [9,31) are t3..t9 -> absolute 3..10
+assert (mv9[:, :, 3:10] == 0.0).all()
+assert (mv9[:, :, 10:] == 1.0).all()
+# linked audio: start token = round(9/24*40)=15, 12 latent frames -> 15..27
+assert (ma9[..., 15:27] == 0.0).all()
+assert (ma9[..., 27:] == 1.0).all()
+print("Test 9 OK: native nested inpaint latent with noise masks")
 
-# 10. Exact latent hard-clamping execution test
-hook_fn = patched_model.model_options["sampler_post_cfg_function"][0]
+# 10. Clean composite carries the encoded clip content at the right tokens
+assert v9.shape == (1, 24, 25, 2, 2)
+assert (v9[:, :, 0] == 0.2).all()  # image -> encoder output for 1-frame seg
+assert (v9[:, :, 3:10] == 0.8).all()  # video clip content window
+print("Test 10 OK: clean composite carries encoded clip content")
 
-# Simulate 25 video latent steps [1, 24, 25, 2, 2] and 40 audio latent steps [1, 32, 2, 40]
-fake_denoised_v = torch.zeros(1, 24, 25, 2, 2)
-fake_denoised_a = torch.zeros(1, 32, 2, 40)
-
-import comfy.nested_tensor
-denoised_in = comfy.nested_tensor.NestedTensor([fake_denoised_v.clone(), fake_denoised_a.clone()])
-hook_args = {"denoised": denoised_in, "model_options": {}}
-clamped_out = hook_fn(hook_args)
-
-assert clamped_out.is_nested
-clamped_v, clamped_a = clamped_out.unbind()
-
-assert clamped_v.shape == fake_denoised_v.shape
-assert clamped_a.shape == fake_denoised_a.shape
-print("Test 10 OK: exact video and audio hard clamping executed on NestedTensor")
-
-# 11. Partial strength blend check
+# 11. Partial strength -> fractional mask value (1 - strength), clean still injected
 state11 = '{"clips":[{"id":1,"kind":"image","start":1,"strength":0.5}]}'
 class CustomVAE:
     def encode(self, pix):
         return torch.ones(1, 24, 1, 2, 2) * 10.0
 
-_, patched_model11 = run_full(
+_, latent11 = run_full(
     state11, AudioVAE(), vae=CustomVAE(),
-    model=dummy_patcher,
     image_1=torch.ones(1, 32, 32, 3),
 )
-hook_fn11 = patched_model11.model_options["sampler_post_cfg_function"][0]
-v_in = torch.zeros(1, 24, 5, 2, 2)
-res11 = hook_fn11({"denoised": v_in.clone(), "model_options": {}})
-# Token 0 should be 50% blend of 0.0 and 10.0 -> 5.0
-assert torch.isclose(res11[:, :, 0], torch.tensor(5.0)).all()
-# Token 1 should remain untouched 0.0
-assert (res11[:, :, 1:] == 0.0).all()
-print("Test 11 OK: partial clamp strength blending")
+mv11, _ = latent11["noise_mask"].unbind()
+v11, _ = latent11["samples"].unbind()
+assert (mv11[:, :, 0] == 0.5).all(), f"Expected 0.5 mask at token 0, got {mv11[:, :, 0].unique().tolist()}"
+assert (mv11[:, :, 1:] == 1.0).all()
+assert (v11[:, :, 0] == 10.0).all()
+print("Test 11 OK: fractional strength maps to mask value 1 - strength")
 
-# 12. Off-grid clip clamping lands on the VAE's 17-frame chunk lattice
+# 12. Off-grid clip lands on the VAE's 17-frame chunk lattice
 state12 = '{"clips":[{"id":1,"kind":"video","start":10,"len":22,"audio_link":false}]}'
 class GridVAE:
     def encode(self, pix):
@@ -361,22 +358,31 @@ class GridVAE:
         steps = 1 if n == 1 else (n - 5) // 17 * 5 + 2
         return torch.full((1, 24, steps, 2, 2), float(pix.shape[0]))
 
-_, patched12 = run_full(state12, AudioVAE(), vae=GridVAE(), model=dummy_patcher,
+_, latent12 = run_full(state12, AudioVAE(), vae=GridVAE(),
                         video_1=torch.rand(22, 32, 32, 3))
-hook12 = patched12.model_options["sampler_post_cfg_function"][0]
-v12 = torch.zeros(1, 24, 25, 2, 2)
-res12 = hook12({"denoised": v12.clone(), "model_options": {}})
+mv12, _ = latent12["noise_mask"].unbind()
+v12, _ = latent12["samples"].unbind()
 # Clip at F=9, want=22: seg_start=0, lead=9, span=31 -> seg_len=39 (next 17k+5).
 # Token grid (1,4,4,4,4): t3=[9,13) t4=[13,17) t5=[17,18) t6=[18,22) t7=[22,26)
 # t8=[26,30) t9=[30,34). Tokens intersecting content [9,31) = t3..t9 (7 tokens).
-assert res12.shape == v12.shape
-clamped = res12[:, :, 3:10]
-assert (clamped == 39.0).all(), f"Expected 7 clamped tokens with value 39.0, got {clamped.unique().tolist()}"
-assert (res12[:, :, :3] == 0.0).all() and (res12[:, :, 10:] == 0.0).all()
-print("Test 12 OK: off-grid clip clamps onto the 17-frame chunk lattice")
+assert (mv12[:, :, 3:10] == 0.0).all(), "Expected 7 masked tokens with value 0.0"
+assert (mv12[:, :, :3] == 1.0).all() and (mv12[:, :, 10:] == 1.0).all()
+assert (v12[:, :, 3:10] == 39.0).all(), f"Expected injected clean 39.0 in tokens 3..10, got {v12[:, :, 3:10].unique().tolist()}"
+print("Test 12 OK: off-grid clip masks onto the 17-frame chunk lattice")
 
-dummy_patcher.detach()
-patched_model.detach()
-patched_model11.detach()
+# 13. Degenerate audio (0 channels / 0 samples) is skipped, never crashes the VAE
+empty_mono = {"waveform": torch.zeros(1, 0, 1), "sample_rate": 16000}
+empty_zero = {"waveform": torch.zeros(0, 1), "sample_rate": 16000}
+assert n._slice_audio(empty_mono, 0.0, 1.0) is None
+assert n._slice_audio(empty_zero, 0.0, 1.0) is None
+assert n._slice_audio({"waveform": torch.zeros(1, 1, 0), "sample_rate": 16000}, 0.0, 1.0) is None
+assert n._prepare_audio_latent(AudioVAE(), empty_zero, 0.0, 1.0, 0, 40) is None
+# linked video clip with degenerate port audio: run must not raise
+state13 = '{"clips":[{"id":1,"kind":"video","start":1,"len":22,"audio_link":true}]}'
+cond13, latent13 = run_full(state13, AudioVAE(), vae=FakeVideoVAE(),
+                            video_1=torch.rand(22, 32, 32, 3),
+                            video_audio_1=empty_zero)
+assert all("audio_latent" not in kf for kf in cond13[0][1]["minimax_keyframes"])
+print("Test 13 OK: degenerate audio skipped without crashing the VAE")
 
 print("ALL TESTS PASSED!")
