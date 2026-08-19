@@ -1,4 +1,4 @@
-"""H3 Motion Context - Timeline.
+"""H3 BSG Timeline Editor.
 
 Visual video-editor timeline for MiniMax H3, powered natively by ComfyUI core
 guides. No monkey-patches, fully compatible with all custom nodes.

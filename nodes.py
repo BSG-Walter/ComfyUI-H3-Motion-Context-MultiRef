@@ -1,4 +1,4 @@
-"""MiniMax H3 Timeline Editor.
+"""MiniMax H3 BSG Timeline Editor.
 
 Visual video-editor timeline node for MiniMax H3, using native ComfyUI core
 minimax_keyframes guides and native per-token denoise masks (commit
@@ -761,5 +761,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MiniMaxH3Timeline": "H3 Timeline Editor",
+    "MiniMaxH3Timeline": "H3 BSG Timeline Editor",
 }

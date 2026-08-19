@@ -1,100 +1,232 @@
-# H3 Motion Context — Timeline
+# ComfyUI H3 BSG Timeline Editor
 
-H3 Motion Context Timeline for MiniMax H3, with a full **video-editor timeline** widget that lets you place still images, video clips and audio clips at any frame position on a visual canvas.
+A standalone, non-linear video-editor timeline node for **MiniMax H3** (Hailuo-01 / H3) in ComfyUI.
 
-Powered natively by ComfyUI core MiniMax H3 guides (`minimax_keyframes`) without any monkey-patches or runtime layout overrides. Fully compatible with other custom nodes.
+The **H3 BSG Timeline Editor** (`MiniMaxH3Timeline`) brings a full multi-track visual timeline canvas directly into your ComfyUI workflow. Arrange still images, video clips, and audio tracks along a frame-accurate ruler, trim and split clips, edit retention strength envelopes, preview video and audio in real time, and pass exact inpainting guidance straight to standard `KSampler`.
 
-## What this node provides
+Powered **100% natively** by ComfyUI core MiniMax H3 keyframe guides (`minimax_keyframes`) and native per-token denoise masks (`noise_mask` on `NestedTensor`). No monkey-patches, no runtime layout overrides, and no custom sampler hacks.
 
-### H3 Timeline Editor
-The **H3 Timeline Editor** node (`MiniMaxH3Timeline`) gives you a visual canvas where you arrange everything on a single timeline.
+---
 
-- **Canvas timeline** (840px wide) with two lanes (video above, audio below), a frame ruler, zoom controls and a playhead.
-- **Undo & Redo buttons** — dedicated `↶ Undo` and `↷ Redo` toolbar buttons to safely step backward and forward through edits (clip moves, trims, deletions, paste, envelope tweaks) without interfering with ComfyUI's global graph undo.
-- **Multi-selection & Group drag** — select multiple clips with `Ctrl`/`Cmd` + click and drag them together across the timeline while preserving their relative spacing.
-- **Copy & Paste** — copy and paste selected clips using standard shortcuts (`Ctrl+C` / `Ctrl+V`) or the context menu. Pasting scans occupied lanes and automatically places clips in the next available free space without overlapping.
-- **Context menus** — right-click on any clip or empty space in the video/audio lanes to quickly insert media (`+ Insert Image`, `+ Insert Video`, `+ Insert Audio`), paste clips, replace media, edit envelope points, or delete.
-- **Drag-and-drop clips** — still images, video clips and audio clips can be placed at any frame position. Clips can extend past the ruler end-line (a visual delimiter with snapping, like the playhead) and dim automatically when they do.
-- **Per-clip source trim** — drag the left/right edges of a clip to set its length and source start. Linked video/audio drags as one unit; unlinked audio can be moved independently.
-- **Snapping** — clips snap to each other, to the playhead and to the end-line. Toggle with the magnet button.
-- **Zoom slider** — log-scale zoom from the ruler overview down to per-frame detail, plus the standard +/− buttons.
-- **Playable preview** — the playhead plays through the timeline, syncing video thumbnails; playback stops at the end-line.
-- **File-backed clips** — upload videos/images/audio directly into the timeline and they decode on the node (video thumbnails + audio waveform). No need to wire separate LoadImage / VHS nodes when you just want to drop a file.
-- **Out-of-range tolerance** — clips placed beyond the latent's frame count are clamped-and-warned by the backend (parked at the last frame), never fatal. Audio clips parked or trimmed log a warning instead of raising.
-- **Dual Flow Matching Control (Soft Attention + ODE Hard Clamping)** — connects directly to `MODEL` and `CONDITIONING`. Combines native `minimax_keyframes` cross-attention conditioning with non-invasive ODE step hard clamping via `set_model_sampler_post_cfg_function` to enforce exact frame and audio slice placement without drifting.
+## Key Features
 
-## Install
+- **Full NLE Timeline Canvas**: 840px interactive multi-track canvas with dedicated Video/Image (top) and Audio (bottom) tracks, customizable frame ruler, zoom controls, and an interactive playhead.
+- **Native Dual-Guidance Control**:
+  - **Cross-Attention Conditioning**: Attaches core `minimax_keyframes` guidance to the prompt conditioning.
+  - **Per-Token Denoise-Mask Inpainting**: Encodes clips into a clean composite latent with an exact per-token `noise_mask`. When sampled in standard `KSampler` with `denoise: 1.0`, masked regions (strength 1.0) are preserved with 100% fidelity while unmasked frames are smoothly synthesized.
+- **Direct Drag & Drop / File Uploads**: Upload images (PNG, JPG, WebP, GIF), videos (MP4, MOV, WebM, MKV, AVI), or audio files (WAV, MP3, FLAC, M4A, OGG) straight into the node. They decode directly in the browser with video thumbnail scrubbing and 128-bucket audio waveforms.
+- **Linked & Unlinked Audio**: Video clips automatically load their embedded audio track. Keep audio linked to move and trim it synchronously with the video, or unlink (`🔗`) to offset, stretch, or independently edit/delete the audio track.
+- **Retention Strength & Envelopes**: Control how strongly the model adheres to clip content (0.0 to 1.0). Drag the strength bar or double-click to place keyframe envelope points for smooth cross-fades and transitions. Video clip envelopes visualize stepped boundaries matching the model's 17-frame token grid.
+- **Clip Slicing & Precision Trimming**:
+  - Drag the left/right edges of clips to trim their length and adjust the source playback window (`src_start`).
+  - Move the playhead and hit `✂ Split` (or press `S`) to slice a clip into two independent segments.
+- **Multi-Selection & Clipboard**: Select multiple clips with `Ctrl`/`Cmd` + click, drag groups together while preserving relative spacing, and copy/paste (`Ctrl+C` / `Ctrl+V`) into the next available gap.
+- **Dedicated History (Undo / Redo)**: Step backward (`↶ Undo`) and forward (`↷ Redo`) through clip manipulations without conflicting with ComfyUI's global graph undo.
+- **Real-Time Playback & Scrubbing**: Scrub across the ruler or press `Space` / `▶ Play` to play synchronized video frames and audio in real time via WebAudio.
+- **Smart Magnet Snapping (`🧲`)**: Snaps clip edges to adjacent clips, to the playhead, and to the MiniMax H3 17-frame VAE grid lines.
+- **State Export / Import**: Easily save timeline configurations to JSON files or load existing project timelines.
 
-Clone the repository into your ComfyUI `custom_nodes` directory:
+---
+
+## Installation
+
+Clone this repository into your ComfyUI `custom_nodes` directory:
 
 ```bash
 cd /path/to/ComfyUI/custom_nodes
 git clone https://github.com/BSG-Walter/ComfyUI-H3-Motion-Context-Timeline.git
 ```
 
-Then restart ComfyUI and hard-refresh the browser.
+Make sure the following Python dependencies are installed in your ComfyUI environment (standard in most ComfyUI setups):
 
-## H3 Timeline Editor
-
-The `H3 Timeline Editor` node gives you one ordered list of clips, each pinned at a 1-based start frame on a visual canvas:
-
-```text
-image  a still, pinned at its frame (an H3 custom keyframe)
-video  a full clip; every latent step is pinned at its own frame
-audio  a window of sound pinned on the audio track
+```bash
+pip install av torch torchvision torchaudio pillow numpy
 ```
 
-A video's audio is linked by default: it follows the clip's position and length. Unlink to move or trim it independently (`audio_start` / `audio_len` / `audio_align`). Audio windows are cut from the head (`head`) or the tail (`tail`) of their source.
+Restart ComfyUI and hard-refresh your browser (`Ctrl+F5` or `Cmd+Shift+R`).
 
-**fps** and **total_frames** are widgets you can edit by hand or convert to input slots (right-click → Convert to input) and drive from other nodes. The timeline ruler length follows `total_frames`; the generated frame count still comes from the wired latent (clips past the ruler end-line are dimmed on the canvas and clamped-and-warned at the backend).
+---
 
-## Recommended Motion Context settings
-
-For the tested continuation setup:
+## Node Anatomy
 
 ```text
-context_length:       22
-encode_mode:          video
-anchor_mode:          head
-audio_mode:           timeline
-audio_context_length: 22
+               +-------------------------------------------+
+               |            H3 BSG Timeline Editor             |
+               +-------------------------------------------+
+[CONDITIONING] | conditioning                 conditioning | [CONDITIONING]
+         [VAE] | video vae                          latent | [LATENT]
+         [VAE] | audio vae                                 |
+      [LATENT] | latent                                    |
+      [STRING] | timeline_state (UI)                       |
+     [COMBOBOX]| crop (disabled / center)                  |
+        [INT]  | fps (default: 24)                         |
+        [INT]  | total_frames (default: 243)               |
+               +-------------------------------------------+
+               |   [Visual BSG Timeline Editor Canvas 840px]   |
+               +-------------------------------------------+
 ```
 
-Use the Trim node on the duplicated head before stitching.
+### Inputs
 
-## Ref2VA + timeline audio
+| Input | Type | Description |
+| :--- | :--- | :--- |
+| **`conditioning`** *(required)* | `CONDITIONING` | Positive conditioning / prompt from `CLIPTextEncode`. Timeline keyframe guides are attached to this stream. |
+| **`video vae`** *(required)* | `VAE` | MiniMax H3 Video VAE used to encode still images and video clips into the 24-channel latent space. |
+| **`audio vae`** *(required)* | `VAE` | MiniMax H3 Audio VAE used to encode audio tracks into the 32-channel stereo latent space. |
+| **`latent`** *(required)* | `LATENT` | Empty or initial MiniMax H3 AV latent (e.g. from `EmptyMiniMaxH3LatentAV`). Sets the generation resolution (width/height) and duration. |
+| **`crop`** | `COMBO` | Scaling behavior when source images/videos do not match target latent aspect ratio: `disabled` (stretch) or `center` (crop to center). |
+| **`fps`** *(optional)* | `INT` | Frame rate for video playback and audio synchronization (default: `24`, range: `1 - 240`). |
+| **`total_frames`** *(optional)* | `INT` | Ruler length in frames (default: `243`, step: `17`). Automatically snaps to valid MiniMax H3 lengths (`5 + 17k`: 5, 22, 39, 56, 73, 243...). |
+| **`image_N`, `video_N`, `audio_N`** | `DYNAMIC` | Optional socket inputs to wire image/video/audio tensors from other ComfyUI nodes instead of uploading files. |
 
-A graph may contain ordinary Ref2VA refs before the Motion Context timeline-audio ref. The Motion Context audio ref is appended after the existing refs.
+### Outputs
 
-Example conceptual order:
+| Output | Type | Description |
+| :--- | :--- | :--- |
+| **`conditioning`** | `CONDITIONING` | Conditioning payload containing the compiled `minimax_keyframes` list. |
+| **`latent`** | `LATENT` | A `NestedTensor` containing the composite clean video/audio latents (`samples`) and per-token denoise masks (`noise_mask`). Connect directly to `KSampler`. |
+
+---
+
+## How It Works: Flow Matching & Inpainting
+
+MiniMax H3 uses a temporal DiT architecture where:
+- **17 pixel frames** correspond to **5 latent tokens** on a `(1, 4, 4, 4, 4)` temporal grid.
+- Video latents are 24-channel tensors (`[B, 24, T_v, H/16, W/16]`).
+- Audio latents are 32-channel tensors (`[B, 32, 2, T_a]`).
+
+### Denoise-Mask Mechanism
+When you place a clip on the timeline:
+1. **VAE Encoding**: The clip content is aligned to the 17-frame chunk boundary and encoded through the video/audio VAE.
+2. **Latent Composition**: The encoded tokens are placed into `clean_video` and `clean_audio` tensors.
+3. **Noise Mask Construction**: A per-token `noise_mask` is generated where:
+   $$\text{mask\_value} = 1.0 - \text{strength}$$
+   - **`strength = 1.0` $\rightarrow$ `mask = 0.0`**: The region is pinned clean. The sampler preserves this content identically.
+   - **`strength = 0.0` $\rightarrow$ `mask = 1.0`**: The region is completely open for pure text-to-video generation.
+   - **`0.0 < strength < 1.0`**: The region receives soft guidance with intermediate noise scheduling.
+4. **Sampling**: When connected to `KSampler` with `denoise: 1.0`, the sampler uses the native inpaint pipeline to seamlessly merge generated motion around the locked clip frames.
+
+---
+
+## Using the BSG Timeline Editor
+
+### 1. Adding Media
+
+You can populate the timeline using two methods:
+
+- **Direct File Upload (Recommended)**:
+  - Click the **`+ image`**, **`+ video`**, or **`+ audio`** buttons beneath the timeline.
+  - Or **right-click** any empty space on the canvas and choose `+ Insert Image`, `+ Insert Video`, or `+ Insert Audio`.
+  - Pick a file from your computer. The file is uploaded to ComfyUI's input directory and immediately decoded on the canvas.
+- **Node Input Sockets**:
+  - Connect standard `IMAGE` or `AUDIO` nodes to the dynamic `image_N`, `video_N`, `video_audio_N`, or `audio_N` sockets.
+
+### 2. Supported Clip Types
+
+- **Still Images (`image`)**: Stills (PNG, JPG, WebP) or animated GIFs/WebP. Stills default to a length of 22 frames and can be stretched or trimmed to any duration.
+- **Video Clips (`video`)**: Video files (MP4, MOV, WebM, etc.). Automatically loads video frames and associated audio.
+- **Audio Clips (`audio`)**: Audio files (WAV, MP3, FLAC, AAC, etc.). Visualized with a detailed waveform on the audio lane.
+
+### 3. Timeline Tracks & Lanes
+
+- **Top Lane (Video Track)**: Houses still images and video clips.
+- **Bottom Lane (Audio Track)**: Houses standalone audio clips and unlinked audio tracks from video clips.
+
+### 4. Clip Editing & Manipulation
+
+- **Move**: Click and drag any clip horizontally.
+- **Trim Left / Right**: Grab the left or right edge of a clip and drag:
+  - Dragging the **right edge** adjusts the duration (`len`).
+  - Dragging the **left edge** changes the starting frame while offsetting the internal source window (`src_start`), keeping the cut point intuitive.
+- **Link / Unlink Audio (`🔗`)**:
+  - By default, a video's audio moves and trims synchronously with the video block.
+  - Click the **`🔗`** link icon or use the context menu to **unlink audio**.
+  - Once unlinked, the audio band appears as a separate block on the audio lane, allowing you to offset sound timing, trim audio independently, or delete the audio track entirely.
+- **Split Clip (`✂ Split` / `S`)**:
+  - Position the playhead over a clip and click `✂ Split` on the toolbar or press `S`.
+  - The clip splits into two independent clips with preserved source frame offsets (`src_start`).
+
+### 5. Strength & Envelopes
+
+Every clip features an adjustable green retention curve:
+- **Flat Strength**: Hover over the horizontal green line inside a clip (cursor changes to `ns-resize`) and drag up/down to adjust strength between `0.00` and `1.00`.
+- **Envelope Keyframes**:
+  - **Double-click** on the green line to add a keyframe point.
+  - Drag points up or down to create fades, ramps, and custom blends.
+  - **Right-click** an envelope point to remove it.
+  - Video envelopes automatically snap to token boundaries for exact DiT synchronization.
+
+### 6. Playback & Scrubbing
+
+- **Scrubbing**: Click or drag across the top ruler to move the red playhead. Video clips automatically seek to preview the exact frame under the playhead.
+- **Real-Time Playback**: Click **`▶ Play`** on the toolbar or press **`Space`** to preview your video edits and hear synchronized audio.
+- **Loop & Bounds**: Playback automatically respects the total timeline duration (`total_frames`).
+
+### 7. Zoom, Pan & Ruler Controls
+
+- **Zoom Slider & Buttons**: Use the log-scale slider or `+` / `−` buttons to zoom from full project overview down to individual frame detail.
+- **Panning Scrollbar**: When zoomed in, drag the horizontal scrollbar located directly beneath the timeline canvas.
+- **Unit Toggle (`F` / `S`)**: Click the unit button on the toolbar to switch the ruler display between **Frames** (`frame 1`, `frame 22`...) and **Seconds** (`0.0s`, `1.5s`...).
+
+---
+
+## Keyboard Shortcuts & Toolbar Reference
+
+| Shortcut / Button | Action |
+| :--- | :--- |
+| **`Space`** / `▶ Play` / `⏹ Stop` | Toggle timeline preview playback (video frames + audio). |
+| **`S`** / `✂ Split` | Split the clip under the playhead into two segments. |
+| **`Ctrl + C`** / `Cmd + C` | Copy selected clip(s). |
+| **`Ctrl + V`** / `Cmd + V` | Paste copied clip(s) into the next available gap. |
+| **`Delete`** / `Backspace` | Delete selected clip(s). |
+| **`Ctrl + Click`** / `Cmd + Click` | Multi-select clips for group movement or deletion. |
+| **`↶ Undo`** | Undo the last timeline action (move, trim, split, envelope edit). |
+| **`↷ Redo`** | Redo the previously undone action. |
+| **`🧲 Snap`** | Toggle magnet snapping on/off. |
+| **`F` / `S`** | Toggle ruler units between Frames and Seconds. |
+| **`+` / `−`** | Zoom in / zoom out horizontally. |
+| **`🗑 Clear`** | Clear all clips from the timeline canvas. |
+| **`⤓ Export`** | Export current timeline layout to a JSON file. |
+| **`⤒ Import`** | Import a timeline layout from a JSON file. |
+| **Right-Click (Clip)** | Open context menu (Copy, Delete, Replace Media, Delete Audio). |
+| **Right-Click (Empty Lane)** | Open insertion menu (Insert Image, Insert Video, Insert Audio, Paste). |
+
+---
+
+## Standard Workflow Integration
+
+Below is the recommended standard setup for MiniMax H3 video generation with the BSG Timeline Editor:
 
 ```text
-Ref2VA image ref
-Ref2VA image ref
-(optional other ordinary refs)
-Motion Context timeline-audio ref
+[ CLIPTextEncode (Prompt) ] --------> conditioning ──> [ H3 BSG Timeline Editor ] ──> conditioning ──> [ KSampler ]
+[ EmptyMiniMaxH3LatentAV ] ---------> latent ─────���──> [                    ] ──> latent ────────> (denoise: 1.0)
+[ VAELoader (H3 Video VAE) ] -------> video vae ─────> [                    ]                          |
+[ VAELoader (H3 Audio VAE) ] -------> audio vae ─────> [                    ]                          v
+                                                                                                [ VAEDecode ]
+                                                                                                       |
+                                                                                                       v
+                                                                                           [ VHS_VideoCombine / Save ]
 ```
 
-## Example workflows
+### Crucial Setting: `denoise = 1.0` in KSampler
+Always set **`denoise: 1.0`** on your `KSampler`. 
+Because the `H3 BSG Timeline Editor` produces exact per-token `noise_mask` maps, the sampler uses full denoise to synthesize unmasked areas while the native inpainting engine automatically protects and locks your timeline clips according to their retention strength.
 
-`example_workflows/Simple Motion Context - No Reference Images.json` is a clean 6-clip Motion Context chain with a T2V start, one active continuation, four optional sequential continuations, 22-frame visual context, and 22-frame timeline audio context from the preceding joint AV latent.
+---
 
-`example_workflows/Advanced Motion Context - Reference Images.json` adds Ref2VA character references with 39-frame visual and 39-frame timeline-audio Motion Context and demonstrates the MultiRef compatibility patch.
+## Troubleshooting & Best Practices
 
-`example_workflows/Music Video Motion Context - Reference Images + Song Driven Lipsync.json` is a 15-slot Ref2VA music-video/lip-sync chain using 22-frame visual-only Motion Context plus matching original-song slices for each clip.
+- **Frame Count Snapping (`total_frames`)**:
+  MiniMax H3 VAE requires video lengths to follow the formula $5 + 17k$ (e.g. 5, 22, 39, 56, 73, 90, 107, 124, 141, 158, 175, 192, 209, 226, 243...). The `total_frames` widget automatically snaps to these valid increments.
+- **Audio Sample Rates**:
+  The timeline automatically resamples uploaded audio waveforms to match the Audio VAE's native sample rate (typically 32,000 Hz or 16,000 Hz). Ensure `torchaudio` is installed for high-quality resampling.
+- **Clips Extending Past the Ruler**:
+  Any clips placed beyond the ruler duration or latent boundary are dimmed on the canvas and safely clamped by the backend without raising errors.
+- **Aspect Ratio & Cropping**:
+  If using images or videos with different resolutions, set `crop: center` to center-crop inputs to the target latent resolution, or `crop: disabled` to rescale them.
 
-`example_workflows/Custom Keyframes Example.json` demonstrates H3 Custom Keyframes with three still-image anchors.
+---
 
-## Important limitation
+## License
 
-The MultiRef compatibility patch is specifically for **Ref2VA refs + Motion Context timeline audio** coexistence. It does not make long recursive generated-audio chains lossless. For fixed-song lip-sync workflows, using the original song slices as the audio reference and Motion Context for video only may be preferable.
-
-## Troubleshooting
-
-**`self-test failed (found 4 rows in marked audio ref slot ...)` on startup or first run** means a **second copy of the H3-Motion-Context custom node is installed** (the upstream `ComfyUI-H3-Motion-Context`, the `ComfyUI-H3-Motion-Context-MultiRef` fork, or an older version of this fork). Both install the same MiniMax H3 runtime patch, and the second application double-wraps `PackedLayout.__init__`, so the self-test finds half the expected rows. **Delete every other H3-Motion-Context folder** from `custom_nodes` (keep only this one), clear `__pycache__` if one lingers, and restart ComfyUI. When this happens the console now prints a message listing the detected duplicate folders (or a search hint if none is found). As a safety net this fork also takes over from another `h3_motion_context` wrapper it can recognize at install time, but the duplicate install should be removed anyway since this fork replaces the upstream package entirely.
-
-## License / upstream
-
-Original project and copyright: **NikoDemon80**. This modified version remains under **GPL-3.0**. See [LICENSE](LICENSE).
-
-Upstream repository: https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**. See the [LICENSE](LICENSE) file for full details.
